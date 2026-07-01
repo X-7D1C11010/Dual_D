@@ -1,7 +1,8 @@
-# Dual_D 双判别器扩展包
+# Dual_D 双判别器独立训练算法
 
-该目录是针对 `D:\Code\JMDA-Net` 当前多模态域适应方案的独立扩展实现。
-所有脚本均为新增文件，不修改原项目中的任何脚本。
+该目录是一个独立的双判别器多模态域适应训练工程。它不需要从其他项目目录导入
+`DataLoad.py`、`Models.py`、`Tensor.py` 等脚本，数据加载、模型、张量对齐、
+双判别器、训练循环、日志和结果保存均在本目录内实现。
 
 ## 设计目标
 
@@ -11,17 +12,41 @@
 - 通过双向生成、闭环一致性、身份保持、特征级对比损失和分类反馈保持语义稳定。
 - 通过配置文件和适配器接口与原有训练流程兼容。
 
-## 推荐接入位置
+## 训练入口
 
-在原方案完成以下步骤之后接入：
+正式训练脚本为：
 
-```text
-Visual/IR extractor -> TensorBasedAlignmentStable -> feat_src / feat_tgt
+```bash
+python scripts/train_dual_d.py \
+  --source-root /path/to/source_weather \
+  --target-root /path/to/target_weather \
+  --output-dir runs \
+  --epochs 100 \
+  --batch-size 32
 ```
 
-即在 `feat_src = concat(p_s_vis, p_s_ir)` 和
-`feat_tgt = concat(p_t_vis, p_t_ir)` 之后，将二者传入
-`dual_d.integration_adapter.DualDTrainingAdapter`。
+如果 RTX 5090 或其他新显卡与当前 PyTorch CUDA 构建不兼容，可先用 CPU 验证流程：
+
+```bash
+python scripts/train_dual_d.py \
+  --source-root /path/to/source_weather \
+  --target-root /path/to/target_weather \
+  --device cpu \
+  --epochs 1
+```
+
+## 输出文件
+
+每次训练会在 `output_dir/run_name/` 下保存：
+
+- `train.log`：训练日志。
+- `metrics.csv`：每轮训练/验证指标。
+- `checkpoints/best_model.pt`：验证集准确率最优 checkpoint。
+- `checkpoints/last_model.pt`：最后一轮 checkpoint。
+- `best_metrics.json`：最优轮详细指标。
+- `result_summary.json`：训练汇总。
+- `resolved_config.json`：实际使用的参数和标签映射。
+- `label_map.json`：类别标签映射。
 
 ## 目录结构
 
@@ -41,28 +66,54 @@ D:\Code\Dual_D
     losses.py
     collaborative_training.py
     integration_adapter.py
+    data\
+      multimodal_dataset.py
+      paired_sampler.py
+    models\
+      backbones.py
+      tensor_alignment.py
+    training\
+      checkpointing.py
+      logging_utils.py
+      metrics.py
+      trainer.py
   scripts\
     example_integration_usage.py
+    train_dual_d.py
 ```
 
-## 最小使用示例
+## 数据目录
 
-```python
-from dual_d.config import DualDConfig
-from dual_d.integration_adapter import DualDTrainingAdapter
+默认支持两种布局，并可通过 `--source-layout`、`--target-layout` 指定。
 
-config = DualDConfig(feature_dim=256)
-adapter = DualDTrainingAdapter(config).to(device)
+### modality_first
 
-outputs = adapter.forward_features(feat_src, feat_tgt, labels=s_label)
-d_loss, d_logs = adapter.compute_discriminator_loss(outputs)
-g_loss, g_logs = adapter.compute_generator_loss(
-    outputs=outputs,
-    classifier=classifier,
-    criterion_cls=criterion_cls,
-    source_labels=s_label,
-    target_labels=t_label,
-)
+```text
+root/train/可见光/<class_id>/*.jpg
+root/train/红外/<class_id>/*.jpg
+root/val/可见光/<class_id>/*.jpg
+root/val/红外/<class_id>/*.jpg
 ```
 
-详见 `docs/integration_notes.md` 和 `scripts/example_integration_usage.py`。
+### class_first
+
+```text
+root/train/<class_id>/可见光/*.jpg
+root/train/<class_id>/红外/*.jpg
+root/val/<class_id>/可见光/*.jpg
+root/val/<class_id>/红外/*.jpg
+```
+
+如果文件夹名不是 `可见光` 和 `红外`，使用：
+
+```bash
+--vis-folder VIS --ir-folder IR
+```
+
+接口验证示例仍保留：
+
+```bash
+python scripts/example_integration_usage.py
+```
+
+它只用随机张量验证模块接口，不读取数据、不训练模型。
