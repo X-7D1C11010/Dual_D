@@ -27,7 +27,7 @@ def classification_metrics(
     labels: torch.Tensor,
     num_classes: int,
 ) -> Dict[str, object]:
-    """Compute accuracy, macro/micro precision, recall, F1, and confusion matrix.
+    """Compute accuracy, present-class metrics, and confusion matrix.
 
     Args:
         predictions: Predicted class ids.
@@ -36,6 +36,9 @@ def classification_metrics(
 
     Returns:
         Dictionary containing scalar metrics and a nested-list confusion matrix.
+        ``precision_macro`` / ``recall_macro`` / ``f1_macro`` are calculated on
+        classes that actually appear in ``labels``. Full-label-space macro
+        metrics are also preserved as ``*_macro_all``.
     """
 
     predictions = predictions.detach().cpu().long().view(-1)
@@ -54,6 +57,7 @@ def classification_metrics(
     per_class_precision = []
     per_class_recall = []
     per_class_f1 = []
+    per_class_support = []
     classes_present = []
     for class_idx in range(num_classes):
         tp = float(confusion[class_idx, class_idx].item())
@@ -68,19 +72,33 @@ def classification_metrics(
         per_class_precision.append(precision)
         per_class_recall.append(recall)
         per_class_f1.append(f1)
+        per_class_support.append(support)
 
     if classes_present:
         precision_macro_present = sum(per_class_precision[idx] for idx in classes_present) / len(classes_present)
         recall_macro_present = sum(per_class_recall[idx] for idx in classes_present) / len(classes_present)
         f1_macro_present = sum(per_class_f1[idx] for idx in classes_present) / len(classes_present)
+        present_support = sum(per_class_support[idx] for idx in classes_present)
+        precision_weighted_present = sum(
+            per_class_precision[idx] * per_class_support[idx] for idx in classes_present
+        ) / present_support
+        recall_weighted_present = sum(
+            per_class_recall[idx] * per_class_support[idx] for idx in classes_present
+        ) / present_support
+        f1_weighted_present = sum(
+            per_class_f1[idx] * per_class_support[idx] for idx in classes_present
+        ) / present_support
     else:
         precision_macro_present = 0.0
         recall_macro_present = 0.0
         f1_macro_present = 0.0
+        precision_weighted_present = 0.0
+        recall_weighted_present = 0.0
+        f1_weighted_present = 0.0
 
-    precision_macro = sum(per_class_precision) / num_classes if num_classes else 0.0
-    recall_macro = sum(per_class_recall) / num_classes if num_classes else 0.0
-    f1_macro = sum(per_class_f1) / num_classes if num_classes else 0.0
+    precision_macro_all = sum(per_class_precision) / num_classes if num_classes else 0.0
+    recall_macro_all = sum(per_class_recall) / num_classes if num_classes else 0.0
+    f1_macro_all = sum(per_class_f1) / num_classes if num_classes else 0.0
 
     tp_micro = float(torch.diagonal(confusion).sum().item())
     fp_micro = float(confusion.sum(dim=0).sum().item() - tp_micro)
@@ -94,18 +112,30 @@ def classification_metrics(
 
     return {
         "accuracy": accuracy,
-        "precision_macro": precision_macro,
-        "recall_macro": recall_macro,
-        "f1_macro": f1_macro,
+        "precision_macro": precision_macro_present,
+        "recall_macro": recall_macro_present,
+        "f1_macro": f1_macro_present,
+        "precision_macro_all": precision_macro_all,
+        "recall_macro_all": recall_macro_all,
+        "f1_macro_all": f1_macro_all,
         "precision_macro_present": precision_macro_present,
         "recall_macro_present": recall_macro_present,
         "f1_macro_present": f1_macro_present,
+        "precision_weighted_present": precision_weighted_present,
+        "recall_weighted_present": recall_weighted_present,
+        "f1_weighted_present": f1_weighted_present,
         "precision_micro": precision_micro,
         "recall_micro": recall_micro,
         "f1_micro": f1_micro,
         "classes_present": classes_present,
+        "classes_absent": [idx for idx in range(num_classes) if idx not in classes_present],
+        "present_class_count": len(classes_present),
+        "num_classes": num_classes,
+        "per_class_precision": per_class_precision,
+        "per_class_recall": per_class_recall,
+        "per_class_f1": per_class_f1,
+        "per_class_support": per_class_support,
         "confusion_matrix": confusion.tolist(),
         "total": total,
         "correct": correct,
     }
-

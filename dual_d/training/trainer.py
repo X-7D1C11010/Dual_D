@@ -207,6 +207,70 @@ def extract_fused_features(
     return feat_src, feat_tgt, loss_tal
 
 
+def _accumulate_logs(totals: Dict[str, float], logs: Dict[str, float]) -> None:
+    """Accumulate slash-named log values into train metric totals."""
+
+    for key, value in logs.items():
+        metric_key = key.replace("/", "_")
+        totals[metric_key] = totals.get(metric_key, 0.0) + float(value)
+
+
+def _average_logged_metric(
+    totals: Dict[str, float],
+    key: str,
+    divisor: float,
+) -> float:
+    """Return an averaged logged metric with a safe default."""
+
+    return totals.get(key, 0.0) / max(divisor, 1.0)
+
+
+def summarize_label_distribution(
+    dataset,
+    num_classes: int,
+    label_map: Dict[str, int],
+) -> Dict[str, object]:
+    """Summarize class presence and imbalance for one dataset split."""
+
+    id_to_label = {int(class_id): str(raw_label) for raw_label, class_id in label_map.items()}
+    counts = [0 for _ in range(num_classes)]
+    for label in getattr(dataset, "labels", []):
+        class_id = int(label)
+        if 0 <= class_id < num_classes:
+            counts[class_id] += 1
+
+    present_classes = [idx for idx, count in enumerate(counts) if count > 0]
+    absent_classes = [idx for idx, count in enumerate(counts) if count == 0]
+    return {
+        "total_samples": int(sum(counts)),
+        "num_classes": int(num_classes),
+        "present_class_count": len(present_classes),
+        "absent_class_count": len(absent_classes),
+        "present_classes": present_classes,
+        "absent_classes": absent_classes,
+        "counts": [
+            {
+                "class_id": class_id,
+                "raw_label": id_to_label.get(class_id, str(class_id)),
+                "count": int(count),
+            }
+            for class_id, count in enumerate(counts)
+        ],
+    }
+
+
+def _compact_distribution(summary: Dict[str, object]) -> str:
+    """Format class counts for text logs."""
+
+    counts = summary["counts"]
+    parts = [
+        f"{item['class_id']}:{item['count']}"
+        for item in counts
+        if int(item["count"]) > 0
+    ]
+    return ", ".join(parts) if parts else "none"
+
+
 def train_one_epoch(
     args,
     models: ModelBundle,
@@ -228,11 +292,16 @@ def train_one_epoch(
     totals = {
         "loss_total": 0.0,
         "loss_cls": 0.0,
+        "loss_cls_source": 0.0,
+        "loss_cls_target": 0.0,
         "loss_tal": 0.0,
         "loss_dual_g": 0.0,
         "loss_dual_d": 0.0,
-        "train_correct": 0.0,
-        "train_total": 0.0,
+        "source_correct": 0.0,
+        "target_correct": 0.0,
+        "source_like_correct": 0.0,
+        "target_like_correct": 0.0,
+        "sample_total": 0.0,
         "steps": 0.0,
         "disc_steps": 0.0,
     }
@@ -257,7 +326,7 @@ def train_one_epoch(
         if step % args.discriminator_update_interval == 0:
             models.dual_adapter.set_discriminators_trainable(True)
             optimizer_disc.zero_grad(set_to_none=True)
-            loss_dual_d, _ = models.dual_adapter.compute_discriminator_loss(dual_outputs)
+            loss_dual_d, d_logs = models.dual_adapter.compute_discriminator_loss(dual_outputs)
             loss_dual_d.backward()
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
@@ -266,6 +335,7 @@ def train_one_epoch(
                 )
             optimizer_disc.step()
             totals["loss_dual_d"] += float(loss_dual_d.detach().cpu())
+            _accumulate_logs(totals, d_logs)
             totals["disc_steps"] += 1.0
 
         models.dual_adapter.set_discriminators_trainable(False)
@@ -273,9 +343,11 @@ def train_one_epoch(
 
         pred_src = models.classifier(feat_src)
         pred_tgt = models.classifier(feat_tgt)
-        loss_cls = criterion_cls(pred_src, source_labels) + criterion_cls(pred_tgt, target_labels)
+        loss_cls_source = criterion_cls(pred_src, source_labels)
+        loss_cls_target = criterion_cls(pred_tgt, target_labels)
+        loss_cls = loss_cls_source + loss_cls_target
 
-        loss_dual_g, _ = models.dual_adapter.compute_generator_loss(
+        loss_dual_g, g_logs = models.dual_adapter.compute_generator_loss(
             outputs=dual_outputs,
             labels=labels_for_contrast,
             classifier=models.classifier,
@@ -283,6 +355,7 @@ def train_one_epoch(
             source_labels=source_labels,
             target_labels=target_labels,
         )
+        _accumulate_logs(totals, g_logs)
         loss_total = loss_cls + args.tal_weight * loss_tal + loss_dual_g
         loss_total.backward()
 
@@ -302,25 +375,90 @@ def train_one_epoch(
         models.tal.apply_orthogonal_projection()
         models.dual_adapter.set_discriminators_trainable(True)
 
-        predicted = torch.argmax(pred_tgt.detach(), dim=1)
-        totals["train_correct"] += float((predicted == target_labels).sum().item())
-        totals["train_total"] += float(target_labels.numel())
+        with torch.no_grad():
+            pred_source_labels = torch.argmax(pred_src.detach(), dim=1)
+            pred_target_labels = torch.argmax(pred_tgt.detach(), dim=1)
+            source_like_logits = models.classifier(dual_outputs.source_like.detach())
+            target_like_logits = models.classifier(dual_outputs.target_like.detach())
+            pred_source_like_labels = torch.argmax(source_like_logits, dim=1)
+            pred_target_like_labels = torch.argmax(target_like_logits, dim=1)
+
+        totals["source_correct"] += float((pred_source_labels == source_labels).sum().item())
+        totals["target_correct"] += float((pred_target_labels == target_labels).sum().item())
+        totals["source_like_correct"] += float(
+            (pred_source_like_labels == target_labels).sum().item()
+        )
+        totals["target_like_correct"] += float(
+            (pred_target_like_labels == source_labels).sum().item()
+        )
+        totals["sample_total"] += float(target_labels.numel())
         totals["loss_total"] += float(loss_total.detach().cpu())
         totals["loss_cls"] += float(loss_cls.detach().cpu())
+        totals["loss_cls_source"] += float(loss_cls_source.detach().cpu())
+        totals["loss_cls_target"] += float(loss_cls_target.detach().cpu())
         totals["loss_tal"] += float(loss_tal.detach().cpu())
         totals["loss_dual_g"] += float(loss_dual_g.detach().cpu())
         totals["steps"] += 1.0
 
     steps = max(totals["steps"], 1.0)
     disc_steps = max(totals["disc_steps"], 1.0)
+    sample_total = max(totals["sample_total"], 1.0)
     return {
         "epoch": epoch,
         "train_loss": totals["loss_total"] / steps,
         "train_loss_cls": totals["loss_cls"] / steps,
+        "train_loss_cls_source": totals["loss_cls_source"] / steps,
+        "train_loss_cls_target": totals["loss_cls_target"] / steps,
         "train_loss_tal": totals["loss_tal"] / steps,
         "train_loss_dual_g": totals["loss_dual_g"] / steps,
         "train_loss_dual_d": totals["loss_dual_d"] / disc_steps,
-        "train_acc": totals["train_correct"] / max(totals["train_total"], 1.0),
+        "train_acc": totals["target_correct"] / sample_total,
+        "train_acc_source": totals["source_correct"] / sample_total,
+        "train_acc_target": totals["target_correct"] / sample_total,
+        "train_acc_source_like": totals["source_like_correct"] / sample_total,
+        "train_acc_target_like": totals["target_like_correct"] / sample_total,
+        "train_dual_d_discriminator_total": _average_logged_metric(
+            totals,
+            "dual_d_discriminator_total",
+            disc_steps,
+        ),
+        "train_dual_d_discriminator_primary": _average_logged_metric(
+            totals,
+            "dual_d_discriminator_primary",
+            disc_steps,
+        ),
+        "train_dual_d_discriminator_auxiliary": _average_logged_metric(
+            totals,
+            "dual_d_discriminator_auxiliary",
+            disc_steps,
+        ),
+        "train_dual_d_generator_total": _average_logged_metric(
+            totals,
+            "dual_d_generator_total",
+            steps,
+        ),
+        "train_dual_d_adv_primary": _average_logged_metric(
+            totals,
+            "dual_d_adv_primary",
+            steps,
+        ),
+        "train_dual_d_adv_auxiliary": _average_logged_metric(
+            totals,
+            "dual_d_adv_auxiliary",
+            steps,
+        ),
+        "train_dual_d_cycle": _average_logged_metric(totals, "dual_d_cycle", steps),
+        "train_dual_d_identity": _average_logged_metric(totals, "dual_d_identity", steps),
+        "train_dual_d_contrastive": _average_logged_metric(
+            totals,
+            "dual_d_contrastive",
+            steps,
+        ),
+        "train_dual_d_classification_feedback": _average_logged_metric(
+            totals,
+            "dual_d_classification_feedback",
+            steps,
+        ),
     }
 
 
@@ -429,7 +567,37 @@ def run_training(args) -> Dict[str, object]:
     logger.info(f"Target val samples: {len(target_val)}")
     logger.info(f"Classes: {num_classes}")
 
+    class_summaries = {
+        "source_train": summarize_label_distribution(source_train, num_classes, label_map),
+        "target_train": summarize_label_distribution(target_train, num_classes, label_map),
+        "target_val": summarize_label_distribution(target_val, num_classes, label_map),
+    }
+    for split_name, split_summary in class_summaries.items():
+        logger.info(
+            "%s classes: present %d/%d | absent %d | counts [%s]",
+            split_name,
+            split_summary["present_class_count"],
+            split_summary["num_classes"],
+            split_summary["absent_class_count"],
+            _compact_distribution(split_summary),
+        )
+
     paired_loader = PairedClassSampler(source_train, target_train, args.batch_size)
+    paired_common_classes = list(paired_loader.classes)
+    save_json(
+        {
+            "label_map": label_map,
+            "paired_training_classes": paired_common_classes,
+            **class_summaries,
+        },
+        run_dir / "class_distribution.json",
+    )
+    logger.info(
+        "Paired training classes: %d/%d | class ids [%s]",
+        len(paired_common_classes),
+        num_classes,
+        ", ".join(str(class_id) for class_id in paired_common_classes),
+    )
     val_loader = DataLoader(
         target_val,
         batch_size=args.batch_size,
@@ -534,4 +702,3 @@ def run_training(args) -> Dict[str, object]:
     save_json(summary, run_dir / "result_summary.json")
     logger.info("Training complete. Best validation accuracy: %.4f", best_acc)
     return summary
-
