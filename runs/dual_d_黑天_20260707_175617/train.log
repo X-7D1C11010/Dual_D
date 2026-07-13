@@ -1,4 +1,3 @@
-nohup: 忽略输入
 2026-07-07 17:56:17 | Starting Dual_D standalone training
 2026-07-07 17:56:17 | Run directory: runs/dual_d_黑天_20260707_175617
 2026-07-07 17:56:17 | Device: cuda
@@ -10,12 +9,6 @@ nohup: 忽略输入
 2026-07-07 17:56:17 | target_train classes: present 8/14 | absent 6 | counts [0:100, 2:11, 3:16, 6:89, 9:162, 10:12, 11:44, 13:31]
 2026-07-07 17:56:17 | target_val classes: present 8/14 | absent 6 | counts [0:26, 2:3, 3:5, 6:23, 9:41, 10:3, 11:11, 13:8]
 2026-07-07 17:56:17 | Paired training classes: 8/14 | class ids [0, 2, 3, 6, 9, 10, 11, 13]
-/home/lixiang/envs/lx_pytorch/lib/python3.11/site-packages/torch/cuda/__init__.py:235: UserWarning: 
-NVIDIA GeForce RTX 5090 with CUDA capability sm_120 is not compatible with the current PyTorch installation.
-The current PyTorch install supports CUDA capabilities sm_50 sm_60 sm_61 sm_70 sm_75 sm_80 sm_86 sm_89 sm_90 compute_90.
-If you want to use the NVIDIA GeForce RTX 5090 GPU with PyTorch, please check the instructions at https://pytorch.org/get-started/locally/
-
-  warnings.warn(
 2026-07-07 17:56:27 | Epoch 001/100 | loss 9.9297 | cls 4.3390 | tal 0.3119 | dual_g 5.4972 | dual_d 0.5324 | train_acc 0.3817 | val_acc 0.0250 | val_f1 0.0063 | 9.7s
 2026-07-07 17:56:27 | New best validation accuracy: 0.0250 at epoch 1
 2026-07-07 17:56:35 | Epoch 002/100 | loss 6.8494 | cls 2.8647 | tal 0.1883 | dual_g 3.9282 | dual_d 0.6097 | train_acc 0.6629 | val_acc 0.3000 | val_f1 0.2761 | 7.9s
@@ -131,6 +124,3 @@ If you want to use the NVIDIA GeForce RTX 5090 GPU with PyTorch, please check th
 2026-07-07 18:09:24 | Epoch 099/100 | loss 2.6693 | cls 1.1344 | tal -0.5190 | dual_g 1.6907 | dual_d 0.6238 | train_acc 1.0000 | val_acc 0.8417 | val_f1 0.8313 | 7.3s
 2026-07-07 18:09:31 | Epoch 100/100 | loss 2.6858 | cls 1.1302 | tal -0.4806 | dual_g 1.6999 | dual_d 0.6151 | train_acc 1.0000 | val_acc 0.8417 | val_f1 0.8313 | 7.3s
 2026-07-07 18:09:31 | Training complete. Best validation accuracy: 0.9167
-Dual_D training complete.
-Run directory: runs/dual_d_黑天_20260707_175617
-Best validation accuracy: 0.9167

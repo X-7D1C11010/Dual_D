@@ -1,0 +1,315 @@
+{
+  "label_map": {
+    "1": 0,
+    "10": 1,
+    "11": 2,
+    "12": 3,
+    "13": 4,
+    "14": 5,
+    "2": 6,
+    "3": 7,
+    "4": 8,
+    "5": 9,
+    "6": 10,
+    "7": 11,
+    "8": 12,
+    "9": 13
+  },
+  "paired_training_classes": [
+    0,
+    2,
+    3,
+    6,
+    9,
+    10,
+    11,
+    13
+  ],
+  "source_train": {
+    "total_samples": 760,
+    "num_classes": 14,
+    "present_class_count": 14,
+    "absent_class_count": 0,
+    "present_classes": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ],
+    "absent_classes": [],
+    "counts": [
+      {
+        "class_id": 0,
+        "raw_label": "1",
+        "count": 120
+      },
+      {
+        "class_id": 1,
+        "raw_label": "10",
+        "count": 43
+      },
+      {
+        "class_id": 2,
+        "raw_label": "11",
+        "count": 47
+      },
+      {
+        "class_id": 3,
+        "raw_label": "12",
+        "count": 40
+      },
+      {
+        "class_id": 4,
+        "raw_label": "13",
+        "count": 40
+      },
+      {
+        "class_id": 5,
+        "raw_label": "14",
+        "count": 30
+      },
+      {
+        "class_id": 6,
+        "raw_label": "2",
+        "count": 52
+      },
+      {
+        "class_id": 7,
+        "raw_label": "3",
+        "count": 52
+      },
+      {
+        "class_id": 8,
+        "raw_label": "4",
+        "count": 58
+      },
+      {
+        "class_id": 9,
+        "raw_label": "5",
+        "count": 53
+      },
+      {
+        "class_id": 10,
+        "raw_label": "6",
+        "count": 53
+      },
+      {
+        "class_id": 11,
+        "raw_label": "7",
+        "count": 83
+      },
+      {
+        "class_id": 12,
+        "raw_label": "8",
+        "count": 44
+      },
+      {
+        "class_id": 13,
+        "raw_label": "9",
+        "count": 45
+      }
+    ]
+  },
+  "target_train": {
+    "total_samples": 465,
+    "num_classes": 14,
+    "present_class_count": 8,
+    "absent_class_count": 6,
+    "present_classes": [
+      0,
+      2,
+      3,
+      6,
+      9,
+      10,
+      11,
+      13
+    ],
+    "absent_classes": [
+      1,
+      4,
+      5,
+      7,
+      8,
+      12
+    ],
+    "counts": [
+      {
+        "class_id": 0,
+        "raw_label": "1",
+        "count": 100
+      },
+      {
+        "class_id": 1,
+        "raw_label": "10",
+        "count": 0
+      },
+      {
+        "class_id": 2,
+        "raw_label": "11",
+        "count": 11
+      },
+      {
+        "class_id": 3,
+        "raw_label": "12",
+        "count": 16
+      },
+      {
+        "class_id": 4,
+        "raw_label": "13",
+        "count": 0
+      },
+      {
+        "class_id": 5,
+        "raw_label": "14",
+        "count": 0
+      },
+      {
+        "class_id": 6,
+        "raw_label": "2",
+        "count": 89
+      },
+      {
+        "class_id": 7,
+        "raw_label": "3",
+        "count": 0
+      },
+      {
+        "class_id": 8,
+        "raw_label": "4",
+        "count": 0
+      },
+      {
+        "class_id": 9,
+        "raw_label": "5",
+        "count": 162
+      },
+      {
+        "class_id": 10,
+        "raw_label": "6",
+        "count": 12
+      },
+      {
+        "class_id": 11,
+        "raw_label": "7",
+        "count": 44
+      },
+      {
+        "class_id": 12,
+        "raw_label": "8",
+        "count": 0
+      },
+      {
+        "class_id": 13,
+        "raw_label": "9",
+        "count": 31
+      }
+    ]
+  },
+  "target_val": {
+    "total_samples": 120,
+    "num_classes": 14,
+    "present_class_count": 8,
+    "absent_class_count": 6,
+    "present_classes": [
+      0,
+      2,
+      3,
+      6,
+      9,
+      10,
+      11,
+      13
+    ],
+    "absent_classes": [
+      1,
+      4,
+      5,
+      7,
+      8,
+      12
+    ],
+    "counts": [
+      {
+        "class_id": 0,
+        "raw_label": "1",
+        "count": 26
+      },
+      {
+        "class_id": 1,
+        "raw_label": "10",
+        "count": 0
+      },
+      {
+        "class_id": 2,
+        "raw_label": "11",
+        "count": 3
+      },
+      {
+        "class_id": 3,
+        "raw_label": "12",
+        "count": 5
+      },
+      {
+        "class_id": 4,
+        "raw_label": "13",
+        "count": 0
+      },
+      {
+        "class_id": 5,
+        "raw_label": "14",
+        "count": 0
+      },
+      {
+        "class_id": 6,
+        "raw_label": "2",
+        "count": 23
+      },
+      {
+        "class_id": 7,
+        "raw_label": "3",
+        "count": 0
+      },
+      {
+        "class_id": 8,
+        "raw_label": "4",
+        "count": 0
+      },
+      {
+        "class_id": 9,
+        "raw_label": "5",
+        "count": 41
+      },
+      {
+        "class_id": 10,
+        "raw_label": "6",
+        "count": 3
+      },
+      {
+        "class_id": 11,
+        "raw_label": "7",
+        "count": 11
+      },
+      {
+        "class_id": 12,
+        "raw_label": "8",
+        "count": 0
+      },
+      {
+        "class_id": 13,
+        "raw_label": "9",
+        "count": 8
+      }
+    ]
+  }
+}
