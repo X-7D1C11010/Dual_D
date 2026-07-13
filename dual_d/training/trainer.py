@@ -21,6 +21,7 @@ from pathlib import Path
 import random
 import time
 from typing import Dict, Tuple
+import warnings
 
 import numpy as np
 import torch
@@ -30,7 +31,12 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 from dual_d.config import load_config
-from dual_d.data import MultiModalDomainDataset, PairedClassSampler
+from dual_d.data import (
+    MultiModalDomainDataset,
+    PairedClassSampler,
+    audit_dataset_splits,
+    data_audit_errors,
+)
 from dual_d.integration_adapter import DualDTrainingAdapter
 from dual_d.models import (
     Classifier,
@@ -41,7 +47,7 @@ from dual_d.models import (
     set_requires_grad,
 )
 from dual_d.training.checkpointing import save_checkpoint, save_json
-from dual_d.training.logging_utils import CSVMetricLogger, setup_text_logger
+from dual_d.training.logging_utils import CSVMetricLogger, close_text_logger, setup_text_logger
 from dual_d.training.metrics import classification_metrics
 
 
@@ -76,8 +82,17 @@ def resolve_device(device_name: str) -> torch.device:
 def configure_visual_trainability(
     net_vis: VisualFeatureExtractor,
     freeze_visual_backbone: bool,
+    pretrained_visual: bool,
 ) -> None:
     """Configure which visual extractor parameters should be trainable."""
+
+    if freeze_visual_backbone and not pretrained_visual:
+        warnings.warn(
+            "freeze_visual_backbone=True with pretrained_visual=False would freeze "
+            "random early ResNet layers. The full visual backbone will be trained.",
+            RuntimeWarning,
+        )
+        freeze_visual_backbone = False
 
     if not freeze_visual_backbone:
         set_requires_grad(net_vis, True)
@@ -102,6 +117,7 @@ def build_datasets(args):
         ir_folder=args.ir_folder,
         image_size=args.image_size,
         resize_size=args.resize_size,
+        augmentation_strength=getattr(args, "augmentation_strength", 0.0),
     )
     label_map = source_train.get_label_map()
     target_train = MultiModalDomainDataset(
@@ -114,6 +130,7 @@ def build_datasets(args):
         global_label_map=label_map,
         image_size=args.image_size,
         resize_size=args.resize_size,
+        augmentation_strength=getattr(args, "augmentation_strength", 0.0),
     )
     target_val = MultiModalDomainDataset(
         root_dir=args.target_root,
@@ -126,8 +143,23 @@ def build_datasets(args):
         image_size=args.image_size,
         resize_size=args.resize_size,
         val_augment=args.val_augment,
+        augmentation_strength=getattr(args, "augmentation_strength", 0.0),
     )
-    return source_train, target_train, target_val, label_map
+    target_train_eval = MultiModalDomainDataset(
+        root_dir=args.target_root,
+        domain_type="target",
+        phase=args.train_phase,
+        layout=args.target_layout,
+        vis_folder=args.vis_folder,
+        ir_folder=args.ir_folder,
+        global_label_map=label_map,
+        image_size=args.image_size,
+        resize_size=args.resize_size,
+        val_augment=False,
+        train_augment=False,
+        augmentation_strength=0.0,
+    )
+    return source_train, target_train, target_train_eval, target_val, label_map
 
 
 def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
@@ -142,7 +174,11 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
         output_dim=args.feature_dim,
         pretrained=args.pretrained_visual,
     ).to(device)
-    configure_visual_trainability(net_vis, args.freeze_visual_backbone)
+    configure_visual_trainability(
+        net_vis,
+        args.freeze_visual_backbone,
+        args.pretrained_visual,
+    )
 
     net_ir = IRFeatureExtractor(output_dim=args.feature_dim).to(device)
     tal = TensorBasedAlignmentStable(
@@ -151,7 +187,11 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
         num_modalities=2,
     ).to(device)
     dual_adapter = DualDTrainingAdapter(dual_config).to(device)
-    classifier = Classifier(input_dim=fused_dim, num_classes=num_classes).to(device)
+    classifier = Classifier(
+        input_dim=fused_dim,
+        num_classes=num_classes,
+        dropout=getattr(args, "classifier_dropout", 0.30),
+    ).to(device)
     return ModelBundle(net_vis, net_ir, tal, dual_adapter, classifier)
 
 
@@ -225,6 +265,29 @@ def _average_logged_metric(
     return totals.get(key, 0.0) / max(divisor, 1.0)
 
 
+def _adversarial_scale(args, epoch: int) -> float:
+    """Return a linear adversarial warm-up scale in the closed interval [0, 1]."""
+
+    warmup_epochs = max(int(getattr(args, "adversarial_warmup_epochs", 0)), 0)
+    ramp_epochs = max(int(getattr(args, "adversarial_ramp_epochs", 0)), 0)
+    if epoch <= warmup_epochs:
+        return 0.0
+    if ramp_epochs == 0:
+        return 1.0
+    return min((epoch - warmup_epochs) / float(ramp_epochs), 1.0)
+
+
+def _gradient_norm(parameters) -> float:
+    """Compute the global L2 norm of currently populated gradients."""
+
+    squared_norm = 0.0
+    for parameter in parameters:
+        if parameter.grad is not None:
+            grad_norm = float(parameter.grad.detach().norm(2).cpu())
+            squared_norm += grad_norm * grad_norm
+    return squared_norm ** 0.5
+
+
 def summarize_label_distribution(
     dataset,
     num_classes: int,
@@ -288,6 +351,7 @@ def train_one_epoch(
     models.tal.train()
     models.dual_adapter.train()
     models.classifier.train()
+    adversarial_scale = _adversarial_scale(args, epoch)
 
     totals = {
         "loss_total": 0.0,
@@ -304,6 +368,8 @@ def train_one_epoch(
         "sample_total": 0.0,
         "steps": 0.0,
         "disc_steps": 0.0,
+        "grad_norm_main": 0.0,
+        "grad_norm_disc": 0.0,
     }
 
     for step, (source_batch, target_batch) in enumerate(paired_loader, start=1):
@@ -323,18 +389,27 @@ def train_one_epoch(
             labels=labels_for_contrast,
         )
 
-        if step % args.discriminator_update_interval == 0:
+        if adversarial_scale > 0 and step % args.discriminator_update_interval == 0:
             models.dual_adapter.set_discriminators_trainable(True)
             optimizer_disc.zero_grad(set_to_none=True)
             loss_dual_d, d_logs = models.dual_adapter.compute_discriminator_loss(dual_outputs)
+            if not bool(torch.isfinite(loss_dual_d)):
+                raise FloatingPointError(
+                    f"Non-finite discriminator loss at epoch={epoch}, step={step}."
+                )
             loss_dual_d.backward()
+            discriminator_parameters = list(models.dual_adapter.discriminator_parameters())
             if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    models.dual_adapter.discriminator_parameters(),
+                grad_norm_disc = torch.nn.utils.clip_grad_norm_(
+                    discriminator_parameters,
                     args.grad_clip,
                 )
+                grad_norm_disc = float(grad_norm_disc.detach().cpu())
+            else:
+                grad_norm_disc = _gradient_norm(discriminator_parameters)
             optimizer_disc.step()
             totals["loss_dual_d"] += float(loss_dual_d.detach().cpu())
+            totals["grad_norm_disc"] += grad_norm_disc
             _accumulate_logs(totals, d_logs)
             totals["disc_steps"] += 1.0
 
@@ -354,22 +429,31 @@ def train_one_epoch(
             criterion_cls=criterion_cls,
             source_labels=source_labels,
             target_labels=target_labels,
+            adversarial_scale=adversarial_scale,
         )
         _accumulate_logs(totals, g_logs)
         loss_total = loss_cls + args.tal_weight * loss_tal + loss_dual_g
+        if not bool(torch.isfinite(loss_total)):
+            raise FloatingPointError(
+                f"Non-finite main loss at epoch={epoch}, step={step}."
+            )
         loss_total.backward()
 
+        main_parameters = [
+            *[p for p in models.net_vis.parameters() if p.requires_grad],
+            *[p for p in models.net_ir.parameters() if p.requires_grad],
+            *list(models.tal.parameters()),
+            *list(models.dual_adapter.generator_parameters()),
+            *list(models.classifier.parameters()),
+        ]
         if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                [
-                    *[p for p in models.net_vis.parameters() if p.requires_grad],
-                    *[p for p in models.net_ir.parameters() if p.requires_grad],
-                    *list(models.tal.parameters()),
-                    *list(models.dual_adapter.generator_parameters()),
-                    *list(models.classifier.parameters()),
-                ],
+            grad_norm_main = torch.nn.utils.clip_grad_norm_(
+                main_parameters,
                 args.grad_clip,
             )
+            grad_norm_main = float(grad_norm_main.detach().cpu())
+        else:
+            grad_norm_main = _gradient_norm(main_parameters)
 
         optimizer_main.step()
         models.tal.apply_orthogonal_projection()
@@ -398,6 +482,7 @@ def train_one_epoch(
         totals["loss_cls_target"] += float(loss_cls_target.detach().cpu())
         totals["loss_tal"] += float(loss_tal.detach().cpu())
         totals["loss_dual_g"] += float(loss_dual_g.detach().cpu())
+        totals["grad_norm_main"] += grad_norm_main
         totals["steps"] += 1.0
 
     steps = max(totals["steps"], 1.0)
@@ -412,6 +497,9 @@ def train_one_epoch(
         "train_loss_tal": totals["loss_tal"] / steps,
         "train_loss_dual_g": totals["loss_dual_g"] / steps,
         "train_loss_dual_d": totals["loss_dual_d"] / disc_steps,
+        "train_grad_norm_main": totals["grad_norm_main"] / steps,
+        "train_grad_norm_discriminator": totals["grad_norm_disc"] / disc_steps,
+        "train_adversarial_scale": adversarial_scale,
         "train_acc": totals["target_correct"] / sample_total,
         "train_acc_source": totals["source_correct"] / sample_total,
         "train_acc_target": totals["target_correct"] / sample_total,
@@ -470,6 +558,7 @@ def evaluate(
     criterion_cls: nn.Module,
     device: torch.device,
     num_classes: int,
+    feature_mode: str | None = None,
 ) -> Dict[str, object]:
     """Evaluate target-domain validation accuracy and metrics."""
 
@@ -493,10 +582,11 @@ def evaluate(
         ir_feat = models.net_ir(ir)
         projected_target = models.tal.project_target([vis_feat, ir_feat])
         features = torch.cat(projected_target, dim=1)
-        if args.eval_feature_mode != "raw":
+        selected_mode = feature_mode or args.eval_feature_mode
+        if selected_mode != "raw":
             features = models.dual_adapter.inference_features(
                 features,
-                mode=args.eval_feature_mode,
+                mode=selected_mode,
             )
         logits = models.classifier(features)
         loss = criterion_cls(logits, labels)
@@ -511,6 +601,7 @@ def evaluate(
     labels_tensor = torch.cat(all_labels) if all_labels else torch.empty(0, dtype=torch.long)
     metrics = classification_metrics(predictions_tensor, labels_tensor, num_classes)
     metrics["val_loss"] = total_loss / max(steps, 1)
+    metrics["feature_mode"] = feature_mode or args.eval_feature_mode
     return metrics
 
 
@@ -557,7 +648,7 @@ def run_training(args) -> Dict[str, object]:
     logger.info(f"Run directory: {run_dir}")
     logger.info(f"Device: {device}")
 
-    source_train, target_train, target_val, label_map = build_datasets(args)
+    source_train, target_train, target_train_eval, target_val, label_map = build_datasets(args)
     num_classes = len(label_map)
     save_json({"args": vars(args), "label_map": label_map}, run_dir / "resolved_config.json")
     save_json(label_map, run_dir / "label_map.json")
@@ -566,6 +657,29 @@ def run_training(args) -> Dict[str, object]:
     logger.info(f"Target train samples: {len(target_train)}")
     logger.info(f"Target val samples: {len(target_val)}")
     logger.info(f"Classes: {num_classes}")
+
+    data_audit = audit_dataset_splits(
+        target_train,
+        target_val,
+        hash_contents=bool(getattr(args, "data_audit_hashes", False)),
+    )
+    save_json(data_audit, run_dir / "data_audit.json")
+    audit_errors = data_audit_errors(data_audit)
+    logger.info(
+        "Data audit: same_dir=%s | path_overlap(vis/ir)=%d/%d | "
+        "content_overlap(vis/ir)=%d/%d | stem_mismatch=%d",
+        data_audit["same_base_dir"],
+        data_audit["path_overlap_vis_count"],
+        data_audit["path_overlap_ir_count"],
+        data_audit["content_overlap_vis_count"],
+        data_audit["content_overlap_ir_count"],
+        data_audit["vis_ir_stem_mismatch_count"],
+    )
+    if audit_errors:
+        message = "Data audit failed: " + "; ".join(audit_errors)
+        if bool(getattr(args, "strict_data_audit", True)):
+            raise RuntimeError(message)
+        logger.warning(message)
 
     class_summaries = {
         "source_train": summarize_label_distribution(source_train, num_classes, label_map),
@@ -606,21 +720,54 @@ def run_training(args) -> Dict[str, object]:
         drop_last=False,
         pin_memory=device.type == "cuda",
     )
+    train_eval_loader = DataLoader(
+        target_train_eval,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        drop_last=False,
+        pin_memory=device.type == "cuda",
+    )
 
     models = build_models(args, num_classes, device)
+    total_parameters = sum(parameter.numel() for model in models.__dict__.values() for parameter in model.parameters())
+    trainable_parameters = sum(
+        parameter.numel()
+        for model in models.__dict__.values()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    logger.info(
+        "Model parameters: total=%d | trainable=%d",
+        total_parameters,
+        trainable_parameters,
+    )
     criterion_cls = LabelSmoothingCrossEntropy(eps=args.label_smoothing)
     optimizer_main, optimizer_disc = build_optimizers(args, models)
-    scheduler = ReduceLROnPlateau(
+    monitor_metric = getattr(args, "monitor_metric", "val_f1_macro_present")
+    monitor_mode = "min" if monitor_metric == "val_loss" else "max"
+    scheduler_main = ReduceLROnPlateau(
         optimizer_main,
-        mode="max",
+        mode=monitor_mode,
         factor=args.lr_factor,
         patience=args.lr_patience,
         min_lr=args.min_lr,
     )
+    scheduler_disc = ReduceLROnPlateau(
+        optimizer_disc,
+        mode=monitor_mode,
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+        min_lr=getattr(args, "min_lr_discriminator", args.min_lr),
+    )
 
     best_acc = -1.0
+    best_score = float("inf") if monitor_mode == "min" else float("-inf")
     best_metrics: Dict[str, object] = {}
     start_time = time.time()
+    epochs_without_improvement = 0
+    epochs_completed = 0
+    early_stopped = False
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
@@ -642,7 +789,48 @@ def run_training(args) -> Dict[str, object]:
             device=device,
             num_classes=num_classes,
         )
-        scheduler.step(float(val_metrics["accuracy"]))
+        if args.eval_feature_mode == "raw":
+            val_raw_metrics = val_metrics
+        else:
+            val_raw_metrics = evaluate(
+                args=args,
+                models=models,
+                dataloader=val_loader,
+                criterion_cls=criterion_cls,
+                device=device,
+                num_classes=num_classes,
+                feature_mode="raw",
+            )
+
+        train_eval_interval = max(int(getattr(args, "train_eval_interval", 1)), 1)
+        if epoch == 1 or epoch % train_eval_interval == 0:
+            train_full_metrics = evaluate(
+                args=args,
+                models=models,
+                dataloader=train_eval_loader,
+                criterion_cls=criterion_cls,
+                device=device,
+                num_classes=num_classes,
+            )
+        else:
+            train_full_metrics = {}
+
+        monitor_values = {
+            "val_acc": float(val_metrics["accuracy"]),
+            "val_f1_macro_present": float(val_metrics["f1_macro_present"]),
+            "val_loss": float(val_metrics["val_loss"]),
+        }
+        monitor_value = monitor_values[monitor_metric]
+        scheduler_main.step(monitor_value)
+        scheduler_disc.step(monitor_value)
+
+        if args.eval_feature_mode == "raw":
+            sampled_mode_acc = float(train_metrics["train_acc_target"])
+        elif args.eval_feature_mode == "source_like":
+            sampled_mode_acc = float(train_metrics["train_acc_source_like"])
+        else:
+            sampled_mode_acc = float("nan")
+        full_train_acc = train_full_metrics.get("accuracy")
 
         row = {
             **train_metrics,
@@ -654,14 +842,31 @@ def run_training(args) -> Dict[str, object]:
             "val_precision_micro": val_metrics["precision_micro"],
             "val_recall_micro": val_metrics["recall_micro"],
             "val_f1_micro": val_metrics["f1_micro"],
+            "val_raw_loss": val_raw_metrics["val_loss"],
+            "val_raw_acc": val_raw_metrics["accuracy"],
+            "val_raw_f1_macro_present": val_raw_metrics["f1_macro_present"],
+            "train_full_acc": full_train_acc,
+            "train_full_f1_macro_present": train_full_metrics.get("f1_macro_present"),
+            "train_sampled_minus_full_acc": (
+                sampled_mode_acc - float(full_train_acc)
+                if full_train_acc is not None and np.isfinite(sampled_mode_acc)
+                else None
+            ),
+            "monitor_value": monitor_value,
             "lr_main": optimizer_main.param_groups[-1]["lr"],
+            "lr_discriminator": optimizer_disc.param_groups[0]["lr"],
+            "lr_discriminator_to_main_ratio": (
+                optimizer_disc.param_groups[0]["lr"]
+                / max(optimizer_main.param_groups[-1]["lr"], 1e-30)
+            ),
             "epoch_seconds": time.time() - epoch_start,
         }
         metrics_logger.write_row(row)
 
         logger.info(
             "Epoch %03d/%03d | loss %.4f | cls %.4f | tal %.4f | dual_g %.4f | "
-            "dual_d %.4f | train_acc %.4f | val_acc %.4f | val_f1 %.4f | %.1fs",
+            "dual_d %.4f | train_acc %.4f | train_full %s | val_acc %.4f | "
+            "val_f1 %.4f | grad(main/disc) %.3f/%.3f | lr(main/disc) %.2e/%.2e | %.1fs",
             epoch,
             args.epochs,
             row["train_loss"],
@@ -670,8 +875,13 @@ def run_training(args) -> Dict[str, object]:
             row["train_loss_dual_g"],
             row["train_loss_dual_d"],
             row["train_acc"],
+            f"{row['train_full_acc']:.4f}" if row["train_full_acc"] is not None else "n/a",
             row["val_acc"],
             row["val_f1_macro_present"],
+            row["train_grad_norm_main"],
+            row["train_grad_norm_discriminator"],
+            row["lr_main"],
+            row["lr_discriminator"],
             row["epoch_seconds"],
         )
 
@@ -686,19 +896,69 @@ def run_training(args) -> Dict[str, object]:
         )
         save_checkpoint(last_state, run_dir / "checkpoints" / "last_model.pt")
 
-        if float(val_metrics["accuracy"]) > best_acc:
-            best_acc = float(val_metrics["accuracy"])
-            best_metrics = {"train": train_metrics, "val": val_metrics, "epoch": epoch}
+        best_acc = max(best_acc, float(val_metrics["accuracy"]))
+        min_delta = float(getattr(args, "early_stopping_min_delta", 0.0))
+        improved = (
+            monitor_value < best_score - min_delta
+            if monitor_mode == "min"
+            else monitor_value > best_score + min_delta
+        )
+        if improved:
+            best_score = monitor_value
+            epochs_without_improvement = 0
+            best_metrics = {
+                "train": train_metrics,
+                "train_full": train_full_metrics,
+                "val": val_metrics,
+                "val_raw": val_raw_metrics,
+                "monitor_metric": monitor_metric,
+                "monitor_value": monitor_value,
+                "epoch": epoch,
+            }
             save_checkpoint(last_state, run_dir / "checkpoints" / "best_model.pt")
             save_json(best_metrics, run_dir / "best_metrics.json")
-            logger.info("New best validation accuracy: %.4f at epoch %d", best_acc, epoch)
+            logger.info(
+                "New best %s: %.4f at epoch %d",
+                monitor_metric,
+                monitor_value,
+                epoch,
+            )
+        else:
+            epochs_without_improvement += 1
+
+        epochs_completed = epoch
+        early_stopping_patience = int(getattr(args, "early_stopping_patience", 0))
+        early_stopping_min_epochs = int(getattr(args, "early_stopping_min_epochs", 0))
+        if (
+            early_stopping_patience > 0
+            and epoch >= early_stopping_min_epochs
+            and epochs_without_improvement >= early_stopping_patience
+        ):
+            early_stopped = True
+            logger.info(
+                "Early stopping at epoch %d after %d epochs without %s improvement.",
+                epoch,
+                epochs_without_improvement,
+                monitor_metric,
+            )
+            break
 
     summary = {
         "run_dir": str(run_dir),
         "best_acc": best_acc,
+        "best_monitor_metric": monitor_metric,
+        "best_monitor_value": best_score,
         "best_metrics": best_metrics,
+        "epochs_completed": epochs_completed,
+        "early_stopped": early_stopped,
         "total_seconds": time.time() - start_time,
     }
     save_json(summary, run_dir / "result_summary.json")
-    logger.info("Training complete. Best validation accuracy: %.4f", best_acc)
+    logger.info(
+        "Training complete. Best validation accuracy: %.4f | best %s: %.4f",
+        best_acc,
+        monitor_metric,
+        best_score,
+    )
+    close_text_logger(logger)
     return summary

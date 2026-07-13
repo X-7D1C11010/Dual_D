@@ -25,6 +25,15 @@ python scripts/train_dual_d.py \
   --batch-size 32
 ```
 
+推荐先填写优化后的默认配置中的数据路径，再启动：
+
+```bash
+python scripts/train_dual_d.py --config configs/train_dual_d_default.json
+```
+
+该配置使用 ImageNet 预训练 ResNet-18；离线环境没有缓存权重时，可显式添加
+`--no-pretrained-visual --no-freeze-visual-backbone`，代码不会再冻结随机初始化的早期层。
+
 如果 RTX 5090 或其他新显卡与当前 PyTorch CUDA 构建不兼容，可先用 CPU 验证流程：
 
 ```bash
@@ -47,6 +56,11 @@ python scripts/train_dual_d.py \
 - `result_summary.json`：训练汇总。
 - `resolved_config.json`：实际使用的参数和标签映射。
 - `label_map.json`：类别标签映射。
+- `data_audit.json`：训练/验证路径、内容哈希、标签目录和模态配对审计。
+
+`metrics.csv` 还会记录完整目标训练集准确率、raw/source-like 验证指标、主/判别器
+梯度范数、两侧学习率及其比值。主优化器和判别器调度器使用同一监控指标同步衰减，
+避免后期判别器相对学习率不断变大。
 
 ## 目录结构
 
@@ -117,3 +131,12 @@ python scripts/example_integration_usage.py
 ```
 
 它只用随机张量验证模块接口，不读取数据、不训练模型。
+
+## 稳定性与泛化默认策略
+
+- 前 5 轮只训练分类/TAL/重建目标，随后用 15 轮线性引入对抗损失。
+- 主学习率 `3e-4`、判别器学习率 `1e-4`，二者同步调度；判别器每 3 步更新一次。
+- 验证集存在类别宏 F1 用于调度、最优模型和早停；最早第 75 轮后才允许早停。
+- 判别器使用更小的 MLP、谱归一化和 0.4 dropout；不再把 cycle 重建结果同时标为 fake。
+- VIS/IR 共用随机裁剪和翻转参数，并使用温和的模态特定颜色/对比度增强。
+- 类平衡采样在复用样本前先遍历类内池，减少小类样本的无意义重复。

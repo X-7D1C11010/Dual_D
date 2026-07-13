@@ -72,7 +72,10 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None, help="Optional JSON config file.")
     parser.add_argument(
         "--dual-config",
-        default=str(PROJECT_ROOT / "configs" / "dual_d_default_config.json"),
+        default=default(
+            "dual_config",
+            str(PROJECT_ROOT / "configs" / "dual_d_default_config.json"),
+        ),
         help="Dual_D module config JSON.",
     )
 
@@ -104,6 +107,12 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
 
     parser.add_argument("--image-size", type=int, default=default("image_size", 224))
     parser.add_argument("--resize-size", type=int, default=default("resize_size", 256))
+    parser.add_argument(
+        "--augmentation-strength",
+        type=float,
+        default=default("augmentation_strength", 0.5),
+        help="Modality-specific photometric jitter strength in [0, 1].",
+    )
     parser.add_argument("--feature-dim", type=int, default=default("feature_dim", 512))
     parser.add_argument("--proj-dim", type=int, default=default("proj_dim", 128))
 
@@ -126,6 +135,11 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--label-smoothing", type=float, default=default("label_smoothing", 0.1))
+    parser.add_argument(
+        "--classifier-dropout",
+        type=float,
+        default=default("classifier_dropout", 0.3),
+    )
     parser.add_argument("--tal-weight", type=float, default=default("tal_weight", 0.3))
     parser.add_argument("--lr-main", type=float, default=default("lr_main", 5e-4))
     parser.add_argument("--lr-visual", type=float, default=default("lr_visual", 1e-5))
@@ -135,11 +149,69 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--lr-patience", type=int, default=default("lr_patience", 10))
     parser.add_argument("--min-lr", type=float, default=default("min_lr", 1e-6))
     parser.add_argument(
+        "--min-lr-discriminator",
+        type=float,
+        default=default("min_lr_discriminator", 1e-6),
+    )
+    parser.add_argument(
         "--discriminator-update-interval",
         type=int,
         default=default("discriminator_update_interval", 2),
     )
     parser.add_argument("--grad-clip", type=float, default=default("grad_clip", 1.0))
+    parser.add_argument(
+        "--adversarial-warmup-epochs",
+        type=int,
+        default=default("adversarial_warmup_epochs", 5),
+        help="Classifier/TAL-only epochs before discriminator updates begin.",
+    )
+    parser.add_argument(
+        "--adversarial-ramp-epochs",
+        type=int,
+        default=default("adversarial_ramp_epochs", 15),
+        help="Epochs used to linearly ramp adversarial generator weights to 1.",
+    )
+    parser.add_argument(
+        "--monitor-metric",
+        default=default("monitor_metric", "val_f1_macro_present"),
+        choices=["val_acc", "val_f1_macro_present", "val_loss"],
+        help="Metric used by both LR schedulers, checkpointing, and early stopping.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=default("early_stopping_patience", 15),
+        help="Stop after this many unimproved epochs; 0 disables early stopping.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-epochs",
+        type=int,
+        default=default("early_stopping_min_epochs", 75),
+        help="Do not stop before this epoch even if the patience counter is exhausted.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=default("early_stopping_min_delta", 0.001),
+    )
+    parser.add_argument(
+        "--train-eval-interval",
+        type=int,
+        default=default("train_eval_interval", 1),
+        help="Evaluate the complete deterministic target train split every N epochs.",
+    )
+    parser.add_argument(
+        "--data-audit-hashes",
+        action=argparse.BooleanOptionalAction,
+        default=default("data_audit_hashes", True),
+        help="Hash target train/validation images to detect exact duplicate content.",
+    )
+    parser.add_argument(
+        "--strict-data-audit",
+        action=argparse.BooleanOptionalAction,
+        default=default("strict_data_audit", True),
+        help="Abort training when the split audit finds leakage or invalid labels.",
+    )
     parser.add_argument(
         "--eval-feature-mode",
         default=default("eval_feature_mode", "source_like"),
@@ -165,6 +237,20 @@ def parse_args() -> argparse.Namespace:
         parser.error("--target-root is required, or provide it in --config.")
     if args.discriminator_update_interval <= 0:
         parser.error("--discriminator-update-interval must be positive.")
+    if not 0.0 <= args.label_smoothing < 1.0:
+        parser.error("--label-smoothing must be in [0, 1).")
+    if not 0.0 <= args.classifier_dropout < 1.0:
+        parser.error("--classifier-dropout must be in [0, 1).")
+    if not 0.0 <= args.augmentation_strength <= 1.0:
+        parser.error("--augmentation-strength must be in [0, 1].")
+    if args.train_eval_interval <= 0:
+        parser.error("--train-eval-interval must be positive.")
+    if args.adversarial_warmup_epochs < 0 or args.adversarial_ramp_epochs < 0:
+        parser.error("Adversarial warmup/ramp epochs must be non-negative.")
+    if args.early_stopping_patience < 0:
+        parser.error("--early-stopping-patience must be non-negative.")
+    if args.early_stopping_min_epochs < 0:
+        parser.error("--early-stopping-min-epochs must be non-negative.")
     return args
 
 
@@ -180,4 +266,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

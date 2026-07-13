@@ -33,6 +33,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.transforms import functional as transform_functional
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -69,11 +70,84 @@ def _phase_root(root_dir: Path, phase: str) -> Path:
     return candidate if candidate.exists() else root_dir
 
 
+class PairedImageTransform:
+    """Apply shared geometry and modality-specific normalization to a VIS/IR pair.
+
+    Random crop and horizontal-flip parameters are sampled once and reused for
+    both modalities. This preserves pixel-level correspondence between the two
+    sensors; applying two independent ``Compose`` objects can silently misalign
+    an otherwise paired sample.
+    """
+
+    def __init__(
+        self,
+        train_like: bool,
+        image_size: int,
+        resize_size: int,
+        augmentation_strength: float = 0.0,
+    ):
+        self.train_like = bool(train_like)
+        self.image_size = int(image_size)
+        self.resize_size = int(resize_size)
+        self.augmentation_strength = max(0.0, min(float(augmentation_strength), 1.0))
+        strength = self.augmentation_strength
+        self.vis_jitter = transforms.ColorJitter(
+            brightness=0.25 * strength,
+            contrast=0.25 * strength,
+            saturation=0.15 * strength,
+            hue=0.05 * strength,
+        )
+        self.ir_jitter = transforms.ColorJitter(
+            brightness=0.15 * strength,
+            contrast=0.15 * strength,
+        )
+
+    def __call__(self, vis_img: Image.Image, ir_img: Image.Image):
+        """Transform and return one synchronized visible/infrared pair."""
+
+        if self.train_like:
+            output_size = [self.resize_size, self.resize_size]
+            vis_img = transform_functional.resize(vis_img, output_size)
+            ir_img = transform_functional.resize(ir_img, output_size)
+            top, left, height, width = transforms.RandomCrop.get_params(
+                vis_img,
+                output_size=(self.image_size, self.image_size),
+            )
+            vis_img = transform_functional.crop(vis_img, top, left, height, width)
+            ir_img = transform_functional.crop(ir_img, top, left, height, width)
+            if bool(torch.rand(()) < 0.5):
+                vis_img = transform_functional.hflip(vis_img)
+                ir_img = transform_functional.hflip(ir_img)
+            if self.augmentation_strength > 0:
+                vis_img = self.vis_jitter(vis_img)
+                ir_img = self.ir_jitter(ir_img)
+        else:
+            output_size = [self.image_size, self.image_size]
+            vis_img = transform_functional.resize(vis_img, output_size)
+            ir_img = transform_functional.resize(ir_img, output_size)
+
+        vis_tensor = transform_functional.to_tensor(vis_img)
+        ir_tensor = transform_functional.to_tensor(ir_img)
+        vis_tensor = transform_functional.normalize(
+            vis_tensor,
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+        ir_tensor = transform_functional.normalize(
+            ir_tensor,
+            mean=[0.5, 0.5, 0.5],
+            std=[0.5, 0.5, 0.5],
+        )
+        return vis_tensor, ir_tensor
+
+
 def build_transforms(
     phase: str,
     image_size: int = 224,
     resize_size: int = 256,
     val_augment: bool = False,
+    train_augment: bool = True,
+    augmentation_strength: float = 0.0,
 ):
     """Build visible and infrared transforms.
 
@@ -84,40 +158,16 @@ def build_transforms(
         val_augment: If true, validation uses train-style random augmentation.
 
     Returns:
-        Dictionary with ``vis`` and ``ir`` transform pipelines.
+        A paired transform that applies identical geometry to both modalities.
     """
 
-    train_like = phase == "train" or val_augment
-    if train_like:
-        image_ops = [
-            transforms.Resize((resize_size, resize_size)),
-            transforms.RandomCrop(image_size),
-            transforms.RandomHorizontalFlip(p=0.5),
-        ]
-    else:
-        image_ops = [
-            transforms.Resize((image_size, image_size)),
-        ]
-
-    return {
-        "vis": transforms.Compose(
-            image_ops
-            + [
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                ),
-            ]
-        ),
-        "ir": transforms.Compose(
-            image_ops
-            + [
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        ),
-    }
+    train_like = (phase == "train" and train_augment) or val_augment
+    return PairedImageTransform(
+        train_like,
+        image_size,
+        resize_size,
+        augmentation_strength=augmentation_strength,
+    )
 
 
 class MultiModalDomainDataset(Dataset):
@@ -151,6 +201,8 @@ class MultiModalDomainDataset(Dataset):
         image_size: int = 224,
         resize_size: int = 256,
         val_augment: bool = False,
+        train_augment: bool = True,
+        augmentation_strength: float = 0.0,
     ):
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -175,16 +227,22 @@ class MultiModalDomainDataset(Dataset):
         else:
             self.label_map = dict(global_label_map)
 
-        self.samples = [
-            sample for sample in self.samples if sample.raw_label in self.label_map
-        ]
-        if not self.samples:
-            raise RuntimeError(
-                "Samples were found, but none matched the provided global_label_map."
+        unknown_labels = sorted(set(raw_labels) - set(self.label_map))
+        if unknown_labels:
+            raise ValueError(
+                "Dataset contains labels absent from the source label map: "
+                f"{unknown_labels}. Fix the directory labels instead of silently dropping samples."
             )
 
         self.labels = [self.label_map[sample.raw_label] for sample in self.samples]
-        self.transform = build_transforms(phase, image_size, resize_size, val_augment)
+        self.transform = build_transforms(
+            phase,
+            image_size,
+            resize_size,
+            val_augment,
+            train_augment,
+            augmentation_strength,
+        )
 
     def _resolve_layout(self, layout: str, vis_folder: str, ir_folder: str) -> str:
         """Resolve automatic layout detection."""
@@ -262,13 +320,13 @@ class MultiModalDomainDataset(Dataset):
             ) from exc
 
         label = self.label_map[sample.raw_label]
+        vis_tensor, ir_tensor = self.transform(vis_img, ir_img)
         return {
-            "vis": self.transform["vis"](vis_img),
-            "ir": self.transform["ir"](ir_img),
+            "vis": vis_tensor,
+            "ir": ir_tensor,
             "label": torch.tensor(label, dtype=torch.long),
             "domain_label": torch.tensor(self.domain_label, dtype=torch.long),
             "raw_label": sample.raw_label,
             "vis_path": str(sample.vis_path),
             "ir_path": str(sample.ir_path),
         }
-

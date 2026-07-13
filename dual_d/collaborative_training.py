@@ -166,6 +166,7 @@ class DualDiscriminatorCoordinator(nn.Module):
         criterion_cls: Optional[nn.Module] = None,
         source_labels: Optional[torch.Tensor] = None,
         target_labels: Optional[torch.Tensor] = None,
+        adversarial_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute generator-side cooperative loss.
 
@@ -175,6 +176,7 @@ class DualDiscriminatorCoordinator(nn.Module):
         """
 
         weights = self.config.loss_weights
+        adversarial_scale = max(0.0, min(float(adversarial_scale), 1.0))
 
         primary_adv = generator_fooling_loss(
             self.primary_discriminator(outputs.source_like)
@@ -231,8 +233,8 @@ class DualDiscriminatorCoordinator(nn.Module):
                 )
 
         total_loss = (
-            weights.adv_primary * primary_adv
-            + weights.adv_auxiliary * auxiliary_adv
+            adversarial_scale * weights.adv_primary * primary_adv
+            + adversarial_scale * weights.adv_auxiliary * auxiliary_adv
             + weights.cycle * cycle_loss
             + weights.identity * identity_loss
             + weights.contrastive * contrast_loss
@@ -246,6 +248,7 @@ class DualDiscriminatorCoordinator(nn.Module):
             "dual_d/identity": safe_item(identity_loss),
             "dual_d/contrastive": safe_item(contrast_loss),
             "dual_d/classification_feedback": safe_item(classification_loss),
+            "dual_d/adversarial_scale": adversarial_scale,
         }
         return total_loss, logs
 
@@ -254,4 +257,3 @@ class DualDiscriminatorCoordinator(nn.Module):
         """Translate target-domain features to source-like features for inference."""
 
         return self.translator.target_to_source(target_features)
-

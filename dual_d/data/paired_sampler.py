@@ -54,6 +54,20 @@ class PairedClassSampler:
         for class_id in self.classes:
             random.shuffle(self.source_indices[class_id])
             random.shuffle(self.target_indices[class_id])
+        source_cursors = {class_id: 0 for class_id in self.classes}
+        target_cursors = {class_id: 0 for class_id in self.classes}
+
+        def next_index(index_map, cursor_map, class_id: int) -> int:
+            """Cycle through a class pool before reusing any sample."""
+
+            pool = index_map[class_id]
+            cursor = cursor_map[class_id]
+            if cursor >= len(pool):
+                random.shuffle(pool)
+                cursor = 0
+            index = pool[cursor]
+            cursor_map[class_id] = cursor + 1
+            return index
 
         num_batches = min(len(self.source_dataset), len(self.target_dataset)) // self.batch_size
         for _ in range(num_batches):
@@ -61,8 +75,12 @@ class PairedClassSampler:
             source_batch_indices = []
             target_batch_indices = []
             for class_id in batch_classes:
-                source_batch_indices.append(random.choice(self.source_indices[class_id]))
-                target_batch_indices.append(random.choice(self.target_indices[class_id]))
+                source_batch_indices.append(
+                    next_index(self.source_indices, source_cursors, class_id)
+                )
+                target_batch_indices.append(
+                    next_index(self.target_indices, target_cursors, class_id)
+                )
 
             source_batch = torch.utils.data.default_collate(
                 [self.source_dataset[idx] for idx in source_batch_indices]
@@ -76,4 +94,3 @@ class PairedClassSampler:
         """Return number of batches per epoch."""
 
         return min(len(self.source_dataset), len(self.target_dataset)) // self.batch_size
-

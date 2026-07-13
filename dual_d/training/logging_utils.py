@@ -43,6 +43,15 @@ def setup_text_logger(log_path: str | Path) -> logging.Logger:
     return logger
 
 
+def close_text_logger(logger: logging.Logger) -> None:
+    """Flush and close all handlers owned by one run logger."""
+
+    for handler in list(logger.handlers):
+        handler.flush()
+        handler.close()
+        logger.removeHandler(handler)
+
+
 class CSVMetricLogger:
     """Append dictionaries of scalar metrics to a CSV file."""
 
@@ -70,4 +79,3 @@ class CSVMetricLogger:
             if write_header:
                 writer.writeheader()
             writer.writerow({field: scalar_row.get(field) for field in self.fieldnames})
-

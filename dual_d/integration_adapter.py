@@ -66,6 +66,7 @@ class DualDTrainingAdapter(nn.Module):
         criterion_cls: Optional[nn.Module] = None,
         source_labels: Optional[torch.Tensor] = None,
         target_labels: Optional[torch.Tensor] = None,
+        adversarial_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Return loss/logs for updating translators and optional base modules."""
 
@@ -76,6 +77,7 @@ class DualDTrainingAdapter(nn.Module):
             criterion_cls=criterion_cls,
             source_labels=source_labels,
             target_labels=target_labels,
+            adversarial_scale=adversarial_scale,
         )
 
     def discriminator_parameters(self):
@@ -113,4 +115,3 @@ class DualDTrainingAdapter(nn.Module):
         if mode == "residual":
             return 0.5 * (target_features + source_like)
         raise ValueError(f"Unsupported inference mode: {mode}")
-
