@@ -13,6 +13,7 @@
   "vis_folder": "可见光",
   "ir_folder": "红外",
   "ais_folder": "AIS",
+  "use_ais": false,
   "source_ais_root": "",
   "target_ais_root": "",
   "target_ais_parent_root": "",

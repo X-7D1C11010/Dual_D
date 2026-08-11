@@ -43,6 +43,15 @@ def _write_domain(root: Path, phases: list[str], offset: int) -> None:
             )
 
 
+def _write_vis_ir_domain(root: Path, phases: list[str], offset: int) -> None:
+    for phase_index, phase in enumerate(phases):
+        for class_index, class_name in enumerate(("0", "1")):
+            stem = f"sample_{class_name}"
+            value = offset + phase_index * 30 + class_index * 60
+            _write_rgb(root / phase / "可见光" / class_name / f"{stem}.png", value)
+            _write_rgb(root / phase / "红外" / class_name / f"{stem}.png", value + 10)
+
+
 class ThreeModalPipelineTests(unittest.TestCase):
     def test_complex_ais_loader_and_encoder(self) -> None:
         with TemporaryDirectory() as directory:
@@ -82,6 +91,28 @@ class ThreeModalPipelineTests(unittest.TestCase):
         self.assertEqual(tuple(sample["ir"].shape), (3, 8, 8))
         self.assertEqual(tuple(sample["ais"].shape), (2, 16))
         self.assertTrue(sample["ais_path"].endswith("sample.npy"))
+
+    def test_dataset_supports_explicit_vis_ir_only_mode(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_rgb(root / "train" / "可见光" / "0" / "sample.png", 32)
+            _write_rgb(root / "train" / "红外" / "0" / "sample.png", 96)
+
+            dataset = MultiModalDomainDataset(
+                root,
+                phase="train",
+                layout="modality_first",
+                image_size=8,
+                resize_size=10,
+                train_augment=False,
+                require_ais=False,
+            )
+            sample = dataset[0]
+
+        self.assertEqual(tuple(sample["vis"].shape), (3, 8, 8))
+        self.assertEqual(tuple(sample["ir"].shape), (3, 8, 8))
+        self.assertNotIn("ais", sample)
+        self.assertEqual(sample["ais_path"], "")
 
     def test_factorized_contraction_matches_explicit_tensor(self) -> None:
         torch.manual_seed(3)
@@ -150,6 +181,7 @@ class ThreeModalPipelineTests(unittest.TestCase):
             feature_dim=16,
             pretrained_visual=False,
             freeze_visual_backbone=False,
+            use_ais=True,
             ais_encoder="complex",
             ais_sequence_length=32,
             ais_dropout=0.0,
@@ -194,6 +226,41 @@ class ThreeModalPipelineTests(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(loss)))
         self.assertIsNotNone(next(models.net_ais.parameters()).grad)
 
+    def test_two_modal_model_path_is_dimensionally_consistent(self) -> None:
+        args = SimpleNamespace(
+            dual_config=str(Path("configs") / "dual_d_default_config.json"),
+            proj_dim=4,
+            feature_dim=16,
+            pretrained_visual=False,
+            freeze_visual_backbone=False,
+            use_ais=False,
+            ais_encoder="complex",
+            ais_sequence_length=32,
+            ais_dropout=0.0,
+            classifier_dropout=0.0,
+        )
+        models = build_models(args, num_classes=2, device=torch.device("cpu"))
+        source = {
+            "vis": torch.randn(2, 3, 64, 64),
+            "ir": torch.randn(2, 3, 64, 64),
+        }
+        target = {
+            "vis": torch.randn(2, 3, 64, 64),
+            "ir": torch.randn(2, 3, 64, 64),
+        }
+        feat_src, feat_tgt, loss_tal = extract_fused_features(
+            models,
+            source,
+            target,
+            torch.device("cpu"),
+        )
+
+        self.assertIsNone(models.net_ais)
+        self.assertEqual(tuple(feat_src.shape), (2, 8))
+        self.assertEqual(tuple(feat_tgt.shape), (2, 8))
+        self.assertTrue(bool(torch.isfinite(loss_tal)))
+        self.assertEqual(tuple(models.classifier(feat_src).shape), (2, 2))
+
     def test_one_epoch_three_modal_training_smoke(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -211,6 +278,7 @@ class ThreeModalPipelineTests(unittest.TestCase):
                     str(root / "runs"),
                     "--run-name",
                     "smoke",
+                    "--use-ais",
                     "--epochs",
                     "1",
                     "--batch-size",
@@ -251,6 +319,62 @@ class ThreeModalPipelineTests(unittest.TestCase):
             )
             self.assertIn("net_ais", checkpoint)
             self.assertEqual(checkpoint["tal"]["U_matrices.2"].shape, torch.Size([8, 2]))
+
+    def test_one_epoch_vis_ir_only_training_smoke(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "晴天"
+            target_root = root / "黑天"
+            _write_vis_ir_domain(source_root, ["train"], 20)
+            _write_vis_ir_domain(target_root, ["train", "val"], 120)
+            args = build_parser({}).parse_args(
+                [
+                    "--source-root",
+                    str(source_root),
+                    "--target-root",
+                    str(target_root),
+                    "--output-dir",
+                    str(root / "runs"),
+                    "--run-name",
+                    "vis_ir_smoke",
+                    "--no-use-ais",
+                    "--epochs",
+                    "1",
+                    "--batch-size",
+                    "2",
+                    "--num-workers",
+                    "0",
+                    "--device",
+                    "cpu",
+                    "--image-size",
+                    "32",
+                    "--resize-size",
+                    "36",
+                    "--feature-dim",
+                    "8",
+                    "--proj-dim",
+                    "2",
+                    "--no-pretrained-visual",
+                    "--no-freeze-visual-backbone",
+                    "--no-data-audit-hashes",
+                    "--early-stopping-patience",
+                    "0",
+                    "--adversarial-warmup-epochs",
+                    "1",
+                ]
+            )
+            batch_summary = run_experiment_matrix(args)
+            checkpoint = torch.load(
+                Path(batch_summary["runs"][0]["run_dir"])
+                / "checkpoints"
+                / "last_model.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+
+            self.assertIsNone(checkpoint["net_ais"])
+            self.assertNotIn("U_matrices.2", checkpoint["tal"])
+            self.assertEqual(checkpoint["classifier"]["fc.0.weight"].shape[1], 4)
 
 
 if __name__ == "__main__":

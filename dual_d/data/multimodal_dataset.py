@@ -191,6 +191,7 @@ class MultiModalDomainDataset(Dataset):
             first and fall back to sorted index when set to ``auto``.
         ais_sequence_length: Fixed length returned for each two-channel signal.
         ais_normalize: Apply per-sample, per-channel standardization.
+        require_ais: Whether each VIS/IR pair also includes an AIS file.
         global_label_map: Optional mapping from raw class names to contiguous
             label ids. Pass the source-domain map into the target domain to keep
             labels aligned.
@@ -212,6 +213,7 @@ class MultiModalDomainDataset(Dataset):
         ais_match: str = "auto",
         ais_sequence_length: int = 128,
         ais_normalize: bool = True,
+        require_ais: bool = True,
         global_label_map: Optional[Dict[str, int]] = None,
         image_size: int = 224,
         resize_size: int = 256,
@@ -238,11 +240,13 @@ class MultiModalDomainDataset(Dataset):
         if self.ais_sequence_length <= 0:
             raise ValueError("ais_sequence_length must be positive.")
         self.ais_normalize = bool(ais_normalize)
+        self.require_ais = bool(require_ais)
 
         self.samples = self._collect_samples()
         if not self.samples:
             raise RuntimeError(
-                f"No aligned VIS/IR/AIS samples found under {self.base_dir} "
+                f"No aligned {'VIS/IR/AIS' if self.require_ais else 'VIS/IR'} "
+                f"samples found under {self.base_dir} "
                 f"with layout={self.layout}, vis_folder={vis_folder}, "
                 f"ir_folder={ir_folder}, ais_folder={ais_folder}, "
                 f"ais_root={self.ais_root}."
@@ -350,11 +354,17 @@ class MultiModalDomainDataset(Dataset):
         vis_files: Sequence[Path],
         ir_files: Sequence[Path],
     ) -> List[SampleRecord]:
-        """Align one class of VIS/IR pairs with one AIS file per sample."""
+        """Align one class of VIS/IR pairs, optionally with real AIS files."""
 
         image_pairs = self._pair_images(vis_files, ir_files)
         if not image_pairs:
             return []
+
+        if not self.require_ais:
+            return [
+                SampleRecord(vis_path, ir_path, raw_label)
+                for vis_path, ir_path in image_pairs
+            ]
 
         ais_dir = self._ais_class_directory(raw_label)
         class_ais_files = ais_files(ais_dir)
@@ -410,7 +420,7 @@ class MultiModalDomainDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index: int):
-        """Load and return one aligned three-modality sample."""
+        """Load one aligned sample in explicit two- or three-modality mode."""
 
         sample = self.samples[index]
         try:
@@ -421,27 +431,27 @@ class MultiModalDomainDataset(Dataset):
                 f"Failed to read paired sample: {sample.vis_path}, {sample.ir_path}"
             ) from exc
 
-        if sample.ais_path is None:
-            raise RuntimeError(f"AIS path is missing for sample: {sample.vis_path}")
-        try:
-            ais_tensor = load_ais_signal(
-                sample.ais_path,
-                sequence_length=self.ais_sequence_length,
-                normalize=self.ais_normalize,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Failed to read AIS sample: {sample.ais_path}") from exc
-
         label = self.label_map[sample.raw_label]
         vis_tensor, ir_tensor = self.transform(vis_img, ir_img)
-        return {
+        result = {
             "vis": vis_tensor,
             "ir": ir_tensor,
-            "ais": ais_tensor,
             "label": torch.tensor(label, dtype=torch.long),
             "domain_label": torch.tensor(self.domain_label, dtype=torch.long),
             "raw_label": sample.raw_label,
             "vis_path": str(sample.vis_path),
             "ir_path": str(sample.ir_path),
-            "ais_path": str(sample.ais_path),
+            "ais_path": str(sample.ais_path) if sample.ais_path is not None else "",
         }
+        if self.require_ais:
+            if sample.ais_path is None:
+                raise RuntimeError(f"AIS path is missing for sample: {sample.vis_path}")
+            try:
+                result["ais"] = load_ais_signal(
+                    sample.ais_path,
+                    sequence_length=self.ais_sequence_length,
+                    normalize=self.ais_normalize,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Failed to read AIS sample: {sample.ais_path}") from exc
+        return result

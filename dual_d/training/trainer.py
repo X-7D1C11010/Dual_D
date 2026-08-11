@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 import random
 import time
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import warnings
 
 import numpy as np
@@ -58,7 +58,7 @@ class ModelBundle:
 
     net_vis: VisualFeatureExtractor
     net_ir: IRFeatureExtractor
-    net_ais: nn.Module
+    net_ais: Optional[nn.Module]
     tal: TensorBasedAlignmentStable
     dual_adapter: DualDTrainingAdapter
     classifier: Classifier
@@ -122,6 +122,7 @@ def build_datasets(args):
         ais_match=args.ais_match,
         ais_sequence_length=args.ais_sequence_length,
         ais_normalize=args.ais_normalize,
+        require_ais=getattr(args, "use_ais", False),
         image_size=args.image_size,
         resize_size=args.resize_size,
         augmentation_strength=getattr(args, "augmentation_strength", 0.0),
@@ -139,6 +140,7 @@ def build_datasets(args):
         ais_match=args.ais_match,
         ais_sequence_length=args.ais_sequence_length,
         ais_normalize=args.ais_normalize,
+        require_ais=getattr(args, "use_ais", False),
         global_label_map=label_map,
         image_size=args.image_size,
         resize_size=args.resize_size,
@@ -156,6 +158,7 @@ def build_datasets(args):
         ais_match=args.ais_match,
         ais_sequence_length=args.ais_sequence_length,
         ais_normalize=args.ais_normalize,
+        require_ais=getattr(args, "use_ais", False),
         global_label_map=label_map,
         image_size=args.image_size,
         resize_size=args.resize_size,
@@ -174,6 +177,7 @@ def build_datasets(args):
         ais_match=args.ais_match,
         ais_sequence_length=args.ais_sequence_length,
         ais_normalize=args.ais_normalize,
+        require_ais=getattr(args, "use_ais", False),
         global_label_map=label_map,
         image_size=args.image_size,
         resize_size=args.resize_size,
@@ -188,7 +192,9 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
     """Instantiate all standalone Dual_D model modules."""
 
     dual_config = load_config(args.dual_config)
-    fused_dim = args.proj_dim * 3
+    use_ais = bool(getattr(args, "use_ais", False))
+    num_modalities = 3 if use_ais else 2
+    fused_dim = args.proj_dim * num_modalities
     if dual_config.feature_dim != fused_dim:
         dual_config.feature_dim = fused_dim
 
@@ -203,16 +209,18 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
     )
 
     net_ir = IRFeatureExtractor(output_dim=args.feature_dim).to(device)
-    net_ais = AISFeatureExtractor(
-        encoder_type=args.ais_encoder,
-        sequence_length=args.ais_sequence_length,
-        output_dim=args.feature_dim,
-        dropout=args.ais_dropout,
-    ).to(device)
+    net_ais = None
+    if use_ais:
+        net_ais = AISFeatureExtractor(
+            encoder_type=args.ais_encoder,
+            sequence_length=args.ais_sequence_length,
+            output_dim=args.feature_dim,
+            dropout=args.ais_dropout,
+        ).to(device)
     tal = TensorBasedAlignmentStable(
-        input_dims=[args.feature_dim, args.feature_dim, args.feature_dim],
-        output_dims=[args.proj_dim, args.proj_dim, args.proj_dim],
-        num_modalities=3,
+        input_dims=[args.feature_dim] * num_modalities,
+        output_dims=[args.proj_dim] * num_modalities,
+        num_modalities=num_modalities,
     ).to(device)
     dual_adapter = DualDTrainingAdapter(dual_config).to(device)
     classifier = Classifier(
@@ -227,9 +235,14 @@ def build_optimizers(args, models: ModelBundle):
     """Build main and discriminator optimizers."""
 
     visual_params = [parameter for parameter in models.net_vis.parameters() if parameter.requires_grad]
+    ais_params = (
+        [parameter for parameter in models.net_ais.parameters() if parameter.requires_grad]
+        if models.net_ais is not None
+        else []
+    )
     main_params = [
         *[parameter for parameter in models.net_ir.parameters() if parameter.requires_grad],
-        *[parameter for parameter in models.net_ais.parameters() if parameter.requires_grad],
+        *ais_params,
         *list(models.tal.parameters()),
         *list(models.dual_adapter.generator_parameters()),
         *list(models.classifier.parameters()),
@@ -255,25 +268,31 @@ def extract_fused_features(
     target_batch: Dict[str, torch.Tensor],
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Extract TAL-aligned VIS/IR/AIS fused source and target features."""
+    """Extract TAL-aligned features in explicit VIS/IR or VIS/IR/AIS mode."""
 
     source_vis = source_batch["vis"].to(device)
     source_ir = source_batch["ir"].to(device)
-    source_ais = source_batch["ais"].to(device)
     target_vis = target_batch["vis"].to(device)
     target_ir = target_batch["ir"].to(device)
-    target_ais = target_batch["ais"].to(device)
 
     source_vis_feat = models.net_vis(source_vis)
     source_ir_feat = models.net_ir(source_ir)
-    source_ais_feat = models.net_ais(source_ais)
     target_vis_feat = models.net_vis(target_vis)
     target_ir_feat = models.net_ir(target_ir)
-    target_ais_feat = models.net_ais(target_ais)
+
+    source_modalities = [source_vis_feat, source_ir_feat]
+    target_modalities = [target_vis_feat, target_ir_feat]
+    if models.net_ais is not None:
+        if "ais" not in source_batch or "ais" not in target_batch:
+            raise RuntimeError(
+                "AIS is enabled but the batch has no AIS tensor. Check AIS roots."
+            )
+        source_modalities.append(models.net_ais(source_batch["ais"].to(device)))
+        target_modalities.append(models.net_ais(target_batch["ais"].to(device)))
 
     projected_source, projected_target, loss_tal = models.tal(
-        [source_vis_feat, source_ir_feat, source_ais_feat],
-        [target_vis_feat, target_ir_feat, target_ais_feat],
+        source_modalities,
+        target_modalities,
     )
     feat_src = torch.cat(projected_source, dim=1)
     feat_tgt = torch.cat(projected_target, dim=1)
@@ -382,7 +401,8 @@ def train_one_epoch(
 
     models.net_vis.train()
     models.net_ir.train()
-    models.net_ais.train()
+    if models.net_ais is not None:
+        models.net_ais.train()
     models.tal.train()
     models.dual_adapter.train()
     models.classifier.train()
@@ -475,10 +495,15 @@ def train_one_epoch(
             )
         loss_total.backward()
 
+        ais_parameters = (
+            [p for p in models.net_ais.parameters() if p.requires_grad]
+            if models.net_ais is not None
+            else []
+        )
         main_parameters = [
             *[p for p in models.net_vis.parameters() if p.requires_grad],
             *[p for p in models.net_ir.parameters() if p.requires_grad],
-            *[p for p in models.net_ais.parameters() if p.requires_grad],
+            *ais_parameters,
             *list(models.tal.parameters()),
             *list(models.dual_adapter.generator_parameters()),
             *list(models.classifier.parameters()),
@@ -606,7 +631,8 @@ def evaluate(
 
     models.net_vis.eval()
     models.net_ir.eval()
-    models.net_ais.eval()
+    if models.net_ais is not None:
+        models.net_ais.eval()
     models.tal.eval()
     models.dual_adapter.eval()
     models.classifier.eval()
@@ -619,13 +645,18 @@ def evaluate(
     for batch in dataloader:
         vis = batch["vis"].to(device)
         ir = batch["ir"].to(device)
-        ais = batch["ais"].to(device)
         labels = batch["label"].to(device)
 
         vis_feat = models.net_vis(vis)
         ir_feat = models.net_ir(ir)
-        ais_feat = models.net_ais(ais)
-        projected_target = models.tal.project_target([vis_feat, ir_feat, ais_feat])
+        modalities = [vis_feat, ir_feat]
+        if models.net_ais is not None:
+            if "ais" not in batch:
+                raise RuntimeError(
+                    "AIS is enabled but the validation batch has no AIS tensor."
+                )
+            modalities.append(models.net_ais(batch["ais"].to(device)))
+        projected_target = models.tal.project_target(modalities)
         features = torch.cat(projected_target, dim=1)
         selected_mode = feature_mode or args.eval_feature_mode
         if selected_mode != "raw":
@@ -668,7 +699,7 @@ def checkpoint_state(
         "metrics": metrics,
         "net_vis": models.net_vis.state_dict(),
         "net_ir": models.net_ir.state_dict(),
-        "net_ais": models.net_ais.state_dict(),
+        "net_ais": models.net_ais.state_dict() if models.net_ais is not None else None,
         "tal": models.tal.state_dict(),
         "dual_adapter": models.dual_adapter.state_dict(),
         "classifier": models.classifier.state_dict(),
@@ -779,10 +810,13 @@ def run_training(args) -> Dict[str, object]:
     )
 
     models = build_models(args, num_classes, device)
-    total_parameters = sum(parameter.numel() for model in models.__dict__.values() for parameter in model.parameters())
+    active_models = [model for model in models.__dict__.values() if model is not None]
+    total_parameters = sum(
+        parameter.numel() for model in active_models for parameter in model.parameters()
+    )
     trainable_parameters = sum(
         parameter.numel()
-        for model in models.__dict__.values()
+        for model in active_models
         for parameter in model.parameters()
         if parameter.requires_grad
     )

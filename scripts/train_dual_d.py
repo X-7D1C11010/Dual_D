@@ -121,6 +121,12 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--ir-folder", default=default("ir_folder", "红外"))
     parser.add_argument("--ais-folder", default=default("ais_folder", "AIS"))
     parser.add_argument(
+        "--use-ais",
+        action=argparse.BooleanOptionalAction,
+        default=default("use_ais", False),
+        help="Enable the AIS data and feature-encoding branch.",
+    )
+    parser.add_argument(
         "--source-ais-root",
         default=default("source_ais_root", ""),
         help="Optional separate source AIS root; omit when AIS is inside source-root.",
@@ -300,9 +306,9 @@ def parse_args() -> argparse.Namespace:
         parser.error("--source-root is required, or provide it in --config.")
     if bool(args.target_root) == bool(args.target_parent_root):
         parser.error("Provide exactly one of --target-root or --target-parent-root.")
-    if args.target_parent_root and args.target_ais_root:
+    if args.use_ais and args.target_parent_root and args.target_ais_root:
         parser.error("Use --target-ais-parent-root for multi-domain experiments.")
-    if args.target_root and args.target_ais_parent_root:
+    if args.use_ais and args.target_root and args.target_ais_parent_root:
         parser.error("Use --target-ais-root for a single target-domain experiment.")
     if args.iterations <= 0:
         parser.error("--iterations must be positive.")
@@ -363,12 +369,12 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
     experiments = resolve_experiments(args)
     if not Path(args.source_root).exists():
         raise FileNotFoundError(f"Source domain does not exist: {args.source_root}")
-    if args.source_ais_root and not Path(args.source_ais_root).exists():
+    if args.use_ais and args.source_ais_root and not Path(args.source_ais_root).exists():
         raise FileNotFoundError(f"Source AIS root does not exist: {args.source_ais_root}")
     for domain, target_root, target_ais_root in experiments:
         if not target_root.exists():
             raise FileNotFoundError(f"Target domain does not exist: {target_root}")
-        if target_ais_root and not Path(target_ais_root).exists():
+        if args.use_ais and target_ais_root and not Path(target_ais_root).exists():
             raise FileNotFoundError(f"Target AIS domain does not exist: {target_ais_root}")
 
     batch_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
