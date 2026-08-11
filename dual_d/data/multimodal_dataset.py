@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from PIL import Image
@@ -35,17 +35,20 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import functional as transform_functional
 
+from .ais_signal import ais_files, load_ais_signal
+
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
 @dataclass
 class SampleRecord:
-    """One paired multimodal image sample."""
+    """One aligned visible/infrared/AIS sample."""
 
     vis_path: Path
     ir_path: Path
     raw_label: str
+    ais_path: Optional[Path] = None
 
 
 def _image_files(directory: Path) -> List[Path]:
@@ -171,7 +174,7 @@ def build_transforms(
 
 
 class MultiModalDomainDataset(Dataset):
-    """Dataset for paired visible/infrared domain samples.
+    """Dataset for aligned visible/infrared/AIS domain samples.
 
     Args:
         root_dir: Root directory for one domain.
@@ -181,6 +184,13 @@ class MultiModalDomainDataset(Dataset):
         layout: ``auto``, ``modality_first``, or ``class_first``.
         vis_folder: Folder name for visible-light images.
         ir_folder: Folder name for infrared images.
+        ais_folder: Folder name for per-sample AIS files.
+        ais_root: Optional separate AIS root. If omitted, AIS is discovered
+            under ``root_dir`` using the same phase and class layout.
+        ais_match: Match AIS files to VIS/IR by stem, sorted index, or try stem
+            first and fall back to sorted index when set to ``auto``.
+        ais_sequence_length: Fixed length returned for each two-channel signal.
+        ais_normalize: Apply per-sample, per-channel standardization.
         global_label_map: Optional mapping from raw class names to contiguous
             label ids. Pass the source-domain map into the target domain to keep
             labels aligned.
@@ -197,6 +207,11 @@ class MultiModalDomainDataset(Dataset):
         layout: str = "auto",
         vis_folder: str = "可见光",
         ir_folder: str = "红外",
+        ais_folder: str = "AIS",
+        ais_root: Optional[str | Path] = None,
+        ais_match: str = "auto",
+        ais_sequence_length: int = 128,
+        ais_normalize: bool = True,
         global_label_map: Optional[Dict[str, int]] = None,
         image_size: int = 224,
         resize_size: int = 256,
@@ -213,12 +228,24 @@ class MultiModalDomainDataset(Dataset):
         self.layout = self._resolve_layout(layout, vis_folder, ir_folder)
         self.vis_folder = vis_folder
         self.ir_folder = ir_folder
+        self.ais_folder = ais_folder
+        self.ais_root = Path(ais_root) if ais_root else self.root_dir
+        self.ais_base_dir = _phase_root(self.ais_root, phase)
+        self.ais_match = str(ais_match).lower()
+        if self.ais_match not in {"auto", "stem", "index"}:
+            raise ValueError(f"Unsupported AIS match mode: {ais_match}")
+        self.ais_sequence_length = int(ais_sequence_length)
+        if self.ais_sequence_length <= 0:
+            raise ValueError("ais_sequence_length must be positive.")
+        self.ais_normalize = bool(ais_normalize)
 
         self.samples = self._collect_samples()
         if not self.samples:
             raise RuntimeError(
-                f"No paired VIS/IR samples found under {self.base_dir} "
-                f"with layout={self.layout}, vis_folder={vis_folder}, ir_folder={ir_folder}."
+                f"No aligned VIS/IR/AIS samples found under {self.base_dir} "
+                f"with layout={self.layout}, vis_folder={vis_folder}, "
+                f"ir_folder={ir_folder}, ais_folder={ais_folder}, "
+                f"ais_root={self.ais_root}."
             )
 
         raw_labels = sorted({sample.raw_label for sample in self.samples})
@@ -276,8 +303,7 @@ class MultiModalDomainDataset(Dataset):
                 continue
             vis_files = _image_files(vis_class_dir)
             ir_files = _image_files(ir_class_dir)
-            for vis_path, ir_path in zip(vis_files, ir_files):
-                records.append(SampleRecord(vis_path, ir_path, raw_label))
+            records.extend(self._align_class_samples(raw_label, vis_files, ir_files))
         return records
 
     def _collect_class_first(self) -> List[SampleRecord]:
@@ -293,9 +319,85 @@ class MultiModalDomainDataset(Dataset):
                 continue
             vis_files = _image_files(vis_dir)
             ir_files = _image_files(ir_dir)
-            for vis_path, ir_path in zip(vis_files, ir_files):
-                records.append(SampleRecord(vis_path, ir_path, raw_label))
+            records.extend(self._align_class_samples(raw_label, vis_files, ir_files))
         return records
+
+    def _ais_class_directory(self, raw_label: str) -> Path:
+        """Resolve a class AIS directory across common server layouts."""
+
+        candidates = [
+            self.ais_base_dir / self.ais_folder / raw_label,
+            self.ais_base_dir / raw_label / self.ais_folder,
+            self.ais_base_dir / raw_label,
+        ]
+        for candidate in candidates:
+            if ais_files(candidate):
+                return candidate
+        return candidates[0]
+
+    @staticmethod
+    def _pair_images(
+        vis_files: Sequence[Path],
+        ir_files: Sequence[Path],
+    ) -> List[Tuple[Path, Path]]:
+        """Preserve the established sorted-index VIS/IR pairing convention."""
+
+        return list(zip(vis_files, ir_files))
+
+    def _align_class_samples(
+        self,
+        raw_label: str,
+        vis_files: Sequence[Path],
+        ir_files: Sequence[Path],
+    ) -> List[SampleRecord]:
+        """Align one class of VIS/IR pairs with one AIS file per sample."""
+
+        image_pairs = self._pair_images(vis_files, ir_files)
+        if not image_pairs:
+            return []
+
+        ais_dir = self._ais_class_directory(raw_label)
+        class_ais_files = ais_files(ais_dir)
+        if not class_ais_files:
+            raise RuntimeError(
+                f"No AIS files found for class={raw_label!r}. Expected files under "
+                f"{ais_dir} or pass a separate AIS root."
+            )
+
+        by_stem = {path.stem: path for path in class_ais_files}
+        stem_matches = [
+            by_stem.get(vis_path.stem) or by_stem.get(ir_path.stem)
+            for vis_path, ir_path in image_pairs
+        ]
+        can_use_stems = all(match is not None for match in stem_matches)
+        if self.ais_match == "stem" and not can_use_stems:
+            missing = [
+                vis_path.stem
+                for (vis_path, _), match in zip(image_pairs, stem_matches)
+                if match is None
+            ]
+            raise RuntimeError(
+                f"AIS stem matching failed for class={raw_label!r}; missing stems: "
+                f"{missing[:10]}"
+            )
+
+        use_stems = self.ais_match == "stem" or (
+            self.ais_match == "auto" and can_use_stems
+        )
+        if use_stems:
+            matched_ais = [match for match in stem_matches if match is not None]
+        else:
+            if len(class_ais_files) < len(image_pairs):
+                raise RuntimeError(
+                    f"AIS count is smaller than VIS/IR count for class={raw_label!r}: "
+                    f"ais={len(class_ais_files)}, image_pairs={len(image_pairs)}."
+                )
+            matched_ais = class_ais_files[: len(image_pairs)]
+
+        return [
+            SampleRecord(vis_path, ir_path, raw_label, ais_path)
+            for (vis_path, ir_path), ais_path in zip(image_pairs, matched_ais)
+        ]
 
     def get_label_map(self) -> Dict[str, int]:
         """Return raw-label to integer-label mapping."""
@@ -308,7 +410,7 @@ class MultiModalDomainDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index: int):
-        """Load and return one paired multimodal sample."""
+        """Load and return one aligned three-modality sample."""
 
         sample = self.samples[index]
         try:
@@ -319,14 +421,27 @@ class MultiModalDomainDataset(Dataset):
                 f"Failed to read paired sample: {sample.vis_path}, {sample.ir_path}"
             ) from exc
 
+        if sample.ais_path is None:
+            raise RuntimeError(f"AIS path is missing for sample: {sample.vis_path}")
+        try:
+            ais_tensor = load_ais_signal(
+                sample.ais_path,
+                sequence_length=self.ais_sequence_length,
+                normalize=self.ais_normalize,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read AIS sample: {sample.ais_path}") from exc
+
         label = self.label_map[sample.raw_label]
         vis_tensor, ir_tensor = self.transform(vis_img, ir_img)
         return {
             "vis": vis_tensor,
             "ir": ir_tensor,
+            "ais": ais_tensor,
             "label": torch.tensor(label, dtype=torch.long),
             "domain_label": torch.tensor(self.domain_label, dtype=torch.long),
             "raw_label": sample.raw_label,
             "vis_path": str(sample.vis_path),
             "ir_path": str(sample.ir_path),
+            "ais_path": str(sample.ais_path),
         }

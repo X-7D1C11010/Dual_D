@@ -66,6 +66,7 @@ class DualDTrainingAdapter(nn.Module):
         criterion_cls: Optional[nn.Module] = None,
         source_labels: Optional[torch.Tensor] = None,
         target_labels: Optional[torch.Tensor] = None,
+        num_classes: Optional[int] = None,
         adversarial_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Return loss/logs for updating translators and optional base modules."""
@@ -77,6 +78,7 @@ class DualDTrainingAdapter(nn.Module):
             criterion_cls=criterion_cls,
             source_labels=source_labels,
             target_labels=target_labels,
+            num_classes=num_classes,
             adversarial_scale=adversarial_scale,
         )
 

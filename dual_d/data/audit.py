@@ -2,7 +2,7 @@
 
 The audit is intentionally independent of model code. It detects accidental
 train/validation reuse, exact content duplicates, missing files, and suspicious
-VIS/IR filename pairing before an experiment is allowed to report metrics.
+VIS/IR/AIS pairing before an experiment is allowed to report metrics.
 """
 
 from __future__ import annotations
@@ -15,7 +15,12 @@ from typing import Dict, Iterable, List, Tuple
 def _resolved_paths(records, attribute: str) -> set[str]:
     """Return normalized absolute paths for one record attribute."""
 
-    return {str(Path(getattr(record, attribute)).resolve()) for record in records}
+    return {
+        str(Path(value).resolve())
+        for record in records
+        for value in [getattr(record, attribute, None)]
+        if value is not None
+    }
 
 
 def _file_digest(path: Path, cache: Dict[str, str]) -> str:
@@ -59,32 +64,47 @@ def audit_dataset_splits(
     val_records = list(getattr(val_dataset, "samples", []))
     train_vis = _resolved_paths(train_records, "vis_path")
     train_ir = _resolved_paths(train_records, "ir_path")
+    train_ais = _resolved_paths(train_records, "ais_path")
     val_vis = _resolved_paths(val_records, "vis_path")
     val_ir = _resolved_paths(val_records, "ir_path")
+    val_ais = _resolved_paths(val_records, "ais_path")
 
     path_overlap_vis = sorted(train_vis & val_vis)
     path_overlap_ir = sorted(train_ir & val_ir)
+    path_overlap_ais = sorted(train_ais & val_ais)
     same_base_dir = Path(train_dataset.base_dir).resolve() == Path(val_dataset.base_dir).resolve()
 
     all_records = train_records + val_records
     missing_files = [
         str(path)
         for record in all_records
-        for path in (record.vis_path, record.ir_path)
-        if not Path(path).is_file()
+        for path in (record.vis_path, record.ir_path, getattr(record, "ais_path", None))
+        if path is not None and not Path(path).is_file()
     ]
     label_path_mismatches = [
         {
             "raw_label": record.raw_label,
             "vis_path": str(record.vis_path),
             "ir_path": str(record.ir_path),
+            "ais_path": str(getattr(record, "ais_path", "")),
         }
         for record in all_records
         if record.raw_label not in record.vis_path.parts
         or record.raw_label not in record.ir_path.parts
+        or (
+            getattr(record, "ais_path", None) is not None
+            and record.raw_label not in record.ais_path.parts
+        )
     ]
     stem_mismatch_count = sum(
         int(record.vis_path.stem != record.ir_path.stem) for record in all_records
+    )
+    ais_stem_mismatch_count = sum(
+        int(
+            getattr(record, "ais_path", None) is not None
+            and record.vis_path.stem != record.ais_path.stem
+        )
+        for record in all_records
     )
 
     audit: Dict[str, object] = {
@@ -95,18 +115,23 @@ def audit_dataset_splits(
         "val_sample_count": len(val_records),
         "path_overlap_vis_count": len(path_overlap_vis),
         "path_overlap_ir_count": len(path_overlap_ir),
+        "path_overlap_ais_count": len(path_overlap_ais),
         "path_overlap_vis_examples": path_overlap_vis[:10],
         "path_overlap_ir_examples": path_overlap_ir[:10],
+        "path_overlap_ais_examples": path_overlap_ais[:10],
         "missing_file_count": len(missing_files),
         "missing_file_examples": missing_files[:10],
         "label_path_mismatch_count": len(label_path_mismatches),
         "label_path_mismatch_examples": label_path_mismatches[:10],
         "vis_ir_stem_mismatch_count": stem_mismatch_count,
+        "vis_ais_stem_mismatch_count": ais_stem_mismatch_count,
         "content_hash_checked": bool(hash_contents),
         "content_overlap_vis_count": 0,
         "content_overlap_ir_count": 0,
+        "content_overlap_ais_count": 0,
         "content_overlap_vis_examples": [],
         "content_overlap_ir_examples": [],
+        "content_overlap_ais_examples": [],
     }
 
     if hash_contents:
@@ -118,12 +143,25 @@ def audit_dataset_splits(
             [record.ir_path for record in train_records],
             [record.ir_path for record in val_records],
         )
+        train_ais_paths = [
+            record.ais_path
+            for record in train_records
+            if getattr(record, "ais_path", None) is not None
+        ]
+        val_ais_paths = [
+            record.ais_path
+            for record in val_records
+            if getattr(record, "ais_path", None) is not None
+        ]
+        ais_count, ais_examples = _content_overlaps(train_ais_paths, val_ais_paths)
         audit.update(
             {
                 "content_overlap_vis_count": vis_count,
                 "content_overlap_ir_count": ir_count,
                 "content_overlap_vis_examples": vis_examples,
                 "content_overlap_ir_examples": ir_examples,
+                "content_overlap_ais_count": ais_count,
+                "content_overlap_ais_examples": ais_examples,
             }
         )
 
@@ -131,8 +169,10 @@ def audit_dataset_splits(
         same_base_dir
         or path_overlap_vis
         or path_overlap_ir
+        or path_overlap_ais
         or audit["content_overlap_vis_count"]
         or audit["content_overlap_ir_count"]
+        or audit["content_overlap_ais_count"]
     )
     return audit
 
@@ -143,12 +183,20 @@ def data_audit_errors(audit: Dict[str, object]) -> List[str]:
     errors = []
     if audit.get("same_base_dir"):
         errors.append("target train and validation resolve to the same directory")
-    if audit.get("path_overlap_vis_count") or audit.get("path_overlap_ir_count"):
-        errors.append("target train and validation share image paths")
-    if audit.get("content_overlap_vis_count") or audit.get("content_overlap_ir_count"):
-        errors.append("target train and validation contain byte-identical images")
+    if (
+        audit.get("path_overlap_vis_count")
+        or audit.get("path_overlap_ir_count")
+        or audit.get("path_overlap_ais_count")
+    ):
+        errors.append("target train and validation share VIS/IR/AIS paths")
+    if (
+        audit.get("content_overlap_vis_count")
+        or audit.get("content_overlap_ir_count")
+        or audit.get("content_overlap_ais_count")
+    ):
+        errors.append("target train and validation contain byte-identical modality files")
     if audit.get("missing_file_count"):
-        errors.append("dataset records reference missing image files")
+        errors.append("dataset records reference missing modality files")
     if audit.get("label_path_mismatch_count"):
         errors.append("a sample label does not match its class directory")
     return errors

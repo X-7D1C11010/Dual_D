@@ -39,6 +39,7 @@ from dual_d.data import (
 )
 from dual_d.integration_adapter import DualDTrainingAdapter
 from dual_d.models import (
+    AISFeatureExtractor,
     Classifier,
     IRFeatureExtractor,
     LabelSmoothingCrossEntropy,
@@ -57,6 +58,7 @@ class ModelBundle:
 
     net_vis: VisualFeatureExtractor
     net_ir: IRFeatureExtractor
+    net_ais: nn.Module
     tal: TensorBasedAlignmentStable
     dual_adapter: DualDTrainingAdapter
     classifier: Classifier
@@ -115,6 +117,11 @@ def build_datasets(args):
         layout=args.source_layout,
         vis_folder=args.vis_folder,
         ir_folder=args.ir_folder,
+        ais_folder=args.ais_folder,
+        ais_root=getattr(args, "source_ais_root", "") or None,
+        ais_match=args.ais_match,
+        ais_sequence_length=args.ais_sequence_length,
+        ais_normalize=args.ais_normalize,
         image_size=args.image_size,
         resize_size=args.resize_size,
         augmentation_strength=getattr(args, "augmentation_strength", 0.0),
@@ -127,6 +134,11 @@ def build_datasets(args):
         layout=args.target_layout,
         vis_folder=args.vis_folder,
         ir_folder=args.ir_folder,
+        ais_folder=args.ais_folder,
+        ais_root=getattr(args, "target_ais_root", "") or None,
+        ais_match=args.ais_match,
+        ais_sequence_length=args.ais_sequence_length,
+        ais_normalize=args.ais_normalize,
         global_label_map=label_map,
         image_size=args.image_size,
         resize_size=args.resize_size,
@@ -139,6 +151,11 @@ def build_datasets(args):
         layout=args.target_layout,
         vis_folder=args.vis_folder,
         ir_folder=args.ir_folder,
+        ais_folder=args.ais_folder,
+        ais_root=getattr(args, "target_ais_root", "") or None,
+        ais_match=args.ais_match,
+        ais_sequence_length=args.ais_sequence_length,
+        ais_normalize=args.ais_normalize,
         global_label_map=label_map,
         image_size=args.image_size,
         resize_size=args.resize_size,
@@ -152,6 +169,11 @@ def build_datasets(args):
         layout=args.target_layout,
         vis_folder=args.vis_folder,
         ir_folder=args.ir_folder,
+        ais_folder=args.ais_folder,
+        ais_root=getattr(args, "target_ais_root", "") or None,
+        ais_match=args.ais_match,
+        ais_sequence_length=args.ais_sequence_length,
+        ais_normalize=args.ais_normalize,
         global_label_map=label_map,
         image_size=args.image_size,
         resize_size=args.resize_size,
@@ -166,7 +188,7 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
     """Instantiate all standalone Dual_D model modules."""
 
     dual_config = load_config(args.dual_config)
-    fused_dim = args.proj_dim * 2
+    fused_dim = args.proj_dim * 3
     if dual_config.feature_dim != fused_dim:
         dual_config.feature_dim = fused_dim
 
@@ -181,10 +203,16 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
     )
 
     net_ir = IRFeatureExtractor(output_dim=args.feature_dim).to(device)
+    net_ais = AISFeatureExtractor(
+        encoder_type=args.ais_encoder,
+        sequence_length=args.ais_sequence_length,
+        output_dim=args.feature_dim,
+        dropout=args.ais_dropout,
+    ).to(device)
     tal = TensorBasedAlignmentStable(
-        input_dims=[args.feature_dim, args.feature_dim],
-        output_dims=[args.proj_dim, args.proj_dim],
-        num_modalities=2,
+        input_dims=[args.feature_dim, args.feature_dim, args.feature_dim],
+        output_dims=[args.proj_dim, args.proj_dim, args.proj_dim],
+        num_modalities=3,
     ).to(device)
     dual_adapter = DualDTrainingAdapter(dual_config).to(device)
     classifier = Classifier(
@@ -192,7 +220,7 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
         num_classes=num_classes,
         dropout=getattr(args, "classifier_dropout", 0.30),
     ).to(device)
-    return ModelBundle(net_vis, net_ir, tal, dual_adapter, classifier)
+    return ModelBundle(net_vis, net_ir, net_ais, tal, dual_adapter, classifier)
 
 
 def build_optimizers(args, models: ModelBundle):
@@ -201,6 +229,7 @@ def build_optimizers(args, models: ModelBundle):
     visual_params = [parameter for parameter in models.net_vis.parameters() if parameter.requires_grad]
     main_params = [
         *[parameter for parameter in models.net_ir.parameters() if parameter.requires_grad],
+        *[parameter for parameter in models.net_ais.parameters() if parameter.requires_grad],
         *list(models.tal.parameters()),
         *list(models.dual_adapter.generator_parameters()),
         *list(models.classifier.parameters()),
@@ -226,21 +255,25 @@ def extract_fused_features(
     target_batch: Dict[str, torch.Tensor],
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Extract TAL-aligned fused source and target features."""
+    """Extract TAL-aligned VIS/IR/AIS fused source and target features."""
 
     source_vis = source_batch["vis"].to(device)
     source_ir = source_batch["ir"].to(device)
+    source_ais = source_batch["ais"].to(device)
     target_vis = target_batch["vis"].to(device)
     target_ir = target_batch["ir"].to(device)
+    target_ais = target_batch["ais"].to(device)
 
     source_vis_feat = models.net_vis(source_vis)
     source_ir_feat = models.net_ir(source_ir)
+    source_ais_feat = models.net_ais(source_ais)
     target_vis_feat = models.net_vis(target_vis)
     target_ir_feat = models.net_ir(target_ir)
+    target_ais_feat = models.net_ais(target_ais)
 
     projected_source, projected_target, loss_tal = models.tal(
-        [source_vis_feat, source_ir_feat],
-        [target_vis_feat, target_ir_feat],
+        [source_vis_feat, source_ir_feat, source_ais_feat],
+        [target_vis_feat, target_ir_feat, target_ais_feat],
     )
     feat_src = torch.cat(projected_source, dim=1)
     feat_tgt = torch.cat(projected_target, dim=1)
@@ -342,12 +375,14 @@ def train_one_epoch(
     optimizer_disc,
     criterion_cls: nn.Module,
     device: torch.device,
+    num_classes: int,
     epoch: int,
 ) -> Dict[str, float]:
     """Train all Dual_D components for one epoch."""
 
     models.net_vis.train()
     models.net_ir.train()
+    models.net_ais.train()
     models.tal.train()
     models.dual_adapter.train()
     models.classifier.train()
@@ -429,6 +464,7 @@ def train_one_epoch(
             criterion_cls=criterion_cls,
             source_labels=source_labels,
             target_labels=target_labels,
+            num_classes=num_classes,
             adversarial_scale=adversarial_scale,
         )
         _accumulate_logs(totals, g_logs)
@@ -442,6 +478,7 @@ def train_one_epoch(
         main_parameters = [
             *[p for p in models.net_vis.parameters() if p.requires_grad],
             *[p for p in models.net_ir.parameters() if p.requires_grad],
+            *[p for p in models.net_ais.parameters() if p.requires_grad],
             *list(models.tal.parameters()),
             *list(models.dual_adapter.generator_parameters()),
             *list(models.classifier.parameters()),
@@ -542,6 +579,11 @@ def train_one_epoch(
             "dual_d_contrastive",
             steps,
         ),
+        "train_dual_d_prototype_contrastive": _average_logged_metric(
+            totals,
+            "dual_d_prototype_contrastive",
+            steps,
+        ),
         "train_dual_d_classification_feedback": _average_logged_metric(
             totals,
             "dual_d_classification_feedback",
@@ -564,6 +606,7 @@ def evaluate(
 
     models.net_vis.eval()
     models.net_ir.eval()
+    models.net_ais.eval()
     models.tal.eval()
     models.dual_adapter.eval()
     models.classifier.eval()
@@ -576,11 +619,13 @@ def evaluate(
     for batch in dataloader:
         vis = batch["vis"].to(device)
         ir = batch["ir"].to(device)
+        ais = batch["ais"].to(device)
         labels = batch["label"].to(device)
 
         vis_feat = models.net_vis(vis)
         ir_feat = models.net_ir(ir)
-        projected_target = models.tal.project_target([vis_feat, ir_feat])
+        ais_feat = models.net_ais(ais)
+        projected_target = models.tal.project_target([vis_feat, ir_feat, ais_feat])
         features = torch.cat(projected_target, dim=1)
         selected_mode = feature_mode or args.eval_feature_mode
         if selected_mode != "raw":
@@ -623,6 +668,7 @@ def checkpoint_state(
         "metrics": metrics,
         "net_vis": models.net_vis.state_dict(),
         "net_ir": models.net_ir.state_dict(),
+        "net_ais": models.net_ais.state_dict(),
         "tal": models.tal.state_dict(),
         "dual_adapter": models.dual_adapter.state_dict(),
         "classifier": models.classifier.state_dict(),
@@ -666,14 +712,17 @@ def run_training(args) -> Dict[str, object]:
     save_json(data_audit, run_dir / "data_audit.json")
     audit_errors = data_audit_errors(data_audit)
     logger.info(
-        "Data audit: same_dir=%s | path_overlap(vis/ir)=%d/%d | "
-        "content_overlap(vis/ir)=%d/%d | stem_mismatch=%d",
+        "Data audit: same_dir=%s | path_overlap(vis/ir/ais)=%d/%d/%d | "
+        "content_overlap(vis/ir/ais)=%d/%d/%d | stem_mismatch(vis-ir/vis-ais)=%d/%d",
         data_audit["same_base_dir"],
         data_audit["path_overlap_vis_count"],
         data_audit["path_overlap_ir_count"],
+        data_audit["path_overlap_ais_count"],
         data_audit["content_overlap_vis_count"],
         data_audit["content_overlap_ir_count"],
+        data_audit["content_overlap_ais_count"],
         data_audit["vis_ir_stem_mismatch_count"],
+        data_audit["vis_ais_stem_mismatch_count"],
     )
     if audit_errors:
         message = "Data audit failed: " + "; ".join(audit_errors)
@@ -779,6 +828,7 @@ def run_training(args) -> Dict[str, object]:
             optimizer_disc=optimizer_disc,
             criterion_cls=criterion_cls,
             device=device,
+            num_classes=num_classes,
             epoch=epoch,
         )
         val_metrics = evaluate(

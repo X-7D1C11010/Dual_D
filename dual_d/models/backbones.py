@@ -9,6 +9,9 @@ Module purpose:
 Public interfaces:
     - VisualFeatureExtractor
     - IRFeatureExtractor
+    - ComplexAISFeatureExtractor
+    - AISMlpFeatureExtractor
+    - AISFeatureExtractor
     - Classifier
     - LabelSmoothingCrossEntropy
     - set_requires_grad
@@ -87,6 +90,156 @@ class IRFeatureExtractor(nn.Module):
         return self.proj(features)
 
 
+class ComplexConv1d(nn.Module):
+    """Complex-valued 1-D convolution implemented with real convolutions.
+
+    For ``W=A+iB`` and ``X=I+iQ`` this layer computes
+    ``real=A*I-B*Q`` and ``imag=B*I+A*Q``.  It preserves I/Q coupling instead
+    of treating the two channels as unrelated real-valued attributes.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        padding: int = 0,
+    ):
+        super().__init__()
+        self.real_conv = nn.Conv1d(
+            int(in_channels),
+            int(out_channels),
+            int(kernel_size),
+            padding=int(padding),
+            bias=False,
+        )
+        self.imag_conv = nn.Conv1d(
+            int(in_channels),
+            int(out_channels),
+            int(kernel_size),
+            padding=int(padding),
+            bias=False,
+        )
+
+    def forward(
+        self,
+        real: torch.Tensor,
+        imag: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return real and imaginary outputs of the complex convolution."""
+
+        real_out = self.real_conv(real) - self.imag_conv(imag)
+        imag_out = self.real_conv(imag) + self.imag_conv(real)
+        return real_out, imag_out
+
+
+class ComplexAISFeatureExtractor(nn.Module):
+    """Complex-valued encoder for two-channel I/Q AIS sequences."""
+
+    def __init__(self, output_dim: int = 512, dropout: float = 0.10):
+        super().__init__()
+        self.conv1 = ComplexConv1d(1, 32, kernel_size=5, padding=2)
+        self.real_bn1 = nn.BatchNorm1d(32)
+        self.imag_bn1 = nn.BatchNorm1d(32)
+        self.conv2 = ComplexConv1d(32, 64, kernel_size=3, padding=1)
+        self.real_bn2 = nn.BatchNorm1d(64)
+        self.imag_bn2 = nn.BatchNorm1d(64)
+        self.pool = nn.MaxPool1d(kernel_size=2)
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.proj = nn.Sequential(
+            nn.Linear(128, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(float(dropout)),
+            nn.Linear(256, int(output_dim)),
+        )
+
+    @staticmethod
+    def _activate_pair(
+        real: torch.Tensor,
+        imag: torch.Tensor,
+        real_bn: nn.Module,
+        imag_bn: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        real = F.relu(real_bn(real), inplace=True)
+        imag = F.relu(imag_bn(imag), inplace=True)
+        return real, imag
+
+    def forward(self, signals: torch.Tensor) -> torch.Tensor:
+        """Encode AIS tensors with shape ``[batch, 2, sequence_length]``."""
+
+        if signals.dim() != 3 or signals.size(1) != 2:
+            raise ValueError(
+                "Complex AIS encoder expects [batch, 2, sequence_length], "
+                f"got {tuple(signals.shape)}."
+            )
+        real = signals[:, 0:1, :]
+        imag = signals[:, 1:2, :]
+        real, imag = self.conv1(real, imag)
+        real, imag = self._activate_pair(real, imag, self.real_bn1, self.imag_bn1)
+        real, imag = self.pool(real), self.pool(imag)
+        real, imag = self.conv2(real, imag)
+        real, imag = self._activate_pair(real, imag, self.real_bn2, self.imag_bn2)
+        real = torch.flatten(self.avgpool(real), 1)
+        imag = torch.flatten(self.avgpool(imag), 1)
+        return self.proj(torch.cat([real, imag], dim=1))
+
+
+class AISMlpFeatureExtractor(nn.Module):
+    """MLP alternative for pre-extracted or non-complex AIS feature vectors."""
+
+    def __init__(
+        self,
+        sequence_length: int = 128,
+        output_dim: int = 512,
+        dropout: float = 0.10,
+    ):
+        super().__init__()
+        self.sequence_length = int(sequence_length)
+        self.net = nn.Sequential(
+            nn.Linear(2 * self.sequence_length, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(float(dropout)),
+            nn.Linear(256, int(output_dim)),
+        )
+
+    def forward(self, signals: torch.Tensor) -> torch.Tensor:
+        """Flatten a fixed-size two-channel AIS tensor and return features."""
+
+        if signals.dim() != 3 or signals.size(1) != 2:
+            raise ValueError(
+                "AIS MLP encoder expects [batch, 2, sequence_length], "
+                f"got {tuple(signals.shape)}."
+            )
+        if signals.size(2) != self.sequence_length:
+            raise ValueError(
+                f"Expected AIS sequence length {self.sequence_length}, "
+                f"got {signals.size(2)}."
+            )
+        return self.net(torch.flatten(signals, 1))
+
+
+def AISFeatureExtractor(
+    encoder_type: str = "complex",
+    sequence_length: int = 128,
+    output_dim: int = 512,
+    dropout: float = 0.10,
+) -> nn.Module:
+    """Build the configured AIS encoder."""
+
+    encoder_type = str(encoder_type).lower()
+    if encoder_type == "complex":
+        return ComplexAISFeatureExtractor(output_dim=output_dim, dropout=dropout)
+    if encoder_type == "mlp":
+        return AISMlpFeatureExtractor(
+            sequence_length=sequence_length,
+            output_dim=output_dim,
+            dropout=dropout,
+        )
+    raise ValueError(f"Unsupported AIS encoder type: {encoder_type}")
+
+
 class Classifier(nn.Module):
     """MLP classifier for fused multimodal features."""
 
@@ -147,4 +300,3 @@ def set_requires_grad(model: nn.Module, requires_grad: bool = False) -> None:
 
     for parameter in model.parameters():
         parameter.requires_grad = bool(requires_grad)
-

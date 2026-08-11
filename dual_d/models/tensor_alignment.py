@@ -4,14 +4,18 @@ Module purpose:
     Provide a standalone implementation of the stable tensor alignment layer
     used before the Dual_D feature-level adversarial module. It projects source
     and target modality features into a shared low-dimensional space while
-    maximizing paired correlation.
+    maximizing paired correlation.  The forward path uses an algebraically
+    factorized tensor contraction so three 512-D modalities do not materialize
+    an infeasible ``512 x 512 x 512`` outer-product tensor.
 
 Public interface:
     - TensorBasedAlignmentStable
 
 Usage:
-    >>> tal = TensorBasedAlignmentStable([512, 512], [128, 128], num_modalities=2)
-    >>> (p_s_vis, p_s_ir), (p_t_vis, p_t_ir), loss = tal([s_vis, s_ir], [t_vis, t_ir])
+    >>> tal = TensorBasedAlignmentStable([512, 512, 512], [128, 128, 128], num_modalities=3)
+    >>> projected_source, projected_target, loss = tal(
+    ...     [s_vis, s_ir, s_ais], [t_vis, t_ir, t_ais]
+    ... )
 """
 
 from __future__ import annotations
@@ -123,6 +127,32 @@ class TensorBasedAlignmentStable(nn.Module):
         similarity = torch.mm(source_norm, target_norm.t())
         return torch.diagonal(similarity).mean()
 
+    @staticmethod
+    def factorized_tensor_contraction(
+        modalities: List[torch.Tensor],
+        matrices: nn.ParameterList | List[torch.Tensor],
+        exclude_mode: int,
+    ) -> torch.Tensor:
+        """Contract an outer-product tensor without explicitly constructing it.
+
+        For one sample, the multimodal tensor is a rank-one outer product.  If
+        all modes except ``exclude_mode`` are projected and summed, the exact
+        result is the unprojected feature in the excluded mode multiplied by
+        the product of the summed projected features from every other mode.
+        This is mathematically equivalent to ``create_multimodal_tensor`` plus
+        repeated mode products and ``tensor_contraction`` but uses linear
+        rather than multiplicative memory in the modality dimensions.
+        """
+
+        result = modalities[exclude_mode]
+        scale = result.new_ones((result.size(0), 1))
+        for idx, (features, matrix) in enumerate(zip(modalities, matrices)):
+            if idx == exclude_mode:
+                continue
+            projected = torch.mm(features, matrix)
+            scale = scale * projected.sum(dim=1, keepdim=True)
+        return result * scale
+
     def project_source(self, source_modalities: List[torch.Tensor]) -> List[torch.Tensor]:
         """Project source-domain modality features."""
 
@@ -146,27 +176,29 @@ class TensorBasedAlignmentStable(nn.Module):
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         """Project modalities and return correlation alignment loss."""
 
-        source_tensor = self.create_multimodal_tensor(source_modalities)
-        target_tensor = self.create_multimodal_tensor(target_modalities)
+        if len(source_modalities) != self.num_modalities:
+            raise ValueError(
+                f"Expected {self.num_modalities} source modalities, "
+                f"got {len(source_modalities)}."
+            )
+        if len(target_modalities) != self.num_modalities:
+            raise ValueError(
+                f"Expected {self.num_modalities} target modalities, "
+                f"got {len(target_modalities)}."
+            )
 
         total_correlation = source_modalities[0].new_tensor(0.0)
         for mode in range(self.num_modalities):
-            source_projected = source_tensor
-            target_projected = target_tensor
-            for idx in range(self.num_modalities):
-                if idx != mode:
-                    source_projected = self.mode_n_product(
-                        source_projected,
-                        self.U_matrices[idx],
-                        idx,
-                    )
-                    target_projected = self.mode_n_product(
-                        target_projected,
-                        self.V_matrices[idx],
-                        idx,
-                    )
-            source_contracted = self.tensor_contraction(source_projected, mode)
-            target_contracted = self.tensor_contraction(target_projected, mode)
+            source_contracted = self.factorized_tensor_contraction(
+                source_modalities,
+                self.U_matrices,
+                mode,
+            )
+            target_contracted = self.factorized_tensor_contraction(
+                target_modalities,
+                self.V_matrices,
+                mode,
+            )
             total_correlation = total_correlation + self.compute_correlation_score(
                 source_contracted,
                 target_contracted,
@@ -186,4 +218,3 @@ class TensorBasedAlignmentStable(nn.Module):
                 q_target, _ = torch.linalg.qr(self.V_matrices[idx].data, mode="reduced")
                 self.U_matrices[idx].data = q_source[:, : self.output_dims[idx]]
                 self.V_matrices[idx].data = q_target[:, : self.output_dims[idx]]
-

@@ -3,7 +3,7 @@
 Module purpose:
     Start full Dual_D training from the independent ``Dual_D`` folder. This
     script does not import files from JMDA-Net or any other sibling project.
-    It trains the visual/IR feature extractors, tensor alignment module,
+    It trains the visual/IR/AIS feature extractors, tensor alignment module,
     bidirectional feature translator, primary discriminator, auxiliary
     discriminator, and classifier.
 
@@ -35,16 +35,20 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
+from datetime import datetime
 import json
 from pathlib import Path
+from statistics import mean, pstdev
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dual_d.training.trainer import run_training  # noqa: E402
+from dual_d.training.checkpointing import save_json  # noqa: E402
 
 
 def load_json_defaults(path: str | Path | None) -> Dict[str, Any]:
@@ -81,6 +85,23 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
 
     parser.add_argument("--source-root", default=default("source_root", ""))
     parser.add_argument("--target-root", default=default("target_root", ""))
+    parser.add_argument(
+        "--target-parent-root",
+        default=default("target_parent_root", ""),
+        help="Parent containing all adverse-weather target-domain folders.",
+    )
+    parser.add_argument(
+        "--target-domains",
+        nargs="+",
+        default=default("target_domains", ["黑天", "逆光", "雾天", "雨天"]),
+        help="Target-domain folder names used with --target-parent-root.",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=default("iterations", 1),
+        help="Independent training repetitions per target domain.",
+    )
     parser.add_argument("--output-dir", default=default("output_dir", str(PROJECT_ROOT / "runs")))
     parser.add_argument("--run-name", default=default("run_name", ""))
 
@@ -98,6 +119,50 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     )
     parser.add_argument("--vis-folder", default=default("vis_folder", "可见光"))
     parser.add_argument("--ir-folder", default=default("ir_folder", "红外"))
+    parser.add_argument("--ais-folder", default=default("ais_folder", "AIS"))
+    parser.add_argument(
+        "--source-ais-root",
+        default=default("source_ais_root", ""),
+        help="Optional separate source AIS root; omit when AIS is inside source-root.",
+    )
+    parser.add_argument(
+        "--target-ais-root",
+        default=default("target_ais_root", ""),
+        help="Optional separate AIS root for one --target-root experiment.",
+    )
+    parser.add_argument(
+        "--target-ais-parent-root",
+        default=default("target_ais_parent_root", ""),
+        help="Optional AIS parent with the same weather subfolders as target-parent-root.",
+    )
+    parser.add_argument(
+        "--ais-match",
+        choices=["auto", "stem", "index"],
+        default=default("ais_match", "auto"),
+        help="How each AIS file is matched to its VIS/IR sample.",
+    )
+    parser.add_argument(
+        "--ais-sequence-length",
+        type=int,
+        default=default("ais_sequence_length", 128),
+    )
+    parser.add_argument(
+        "--ais-encoder",
+        choices=["complex", "mlp"],
+        default=default("ais_encoder", "complex"),
+        help="Complex I/Q encoder or MLP for pre-extracted numerical AIS features.",
+    )
+    parser.add_argument(
+        "--ais-dropout",
+        type=float,
+        default=default("ais_dropout", 0.1),
+    )
+    parser.add_argument(
+        "--ais-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=default("ais_normalize", True),
+        help="Apply per-sample I/Q standardization.",
+    )
 
     parser.add_argument("--epochs", type=int, default=default("epochs", 100))
     parser.add_argument("--batch-size", type=int, default=default("batch_size", 32))
@@ -163,7 +228,7 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         "--adversarial-warmup-epochs",
         type=int,
         default=default("adversarial_warmup_epochs", 5),
-        help="Classifier/TAL-only epochs before discriminator updates begin.",
+        help="Epochs before discriminator updates and generator adversarial terms begin.",
     )
     parser.add_argument(
         "--adversarial-ramp-epochs",
@@ -204,7 +269,7 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         "--data-audit-hashes",
         action=argparse.BooleanOptionalAction,
         default=default("data_audit_hashes", True),
-        help="Hash target train/validation images to detect exact duplicate content.",
+        help="Hash target train/validation VIS/IR/AIS files to detect duplicates.",
     )
     parser.add_argument(
         "--strict-data-audit",
@@ -233,8 +298,22 @@ def parse_args() -> argparse.Namespace:
 
     if not args.source_root:
         parser.error("--source-root is required, or provide it in --config.")
-    if not args.target_root:
-        parser.error("--target-root is required, or provide it in --config.")
+    if bool(args.target_root) == bool(args.target_parent_root):
+        parser.error("Provide exactly one of --target-root or --target-parent-root.")
+    if args.target_parent_root and args.target_ais_root:
+        parser.error("Use --target-ais-parent-root for multi-domain experiments.")
+    if args.target_root and args.target_ais_parent_root:
+        parser.error("Use --target-ais-root for a single target-domain experiment.")
+    if args.iterations <= 0:
+        parser.error("--iterations must be positive.")
+    if args.epochs <= 0:
+        parser.error("--epochs must be positive.")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive.")
+    if args.ais_sequence_length <= 0:
+        parser.error("--ais-sequence-length must be positive.")
+    if not 0.0 <= args.ais_dropout < 1.0:
+        parser.error("--ais-dropout must be in [0, 1).")
     if args.discriminator_update_interval <= 0:
         parser.error("--discriminator-update-interval must be positive.")
     if not 0.0 <= args.label_smoothing < 1.0:
@@ -254,14 +333,121 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def resolve_experiments(args: argparse.Namespace) -> List[Tuple[str, Path, str]]:
+    """Resolve one or four target domains and their optional AIS roots."""
+
+    if args.target_root:
+        target_root = Path(args.target_root)
+        return [(target_root.name, target_root, str(args.target_ais_root or ""))]
+
+    domains = args.target_domains
+    if isinstance(domains, str):
+        domains = [item.strip() for item in domains.split(",") if item.strip()]
+    if not domains:
+        raise ValueError("At least one --target-domains entry is required.")
+
+    target_parent = Path(args.target_parent_root)
+    ais_parent = Path(args.target_ais_parent_root) if args.target_ais_parent_root else None
+    experiments = []
+    for domain in domains:
+        domain = str(domain)
+        target_root = target_parent / domain
+        target_ais_root = str(ais_parent / domain) if ais_parent is not None else ""
+        experiments.append((domain, target_root, target_ais_root))
+    return experiments
+
+
+def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
+    """Run every target domain for the requested number of independent trials."""
+
+    experiments = resolve_experiments(args)
+    if not Path(args.source_root).exists():
+        raise FileNotFoundError(f"Source domain does not exist: {args.source_root}")
+    if args.source_ais_root and not Path(args.source_ais_root).exists():
+        raise FileNotFoundError(f"Source AIS root does not exist: {args.source_ais_root}")
+    for domain, target_root, target_ais_root in experiments:
+        if not target_root.exists():
+            raise FileNotFoundError(f"Target domain does not exist: {target_root}")
+        if target_ais_root and not Path(target_ais_root).exists():
+            raise FileNotFoundError(f"Target AIS domain does not exist: {target_ais_root}")
+
+    batch_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    total_runs = len(experiments) * int(args.iterations)
+    summaries: List[Dict[str, Any]] = []
+    run_index = 0
+
+    for domain, target_root, target_ais_root in experiments:
+        for iteration in range(1, int(args.iterations) + 1):
+            run_index += 1
+            run_args = deepcopy(args)
+            run_args.target_root = str(target_root)
+            run_args.target_ais_root = target_ais_root
+            run_args.seed = int(args.seed) + run_index - 1
+            run_args.target_domain_name = domain
+            run_args.iteration_index = iteration
+            if total_runs > 1:
+                prefix = args.run_name.strip() or "dual_d"
+                safe_domain = Path(domain).name
+                run_args.run_name = (
+                    f"{prefix}_{safe_domain}_iter{iteration:02d}_{batch_timestamp}"
+                )
+
+            print(
+                f"Starting run {run_index}/{total_runs}: "
+                f"domain={domain}, iteration={iteration}, seed={run_args.seed}"
+            )
+            summary = run_training(run_args)
+            summary = {
+                **summary,
+                "target_domain": domain,
+                "target_root": str(target_root),
+                "target_ais_root": target_ais_root,
+                "iteration": iteration,
+                "seed": run_args.seed,
+            }
+            summaries.append(summary)
+
+    domain_statistics: Dict[str, Dict[str, float]] = {}
+    for domain, _, _ in experiments:
+        accuracies = [
+            float(item["best_acc"])
+            for item in summaries
+            if item["target_domain"] == domain
+        ]
+        domain_statistics[domain] = {
+            "runs": len(accuracies),
+            "best_acc_mean": mean(accuracies),
+            "best_acc_std": pstdev(accuracies) if len(accuracies) > 1 else 0.0,
+            "best_acc_min": min(accuracies),
+            "best_acc_max": max(accuracies),
+        }
+
+    batch_summary = {
+        "batch_timestamp": batch_timestamp,
+        "iterations": int(args.iterations),
+        "target_domains": [domain for domain, _, _ in experiments],
+        "total_runs": total_runs,
+        "domain_statistics": domain_statistics,
+        "runs": summaries,
+    }
+    summary_path = Path(args.output_dir) / f"batch_summary_{batch_timestamp}.json"
+    save_json(batch_summary, summary_path)
+    batch_summary["summary_path"] = str(summary_path)
+    return batch_summary
+
+
 def main() -> None:
     """CLI main function."""
 
     args = parse_args()
-    summary = run_training(args)
-    print("Dual_D training complete.")
-    print(f"Run directory: {summary['run_dir']}")
-    print(f"Best validation accuracy: {summary['best_acc']:.4f}")
+    summary = run_experiment_matrix(args)
+    print("Dual_D experiment matrix complete.")
+    print(f"Batch summary: {summary['summary_path']}")
+    for domain, metrics in summary["domain_statistics"].items():
+        print(
+            f"{domain}: best val acc {metrics['best_acc_mean']:.4f} "
+            f"± {metrics['best_acc_std']:.4f} over {metrics['runs']} run(s)"
+        )
 
 
 if __name__ == "__main__":

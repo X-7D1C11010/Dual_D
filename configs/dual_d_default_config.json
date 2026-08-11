@@ -1,5 +1,5 @@
 {
-  "feature_dim": 256,
+  "feature_dim": 384,
   "contrastive_temperature": 0.2,
   "include_reconstruction_fakes": false,
   "detach_contrastive_positives": true,
@@ -9,7 +9,8 @@
     "adv_auxiliary": 0.1,
     "cycle": 0.5,
     "identity": 0.05,
-    "contrastive": 0.1
+    "contrastive": 0.05,
+    "prototype_contrastive": 0.1
   },
   "primary_discriminator": {
     "hidden_dims": [256, 128],

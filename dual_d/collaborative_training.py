@@ -23,6 +23,8 @@ from .auxiliary_discriminator import AuxiliaryTargetDiscriminator
 from .config import DualDConfig
 from .feature_generators import BidirectionalFeatureTranslator
 from .losses import (
+    batch_class_prototypes,
+    class_prototype_contrastive_loss,
     cycle_consistency_loss,
     discriminator_real_fake_loss,
     generator_fooling_loss,
@@ -166,6 +168,7 @@ class DualDiscriminatorCoordinator(nn.Module):
         criterion_cls: Optional[nn.Module] = None,
         source_labels: Optional[torch.Tensor] = None,
         target_labels: Optional[torch.Tensor] = None,
+        num_classes: Optional[int] = None,
         adversarial_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute generator-side cooperative loss.
@@ -204,20 +207,69 @@ class DualDiscriminatorCoordinator(nn.Module):
             contrast_source_positive = contrast_source_positive.detach()
             contrast_target_positive = contrast_target_positive.detach()
 
+        source_anchor_labels = target_labels if target_labels is not None else labels
+        source_candidate_labels = source_labels if source_labels is not None else labels
+        target_anchor_labels = source_labels if source_labels is not None else labels
+        target_candidate_labels = target_labels if target_labels is not None else labels
+
         contrast_loss = 0.5 * (
             paired_contrastive_loss(
                 outputs.source_like,
                 contrast_source_positive,
-                labels=labels,
+                labels=source_anchor_labels,
+                positive_labels=source_candidate_labels,
                 temperature=self.config.contrastive_temperature,
             )
             + paired_contrastive_loss(
                 outputs.target_like,
                 contrast_target_positive,
-                labels=labels,
+                labels=target_anchor_labels,
+                positive_labels=target_candidate_labels,
                 temperature=self.config.contrastive_temperature,
             )
         )
+
+        prototype_contrastive_loss = outputs.source_features.new_tensor(0.0)
+        if source_labels is not None and target_labels is not None:
+            if num_classes is None:
+                max_label = torch.cat([source_labels.view(-1), target_labels.view(-1)]).max()
+                resolved_num_classes = int(max_label.detach().cpu().item()) + 1
+            else:
+                resolved_num_classes = int(num_classes)
+
+            if resolved_num_classes > 0:
+                source_prototype_features = outputs.source_features
+                target_prototype_features = outputs.target_features
+                if self.config.detach_contrastive_positives:
+                    source_prototype_features = source_prototype_features.detach()
+                    target_prototype_features = target_prototype_features.detach()
+
+                source_prototypes, source_prototype_mask = batch_class_prototypes(
+                    source_prototype_features,
+                    source_labels,
+                    resolved_num_classes,
+                )
+                target_prototypes, target_prototype_mask = batch_class_prototypes(
+                    target_prototype_features,
+                    target_labels,
+                    resolved_num_classes,
+                )
+                prototype_contrastive_loss = 0.5 * (
+                    class_prototype_contrastive_loss(
+                        outputs.source_like,
+                        target_labels,
+                        source_prototypes,
+                        source_prototype_mask,
+                        temperature=self.config.contrastive_temperature,
+                    )
+                    + class_prototype_contrastive_loss(
+                        outputs.target_like,
+                        source_labels,
+                        target_prototypes,
+                        target_prototype_mask,
+                        temperature=self.config.contrastive_temperature,
+                    )
+                )
 
         classification_loss = outputs.source_features.new_tensor(0.0)
         if classifier is not None and criterion_cls is not None:
@@ -238,6 +290,7 @@ class DualDiscriminatorCoordinator(nn.Module):
             + weights.cycle * cycle_loss
             + weights.identity * identity_loss
             + weights.contrastive * contrast_loss
+            + weights.prototype_contrastive * prototype_contrastive_loss
             + weights.classification * classification_loss
         )
         logs = {
@@ -247,6 +300,7 @@ class DualDiscriminatorCoordinator(nn.Module):
             "dual_d/cycle": safe_item(cycle_loss),
             "dual_d/identity": safe_item(identity_loss),
             "dual_d/contrastive": safe_item(contrast_loss),
+            "dual_d/prototype_contrastive": safe_item(prototype_contrastive_loss),
             "dual_d/classification_feedback": safe_item(classification_loss),
             "dual_d/adversarial_scale": adversarial_scale,
         }

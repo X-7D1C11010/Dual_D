@@ -11,12 +11,14 @@ Public interfaces:
     - cycle_consistency_loss(...)
     - identity_preservation_loss(...)
     - paired_contrastive_loss(...)
+    - batch_class_prototypes(...)
+    - class_prototype_contrastive_loss(...)
     - safe_item(tensor)
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -88,6 +90,7 @@ def paired_contrastive_loss(
     anchor_features: torch.Tensor,
     positive_features: torch.Tensor,
     labels: Optional[torch.Tensor] = None,
+    positive_labels: Optional[torch.Tensor] = None,
     temperature: float = 0.20,
 ) -> torch.Tensor:
     """Class-aware paired contrastive loss.
@@ -95,8 +98,10 @@ def paired_contrastive_loss(
     Args:
         anchor_features: Generated features to be pulled toward positives.
         positive_features: Real features used as positive candidates.
-        labels: Optional class labels for supervised positives. If omitted, the
-            diagonal pair in the batch is treated as the positive pair.
+        labels: Optional class labels for anchors. If omitted, the diagonal
+            pair in the batch is treated as the positive pair.
+        positive_labels: Optional labels for positive candidates. If omitted,
+            ``labels`` is reused for backward compatibility.
         temperature: Softmax temperature.
 
     Returns:
@@ -115,11 +120,75 @@ def paired_contrastive_loss(
         target = torch.arange(anchor_features.size(0), device=anchor_features.device)
         return F.nll_loss(log_probs, target)
 
-    labels = labels.view(-1)
-    mask = labels.unsqueeze(0).eq(labels.unsqueeze(1)).to(log_probs.dtype)
+    anchor_labels = labels.view(-1)
+    candidate_labels = (
+        positive_labels.view(-1) if positive_labels is not None else anchor_labels
+    )
+    if anchor_labels.numel() != anchor_features.size(0):
+        raise ValueError("Anchor label count does not match anchor feature count.")
+    if candidate_labels.numel() != positive_features.size(0):
+        raise ValueError("Candidate label count does not match positive feature count.")
+    mask = anchor_labels.unsqueeze(1).eq(candidate_labels.unsqueeze(0)).to(log_probs.dtype)
     mask_sum = mask.sum(dim=1).clamp_min(1.0)
     per_sample = -(mask * log_probs).sum(dim=1) / mask_sum
     return per_sample.mean()
+
+
+def batch_class_prototypes(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    num_classes: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return per-class feature prototypes and a present-class mask.
+
+    Prototypes are computed only from classes present in the current batch.
+    Missing classes keep a zero vector and are masked out by downstream losses.
+    """
+
+    num_classes = int(num_classes)
+    if num_classes <= 0:
+        raise ValueError("num_classes must be positive.")
+
+    prototypes = features.new_zeros((num_classes, features.size(1)))
+    counts = features.new_zeros((num_classes,))
+    labels = labels.view(-1).long()
+    valid = labels.ge(0) & labels.lt(num_classes)
+    if bool(valid.any()):
+        valid_labels = labels[valid]
+        valid_features = features[valid]
+        prototypes.index_add_(0, valid_labels, valid_features)
+        counts.index_add_(0, valid_labels, torch.ones_like(valid_labels, dtype=features.dtype))
+
+    present_mask = counts.gt(0)
+    if bool(present_mask.any()):
+        prototypes[present_mask] = prototypes[present_mask] / counts[present_mask].unsqueeze(1)
+    return prototypes, present_mask
+
+
+def class_prototype_contrastive_loss(
+    anchor_features: torch.Tensor,
+    anchor_labels: torch.Tensor,
+    prototype_features: torch.Tensor,
+    prototype_mask: torch.Tensor,
+    temperature: float = 0.20,
+) -> torch.Tensor:
+    """Pull anchors to the matching class prototype and away from other classes."""
+
+    if anchor_features.size(0) == 0 or prototype_features.size(0) == 0:
+        return anchor_features.new_tensor(0.0)
+
+    num_classes = int(prototype_features.size(0))
+    labels = anchor_labels.view(-1).long()
+    in_range = labels.ge(0) & labels.lt(num_classes)
+    valid = in_range & prototype_mask[labels.clamp(0, max(num_classes - 1, 0))].bool()
+    if not bool(valid.any()):
+        return anchor_features.new_tensor(0.0)
+
+    anchor_norm = F.normalize(anchor_features[valid], p=2, dim=1)
+    prototype_norm = F.normalize(prototype_features, p=2, dim=1)
+    logits = torch.matmul(anchor_norm, prototype_norm.t()) / float(temperature)
+    logits = logits.masked_fill(~prototype_mask.view(1, -1).bool(), -1e4)
+    return F.cross_entropy(logits, labels[valid])
 
 
 def safe_item(value: torch.Tensor | float | int) -> float:
@@ -128,4 +197,3 @@ def safe_item(value: torch.Tensor | float | int) -> float:
     if isinstance(value, torch.Tensor):
         return float(value.detach().cpu().item())
     return float(value)
-

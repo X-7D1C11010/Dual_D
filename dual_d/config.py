@@ -14,7 +14,7 @@ Public interfaces:
 
 Usage:
     >>> from dual_d.config import DualDConfig, load_config
-    >>> cfg = DualDConfig(feature_dim=256)
+    >>> cfg = DualDConfig(feature_dim=384)
     >>> cfg = load_config("configs/dual_d_default_config.json")
 """
 
@@ -44,6 +44,7 @@ class LossWeights:
         cycle: Weight for bidirectional cycle consistency.
         identity: Weight for identity preservation.
         contrastive: Weight for paired/class-aware feature contrast.
+        prototype_contrastive: Weight for class-prototype contrastive feedback.
     """
 
     classification: float = 1.0
@@ -52,6 +53,7 @@ class LossWeights:
     cycle: float = 0.50
     identity: float = 0.05
     contrastive: float = 0.10
+    prototype_contrastive: float = 0.10
 
 
 @dataclass
@@ -80,7 +82,7 @@ class DualDConfig:
 
     Attributes:
         feature_dim: Dimension of fused source/target features. For the current
-            JMDA-Net main path this is usually 256 because two 128-D TAL
+            VIS/IR/AIS main path this is usually 384 because three 128-D TAL
             projections are concatenated.
         contrastive_temperature: Temperature for class-aware contrastive loss.
         include_reconstruction_fakes: If true, cycle-reconstructed features are
@@ -89,7 +91,7 @@ class DualDConfig:
             fixed anchors for generated features during generator optimization.
     """
 
-    feature_dim: int = 256
+    feature_dim: int = 384
     contrastive_temperature: float = 0.20
     include_reconstruction_fakes: bool = True
     detach_contrastive_positives: bool = True
@@ -113,7 +115,7 @@ class DualDConfig:
             auxiliary_data["hidden_dims"] = _tuple_from(auxiliary_data["hidden_dims"])
 
         return cls(
-            feature_dim=int(data.get("feature_dim", 256)),
+            feature_dim=int(data.get("feature_dim", 384)),
             contrastive_temperature=float(data.get("contrastive_temperature", 0.20)),
             include_reconstruction_fakes=bool(data.get("include_reconstruction_fakes", True)),
             detach_contrastive_positives=bool(data.get("detach_contrastive_positives", True)),
@@ -145,4 +147,3 @@ def save_config(config: DualDConfig, path: str | Path) -> None:
     with target.open("w", encoding="utf-8") as file_obj:
         json.dump(config.to_dict(), file_obj, indent=2)
         file_obj.write("\n")
-

@@ -13,6 +13,7 @@ import torch
 
 from dual_d.data.audit import audit_dataset_splits, data_audit_errors
 from dual_d.data.multimodal_dataset import PairedImageTransform, SampleRecord
+from dual_d.losses import class_prototype_contrastive_loss
 from dual_d.training.trainer import _adversarial_scale
 
 
@@ -64,6 +65,30 @@ class TrainingSafetyTests(unittest.TestCase):
         self.assertEqual(_adversarial_scale(args, 10), 0.5)
         self.assertEqual(_adversarial_scale(args, 15), 1.0)
         self.assertEqual(_adversarial_scale(args, 100), 1.0)
+
+    def test_class_prototype_contrastive_prefers_matching_class(self) -> None:
+        prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        prototype_mask = torch.tensor([True, True])
+        labels = torch.tensor([0, 1])
+        matching = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        swapped = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
+
+        matching_loss = class_prototype_contrastive_loss(
+            matching,
+            labels,
+            prototypes,
+            prototype_mask,
+            temperature=0.1,
+        )
+        swapped_loss = class_prototype_contrastive_loss(
+            swapped,
+            labels,
+            prototypes,
+            prototype_mask,
+            temperature=0.1,
+        )
+
+        self.assertLess(float(matching_loss), float(swapped_loss))
 
 
 if __name__ == "__main__":
