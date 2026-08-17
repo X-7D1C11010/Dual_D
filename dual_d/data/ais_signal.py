@@ -1,8 +1,12 @@
 """AIS signal loading utilities for the three-modality Dual-D pipeline.
 
-The loader accepts one AIS file per VIS/IR sample.  Supported formats are
-``.npy``, ``.npz``, ``.csv``, ``.txt`` and ``.json``.  Every sample is
-converted to a fixed-size ``[2, sequence_length]`` tensor:
+The preferred input is the JMDA-Net global MATLAB v7.3 file
+``balanced_AIS-dataset_16classes_100persample.mat``.  It stores
+``balanced_rcv_I``, ``balanced_rcv_Q`` and ``new_balanced_label``; the loader
+groups those real I/Q waveforms by class and returns ``[N, 2, L]`` arrays.
+One AIS file per VIS/IR sample remains supported as a fallback.  Supported
+fallback formats are ``.npy``, ``.npz``, ``.csv``, ``.txt`` and ``.json``.
+Every fallback sample is converted to a fixed-size ``[2, sequence_length]`` tensor:
 
 - native complex arrays are split into in-phase (I) and quadrature (Q) parts;
 - real arrays with a two-channel axis are interpreted as I/Q data;
@@ -16,14 +20,16 @@ while still allowing pre-extracted numerical AIS attributes on a server.
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
 
 
 AIS_EXTENSIONS = {".npy", ".npz", ".csv", ".txt", ".json"}
+REFERENCE_AIS_FILENAME = "balanced_AIS-dataset_16classes_100persample.mat"
 
 
 def ais_files(directory: Path) -> list[Path]:
@@ -39,6 +45,148 @@ def ais_files(directory: Path) -> list[Path]:
         ],
         key=lambda path: path.name,
     )
+
+
+def resolve_reference_ais_file(
+    root: str | Path,
+    ais_folder: str = "AIS",
+    filename: str = REFERENCE_AIS_FILENAME,
+) -> Path | None:
+    """Find the JMDA-Net global AIS MAT file near a domain or AIS root."""
+
+    root = Path(root)
+    if root.is_file():
+        if root.suffix.lower() not in {".mat", ".h5", ".hdf5"}:
+            return None
+        return root
+    if not root.exists():
+        return None
+
+    candidates = []
+    current = root.resolve()
+    for _ in range(4):
+        candidates.extend(
+            [
+                current / filename,
+                current / ais_folder / filename,
+            ]
+        )
+        if current.parent == current:
+            break
+        current = current.parent
+
+    for candidate in candidates:
+        if candidate.is_file() and candidate.suffix.lower() in {".mat", ".h5", ".hdf5"}:
+            return candidate
+    return None
+
+
+def _mat_array(container, key: str) -> np.ndarray:
+    """Read one array from scipy or h5py containers."""
+
+    value = container[key]
+    return np.asarray(value[:] if hasattr(value, "shape") and hasattr(value, "__getitem__") else value)
+
+
+def _find_mat_key(keys, fragment: str) -> str | None:
+    """Find a MATLAB/HDF5 key by case-insensitive name fragment."""
+
+    fragment = fragment.lower()
+    return next((key for key in keys if fragment in str(key).lower()), None)
+
+
+def load_reference_ais_mat(path: str | Path) -> Tuple[np.ndarray, np.ndarray]:
+    """Load the JMDA-Net global AIS MAT file as ``[N, 2, L]`` and labels.
+
+    The reference project stores I/Q arrays either as ``[L, N]`` or ``[N, L]``.
+    This loader preserves the per-sample I/Q waveform and follows the reference
+    key convention: ``balanced_rcv_I``, ``balanced_rcv_Q`` and
+    ``new_balanced_label``.
+    """
+
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"AIS MAT file does not exist: {path}")
+
+    i_data = q_data = labels = None
+    errors = []
+    try:
+        import h5py
+
+        with h5py.File(path, "r") as container:
+            keys = list(container.keys())
+            i_key = _find_mat_key(keys, "rcv_i")
+            q_key = _find_mat_key(keys, "rcv_q")
+            label_key = _find_mat_key(keys, "label")
+            if i_key and q_key and label_key:
+                i_data = _mat_array(container, i_key)
+                q_data = _mat_array(container, q_key)
+                labels = _mat_array(container, label_key)
+    except Exception as exc:
+        errors.append(f"hdf5: {exc}")
+
+    if i_data is None or q_data is None or labels is None:
+        try:
+            import scipy.io as sio
+
+            container = sio.loadmat(path)
+            keys = [key for key in container if not str(key).startswith("__")]
+            i_key = _find_mat_key(keys, "rcv_i")
+            q_key = _find_mat_key(keys, "rcv_q")
+            label_key = _find_mat_key(keys, "label")
+            if i_key and q_key and label_key:
+                i_data = np.asarray(container[i_key])
+                q_data = np.asarray(container[q_key])
+                labels = np.asarray(container[label_key])
+        except Exception as exc:
+            errors.append(f"scipy: {exc}")
+
+    if i_data is None or q_data is None or labels is None:
+        raise ValueError(
+            "Unable to read JMDA-Net AIS keys balanced_rcv_I/balanced_rcv_Q/"
+            f"new_balanced_label from {path}. {' | '.join(errors)}"
+        )
+
+    i_data = np.asarray(i_data, dtype=np.float32)
+    q_data = np.asarray(q_data, dtype=np.float32)
+    labels = np.asarray(labels).reshape(-1)
+    if i_data.ndim != 2 or q_data.ndim != 2 or i_data.shape != q_data.shape:
+        raise ValueError(
+            f"AIS I/Q arrays must be same-rank 2D arrays, got {i_data.shape} and {q_data.shape}."
+        )
+
+    n_samples = labels.size
+    if i_data.shape[1] == n_samples:
+        i_data = i_data.T
+        q_data = q_data.T
+    elif i_data.shape[0] != n_samples:
+        raise ValueError(
+            f"AIS sample count mismatch: I/Q shape={i_data.shape}, labels={labels.shape}."
+        )
+
+    if not np.isfinite(labels).all():
+        raise ValueError(f"AIS labels contain NaN or Inf: {path}")
+    rounded_labels = np.rint(labels)
+    if not np.allclose(labels, rounded_labels):
+        raise ValueError(f"AIS labels must be integer-valued: {path}")
+    labels = rounded_labels.astype(np.int64)
+    features = np.stack([i_data, q_data], axis=1)
+    if not np.isfinite(features).all():
+        raise ValueError(f"AIS data contains NaN or Inf: {path}")
+    return np.ascontiguousarray(features, dtype=np.float32), labels
+
+
+@lru_cache(maxsize=8)
+def group_reference_ais_by_label(
+    path: str | Path,
+) -> Tuple[Dict[int, np.ndarray], int]:
+    """Load the global MAT file and group waveform tensors by integer label."""
+
+    features, labels = load_reference_ais_mat(path)
+    grouped: Dict[int, np.ndarray] = {}
+    for label in np.unique(labels):
+        grouped[int(label)] = np.ascontiguousarray(features[labels == label])
+    return grouped, int(features.shape[2])
 
 
 def _first_numeric_json_value(data: Any) -> Any:
@@ -156,4 +304,12 @@ def load_ais_signal(
     return torch.from_numpy(np.ascontiguousarray(channels, dtype=np.float32))
 
 
-__all__ = ["AIS_EXTENSIONS", "ais_files", "load_ais_signal"]
+__all__ = [
+    "AIS_EXTENSIONS",
+    "REFERENCE_AIS_FILENAME",
+    "ais_files",
+    "group_reference_ais_by_label",
+    "load_ais_signal",
+    "load_reference_ais_mat",
+    "resolve_reference_ais_file",
+]

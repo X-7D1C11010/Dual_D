@@ -119,6 +119,7 @@ def build_datasets(args):
         ir_folder=args.ir_folder,
         ais_folder=args.ais_folder,
         ais_root=getattr(args, "source_ais_root", "") or None,
+        ais_data_path=getattr(args, "source_ais_data_path", "") or None,
         ais_match=args.ais_match,
         ais_sequence_length=args.ais_sequence_length,
         ais_normalize=args.ais_normalize,
@@ -137,6 +138,7 @@ def build_datasets(args):
         ir_folder=args.ir_folder,
         ais_folder=args.ais_folder,
         ais_root=getattr(args, "target_ais_root", "") or None,
+        ais_data_path=getattr(args, "target_ais_data_path", "") or None,
         ais_match=args.ais_match,
         ais_sequence_length=args.ais_sequence_length,
         ais_normalize=args.ais_normalize,
@@ -155,6 +157,7 @@ def build_datasets(args):
         ir_folder=args.ir_folder,
         ais_folder=args.ais_folder,
         ais_root=getattr(args, "target_ais_root", "") or None,
+        ais_data_path=getattr(args, "target_ais_data_path", "") or None,
         ais_match=args.ais_match,
         ais_sequence_length=args.ais_sequence_length,
         ais_normalize=args.ais_normalize,
@@ -174,6 +177,7 @@ def build_datasets(args):
         ir_folder=args.ir_folder,
         ais_folder=args.ais_folder,
         ais_root=getattr(args, "target_ais_root", "") or None,
+        ais_data_path=getattr(args, "target_ais_data_path", "") or None,
         ais_match=args.ais_match,
         ais_sequence_length=args.ais_sequence_length,
         ais_normalize=args.ais_normalize,
@@ -211,9 +215,12 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
     net_ir = IRFeatureExtractor(output_dim=args.feature_dim).to(device)
     net_ais = None
     if use_ais:
+        ais_sequence_length = int(
+            getattr(args, "effective_ais_sequence_length", args.ais_sequence_length)
+        )
         net_ais = AISFeatureExtractor(
             encoder_type=args.ais_encoder,
-            sequence_length=args.ais_sequence_length,
+            sequence_length=ais_sequence_length,
             output_dim=args.feature_dim,
             dropout=args.ais_dropout,
         ).to(device)
@@ -726,6 +733,21 @@ def run_training(args) -> Dict[str, object]:
     logger.info(f"Device: {device}")
 
     source_train, target_train, target_train_eval, target_val, label_map = build_datasets(args)
+    if bool(getattr(args, "use_ais", False)):
+        ais_lengths = {
+            int(dataset.ais_signal_length)
+            for dataset in (source_train, target_train, target_train_eval, target_val)
+        }
+        if len(ais_lengths) != 1:
+            raise RuntimeError(
+                "AIS signal lengths differ across source/target splits: "
+                f"{sorted(ais_lengths)}. Use one MAT file or a common --ais-sequence-length."
+            )
+        args.effective_ais_sequence_length = ais_lengths.pop()
+        logger.info(
+            "AIS input: JMDA-compatible I/Q tensor shape [2, %d]",
+            args.effective_ais_sequence_length,
+        )
     num_classes = len(label_map)
     save_json({"args": vars(args), "label_map": label_map}, run_dir / "resolved_config.json")
     save_json(label_map, run_dir / "label_map.json")

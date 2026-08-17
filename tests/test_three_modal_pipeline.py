@@ -8,10 +8,11 @@ from types import SimpleNamespace
 import unittest
 
 import numpy as np
+import h5py
 from PIL import Image
 import torch
 
-from dual_d.data.ais_signal import load_ais_signal
+from dual_d.data.ais_signal import load_ais_signal, load_reference_ais_mat
 from dual_d.data.multimodal_dataset import MultiModalDomainDataset
 from dual_d.losses import paired_contrastive_loss
 from dual_d.models.backbones import AISFeatureExtractor
@@ -53,6 +54,42 @@ def _write_vis_ir_domain(root: Path, phases: list[str], offset: int) -> None:
 
 
 class ThreeModalPipelineTests(unittest.TestCase):
+    def test_reference_jmda_mat_loader_and_class_sampling(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            mat_path = root / "AIS" / "balanced_AIS-dataset_16classes_100persample.mat"
+            mat_path.parent.mkdir(parents=True, exist_ok=True)
+            i_data = np.arange(24, dtype=np.float32).reshape(6, 4)
+            q_data = i_data + 100.0
+            labels = np.asarray([[1.0], [2.0], [1.0], [2.0]], dtype=np.float32)
+            with h5py.File(mat_path, "w") as container:
+                container.create_dataset("balanced_rcv_I", data=i_data)
+                container.create_dataset("balanced_rcv_Q", data=q_data)
+                container.create_dataset("new_balanced_label", data=labels)
+
+            features, loaded_labels = load_reference_ais_mat(mat_path)
+            self.assertEqual(tuple(features.shape), (4, 2, 6))
+            self.assertTrue(np.array_equal(loaded_labels, np.array([1, 2, 1, 2])))
+
+            _write_rgb(root / "train" / "vis" / "1" / "sample.png", 32)
+            _write_rgb(root / "train" / "ir" / "1" / "sample.png", 96)
+            dataset = MultiModalDomainDataset(
+                root,
+                phase="train",
+                layout="modality_first",
+                vis_folder="vis",
+                ir_folder="ir",
+                image_size=8,
+                resize_size=10,
+                train_augment=False,
+                ais_data_path=mat_path,
+            )
+            sample = dataset[0]
+
+        self.assertEqual(dataset.ais_signal_length, 6)
+        self.assertEqual(tuple(sample["ais"].shape), (2, 6))
+        self.assertEqual(sample["ais_path"], str(mat_path))
+
     def test_complex_ais_loader_and_encoder(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "sample.npy"

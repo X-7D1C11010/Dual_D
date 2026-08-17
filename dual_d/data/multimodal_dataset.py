@@ -1,9 +1,10 @@
-"""Standalone visible/infrared multimodal dataset loader.
+"""Standalone visible/infrared/AIS multimodal dataset loader.
 
 Module purpose:
-    Load paired visible-light and infrared images without importing any script
-    from another project folder. The loader supports both common directory
-    layouts used by JMDA-style domain adaptation experiments.
+    Load paired visible-light and infrared images plus optional AIS signals
+    without importing any script from another project folder. The loader
+    supports both common directory layouts used by JMDA-style domain
+    adaptation experiments.
 
 Supported layouts:
     1. modality_first:
@@ -29,13 +30,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import functional as transform_functional
 
-from .ais_signal import ais_files, load_ais_signal
+from .ais_signal import (
+    REFERENCE_AIS_FILENAME,
+    ais_files,
+    group_reference_ais_by_label,
+    load_ais_signal,
+    resolve_reference_ais_file,
+)
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -184,14 +192,16 @@ class MultiModalDomainDataset(Dataset):
         layout: ``auto``, ``modality_first``, or ``class_first``.
         vis_folder: Folder name for visible-light images.
         ir_folder: Folder name for infrared images.
-        ais_folder: Folder name for per-sample AIS files.
+        ais_folder: Folder name for AIS data.
         ais_root: Optional separate AIS root. If omitted, AIS is discovered
-            under ``root_dir`` using the same phase and class layout.
+            near ``root_dir``. The JMDA-Net global MAT file is preferred when
+            present; per-sample numeric files remain supported as fallback.
+        ais_data_path: Optional explicit JMDA-Net MAT/HDF5 file path.
         ais_match: Match AIS files to VIS/IR by stem, sorted index, or try stem
             first and fall back to sorted index when set to ``auto``.
         ais_sequence_length: Fixed length returned for each two-channel signal.
         ais_normalize: Apply per-sample, per-channel standardization.
-        require_ais: Whether each VIS/IR pair also includes an AIS file.
+        require_ais: Whether each VIS/IR pair also includes AIS data.
         global_label_map: Optional mapping from raw class names to contiguous
             label ids. Pass the source-domain map into the target domain to keep
             labels aligned.
@@ -210,6 +220,7 @@ class MultiModalDomainDataset(Dataset):
         ir_folder: str = "红外",
         ais_folder: str = "AIS",
         ais_root: Optional[str | Path] = None,
+        ais_data_path: Optional[str | Path] = None,
         ais_match: str = "auto",
         ais_sequence_length: int = 128,
         ais_normalize: bool = True,
@@ -232,6 +243,7 @@ class MultiModalDomainDataset(Dataset):
         self.ir_folder = ir_folder
         self.ais_folder = ais_folder
         self.ais_root = Path(ais_root) if ais_root else self.root_dir
+        self.ais_data_path = Path(ais_data_path) if ais_data_path else None
         self.ais_base_dir = _phase_root(self.ais_root, phase)
         self.ais_match = str(ais_match).lower()
         if self.ais_match not in {"auto", "stem", "index"}:
@@ -241,6 +253,20 @@ class MultiModalDomainDataset(Dataset):
             raise ValueError("ais_sequence_length must be positive.")
         self.ais_normalize = bool(ais_normalize)
         self.require_ais = bool(require_ais)
+        self.reference_ais_file = None
+        self.reference_ais_by_label = {}
+        self.ais_signal_length = self.ais_sequence_length
+        if self.require_ais:
+            reference_root = self.ais_data_path or self.ais_root
+            self.reference_ais_file = resolve_reference_ais_file(
+                reference_root,
+                ais_folder=self.ais_folder,
+                filename=REFERENCE_AIS_FILENAME,
+            )
+            if self.reference_ais_file is not None:
+                self.reference_ais_by_label, self.ais_signal_length = (
+                    group_reference_ais_by_label(str(self.reference_ais_file.resolve()))
+                )
 
         self.samples = self._collect_samples()
         if not self.samples:
@@ -264,6 +290,22 @@ class MultiModalDomainDataset(Dataset):
                 "Dataset contains labels absent from the source label map: "
                 f"{unknown_labels}. Fix the directory labels instead of silently dropping samples."
             )
+
+        if self.reference_ais_file is not None:
+            missing_ais_labels = []
+            for raw_label in raw_labels:
+                try:
+                    ais_label = int(raw_label)
+                except ValueError:
+                    missing_ais_labels.append(raw_label)
+                    continue
+                if ais_label not in self.reference_ais_by_label:
+                    missing_ais_labels.append(raw_label)
+            if missing_ais_labels:
+                raise RuntimeError(
+                    "JMDA-Net AIS MAT file has no samples for image labels: "
+                    f"{missing_ais_labels}. The image/AIS class numbering must match."
+                )
 
         self.labels = [self.label_map[sample.raw_label] for sample in self.samples]
         self.transform = build_transforms(
@@ -360,7 +402,7 @@ class MultiModalDomainDataset(Dataset):
         if not image_pairs:
             return []
 
-        if not self.require_ais:
+        if not self.require_ais or self.reference_ais_file is not None:
             return [
                 SampleRecord(vis_path, ir_path, raw_label)
                 for vis_path, ir_path in image_pairs
@@ -441,17 +483,32 @@ class MultiModalDomainDataset(Dataset):
             "raw_label": sample.raw_label,
             "vis_path": str(sample.vis_path),
             "ir_path": str(sample.ir_path),
-            "ais_path": str(sample.ais_path) if sample.ais_path is not None else "",
+            "ais_path": (
+                str(sample.ais_path)
+                if sample.ais_path is not None
+                else str(self.reference_ais_file or "")
+            ),
         }
         if self.require_ais:
-            if sample.ais_path is None:
-                raise RuntimeError(f"AIS path is missing for sample: {sample.vis_path}")
             try:
-                result["ais"] = load_ais_signal(
-                    sample.ais_path,
-                    sequence_length=self.ais_sequence_length,
-                    normalize=self.ais_normalize,
-                )
+                if self.reference_ais_file is not None:
+                    ais_label = int(sample.raw_label)
+                    class_pool = self.reference_ais_by_label[ais_label]
+                    ais_array = class_pool[index % len(class_pool)]
+                    result["ais"] = torch.from_numpy(
+                        np.ascontiguousarray(ais_array, dtype=np.float32)
+                    )
+                else:
+                    if sample.ais_path is None:
+                        raise RuntimeError(
+                            f"AIS path is missing for sample: {sample.vis_path}"
+                        )
+                    result["ais"] = load_ais_signal(
+                        sample.ais_path,
+                        sequence_length=self.ais_sequence_length,
+                        normalize=self.ais_normalize,
+                    )
             except Exception as exc:
-                raise RuntimeError(f"Failed to read AIS sample: {sample.ais_path}") from exc
+                source = self.reference_ais_file or sample.ais_path
+                raise RuntimeError(f"Failed to read AIS sample: {source}") from exc
         return result

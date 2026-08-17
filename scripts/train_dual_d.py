@@ -49,6 +49,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dual_d.training.trainer import run_training  # noqa: E402
 from dual_d.training.checkpointing import save_json  # noqa: E402
+from dual_d.data.ais_signal import resolve_reference_ais_file  # noqa: E402
 
 
 def load_json_defaults(path: str | Path | None) -> Dict[str, Any]:
@@ -123,7 +124,7 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--use-ais",
         action=argparse.BooleanOptionalAction,
-        default=default("use_ais", False),
+        default=default("use_ais", True),
         help="Enable the AIS data and feature-encoding branch.",
     )
     parser.add_argument(
@@ -132,9 +133,19 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         help="Optional separate source AIS root; omit when AIS is inside source-root.",
     )
     parser.add_argument(
+        "--source-ais-data-path",
+        default=default("source_ais_data_path", ""),
+        help="Optional explicit JMDA-Net AIS .mat/.h5 file for the source domain.",
+    )
+    parser.add_argument(
         "--target-ais-root",
         default=default("target_ais_root", ""),
         help="Optional separate AIS root for one --target-root experiment.",
+    )
+    parser.add_argument(
+        "--target-ais-data-path",
+        default=default("target_ais_data_path", ""),
+        help="Optional explicit JMDA-Net AIS .mat/.h5 file; can be shared by all targets.",
     )
     parser.add_argument(
         "--target-ais-parent-root",
@@ -371,11 +382,26 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
         raise FileNotFoundError(f"Source domain does not exist: {args.source_root}")
     if args.use_ais and args.source_ais_root and not Path(args.source_ais_root).exists():
         raise FileNotFoundError(f"Source AIS root does not exist: {args.source_ais_root}")
+    source_ais_data_path = getattr(args, "source_ais_data_path", "")
+    target_ais_data_path = getattr(args, "target_ais_data_path", "")
+    if args.use_ais and source_ais_data_path and not Path(source_ais_data_path).is_file():
+        raise FileNotFoundError(f"Source AIS data file does not exist: {source_ais_data_path}")
+    if args.use_ais and target_ais_data_path and not Path(target_ais_data_path).is_file():
+        raise FileNotFoundError(f"Target AIS data file does not exist: {target_ais_data_path}")
+    shared_ais_parent = (
+        Path(args.target_ais_parent_root)
+        if args.use_ais and args.target_ais_parent_root
+        else None
+    )
     for domain, target_root, target_ais_root in experiments:
         if not target_root.exists():
             raise FileNotFoundError(f"Target domain does not exist: {target_root}")
         if args.use_ais and target_ais_root and not Path(target_ais_root).exists():
-            raise FileNotFoundError(f"Target AIS domain does not exist: {target_ais_root}")
+            if shared_ais_parent is None or resolve_reference_ais_file(
+                shared_ais_parent,
+                ais_folder=getattr(args, "ais_folder", "AIS"),
+            ) is None:
+                raise FileNotFoundError(f"Target AIS domain does not exist: {target_ais_root}")
 
     batch_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     total_runs = len(experiments) * int(args.iterations)
@@ -387,7 +413,19 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
             run_index += 1
             run_args = deepcopy(args)
             run_args.target_root = str(target_root)
-            run_args.target_ais_root = target_ais_root
+            if (
+                target_ais_root
+                and not Path(target_ais_root).exists()
+                and shared_ais_parent is not None
+                and resolve_reference_ais_file(
+                    shared_ais_parent,
+                    ais_folder=getattr(args, "ais_folder", "AIS"),
+                )
+                is not None
+            ):
+                run_args.target_ais_root = str(shared_ais_parent)
+            else:
+                run_args.target_ais_root = target_ais_root
             run_args.seed = int(args.seed) + run_index - 1
             run_args.target_domain_name = domain
             run_args.iteration_index = iteration
