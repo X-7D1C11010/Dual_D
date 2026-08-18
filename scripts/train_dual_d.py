@@ -193,7 +193,11 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         "--multi-gpu",
         action=argparse.BooleanOptionalAction,
         default=default("multi_gpu", True),
-        help="Use DataParallel for feature encoders/classifier when multiple CUDA GPUs exist.",
+        help=(
+            "Use DataParallel for feature encoders/classifier when multiple CUDA "
+            "GPUs exist; automatically fall back to the primary GPU if NCCL "
+            "broadcast is unavailable."
+        ),
     )
     parser.add_argument(
         "--min-steps-per-epoch",

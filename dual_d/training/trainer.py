@@ -81,6 +81,32 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device(device_name)
 
 
+def validate_cuda_architecture(device: torch.device) -> None:
+    """Fail early when the installed PyTorch build lacks the GPU's SM target."""
+
+    if device.type != "cuda":
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested but torch.cuda.is_available() is False. "
+            "Check the NVIDIA driver and the active Python environment."
+        )
+
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device_index)
+    required_arch = f"sm_{major}{minor}"
+    compiled_arches = set(torch.cuda.get_arch_list())
+    if compiled_arches and required_arch not in compiled_arches:
+        name = torch.cuda.get_device_name(device_index)
+        raise RuntimeError(
+            "Incompatible PyTorch CUDA build: "
+            f"{name} requires {required_arch}, but this installation provides "
+            f"{', '.join(sorted(compiled_arches))}. Install a PyTorch/torchvision "
+            "build compiled for the RTX 5090 (CUDA 12.8+ / Blackwell support) "
+            "before starting training."
+        )
+
+
 def configure_visual_trainability(
     net_vis: VisualFeatureExtractor,
     freeze_visual_backbone: bool,
@@ -105,6 +131,43 @@ def configure_visual_trainability(
     for name, parameter in net_vis.named_parameters():
         if name.startswith(trainable_prefixes):
             parameter.requires_grad = True
+
+
+def _probe_data_parallel(
+    device: torch.device,
+    device_ids: list[int],
+    output_device: int,
+) -> bool:
+    """Check the NCCL broadcast used by ``DataParallel`` before wrapping models.
+
+    Some multi-GPU installations can execute ordinary CUDA kernels but fail when
+    NCCL performs the parameter broadcast used by DataParallel.  Detecting that
+    condition here lets the training run continue on the primary GPU instead of
+    failing on the first batch.
+    """
+
+    if len(device_ids) < 2:
+        return True
+    probe = nn.DataParallel(
+        nn.Linear(8, 8, bias=False).to(device),
+        device_ids=device_ids,
+        output_device=output_device,
+    )
+    try:
+        probe(torch.zeros(len(device_ids), 8, device=device))
+        torch.cuda.synchronize(output_device)
+    except RuntimeError as error:
+        warnings.warn(
+            "DataParallel/NCCL probe failed; continuing on the primary GPU. "
+            "Try NCCL_P2P_DISABLE=1 (and, if needed, NCCL_SHM_DISABLE=1) "
+            f"for multi-GPU execution. Original error: {error}",
+            RuntimeWarning,
+        )
+        return False
+    finally:
+        del probe
+        torch.cuda.empty_cache()
+    return True
 
 
 def build_datasets(args):
@@ -252,15 +315,26 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
         device_ids = [output_device] + [
             index for index in range(torch.cuda.device_count()) if index != output_device
         ]
-        net_vis = nn.DataParallel(net_vis, device_ids=device_ids, output_device=output_device)
-        net_ir = nn.DataParallel(net_ir, device_ids=device_ids, output_device=output_device)
-        if net_ais is not None:
-            net_ais = nn.DataParallel(net_ais, device_ids=device_ids, output_device=output_device)
-        classifier = nn.DataParallel(
-            classifier,
-            device_ids=device_ids,
-            output_device=output_device,
-        )
+        if _probe_data_parallel(device, device_ids, output_device):
+            net_vis = nn.DataParallel(net_vis, device_ids=device_ids, output_device=output_device)
+            net_ir = nn.DataParallel(net_ir, device_ids=device_ids, output_device=output_device)
+            if net_ais is not None:
+                net_ais = nn.DataParallel(
+                    net_ais,
+                    device_ids=device_ids,
+                    output_device=output_device,
+                )
+            classifier = nn.DataParallel(
+                classifier,
+                device_ids=device_ids,
+                output_device=output_device,
+            )
+        else:
+            warnings.warn(
+                "multi_gpu was requested, but DataParallel was disabled after the "
+                "NCCL probe. The run will use the primary CUDA device.",
+                RuntimeWarning,
+            )
     return ModelBundle(net_vis, net_ir, net_ais, tal, dual_adapter, classifier)
 
 
@@ -746,6 +820,7 @@ def run_training(args) -> Dict[str, object]:
 
     set_seed(args.seed)
     device = resolve_device(args.device)
+    validate_cuda_architecture(device)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name or f"dual_d_{Path(args.target_root).name}_{timestamp}"
     run_dir = Path(args.output_dir) / run_name
@@ -862,8 +937,6 @@ def run_training(args) -> Dict[str, object]:
         getattr(source_train, "reference_ais_pool_indices", np.empty(0)).size,
         getattr(target_val, "reference_ais_pool_indices", np.empty(0)).size,
     )
-    if bool(getattr(args, "multi_gpu", False)) and device.type == "cuda":
-        logger.info("CUDA devices available: %d | encoder data parallel requested", torch.cuda.device_count())
     val_loader = DataLoader(
         target_val,
         batch_size=args.batch_size,
@@ -882,6 +955,13 @@ def run_training(args) -> Dict[str, object]:
     )
 
     models = build_models(args, num_classes, device)
+    multi_gpu_active = isinstance(models.net_vis, nn.DataParallel)
+    if bool(getattr(args, "multi_gpu", False)) and device.type == "cuda":
+        logger.info(
+            "CUDA devices available: %d | encoder data parallel active=%s",
+            torch.cuda.device_count(),
+            multi_gpu_active,
+        )
     active_models = [model for model in models.__dict__.values() if model is not None]
     total_parameters = sum(
         parameter.numel() for model in active_models for parameter in model.parameters()
