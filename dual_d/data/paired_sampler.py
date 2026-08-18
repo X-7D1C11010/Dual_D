@@ -26,12 +26,19 @@ import torch
 class PairedClassSampler:
     """Iterable paired-batch sampler for source and target datasets."""
 
-    def __init__(self, source_dataset, target_dataset, batch_size: int):
+    def __init__(
+        self,
+        source_dataset,
+        target_dataset,
+        batch_size: int,
+        min_steps_per_epoch: int = 8,
+    ):
         self.source_dataset = source_dataset
         self.target_dataset = target_dataset
         self.batch_size = int(batch_size)
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive.")
+        self.min_steps_per_epoch = max(int(min_steps_per_epoch), 1)
 
         self.source_indices = self._build_index(source_dataset.labels)
         self.target_indices = self._build_index(target_dataset.labels)
@@ -69,7 +76,13 @@ class PairedClassSampler:
             cursor_map[class_id] = cursor + 1
             return index
 
-        num_batches = min(len(self.source_dataset), len(self.target_dataset)) // self.batch_size
+        natural_batches = max(
+            1,
+            min(len(self.source_dataset), len(self.target_dataset)) // self.batch_size,
+        )
+        # Small target domains otherwise produce only a few optimizer updates.
+        # Re-sampling uses fresh stochastic augmentation and keeps labels valid.
+        num_batches = max(natural_batches, self.min_steps_per_epoch)
         for _ in range(num_batches):
             batch_classes = random.choices(self.classes, k=self.batch_size)
             source_batch_indices = []
@@ -93,4 +106,8 @@ class PairedClassSampler:
     def __len__(self) -> int:
         """Return number of batches per epoch."""
 
-        return min(len(self.source_dataset), len(self.target_dataset)) // self.batch_size
+        natural_batches = max(
+            1,
+            min(len(self.source_dataset), len(self.target_dataset)) // self.batch_size,
+        )
+        return max(natural_batches, self.min_steps_per_epoch)

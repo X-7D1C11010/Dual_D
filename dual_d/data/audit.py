@@ -23,6 +23,18 @@ def _resolved_paths(records, attribute: str) -> set[str]:
     }
 
 
+def _ais_keys(records) -> set[tuple[str, int | None]]:
+    """Return AIS provenance keys, preserving global MAT row indices."""
+
+    keys = set()
+    for record in records:
+        value = getattr(record, "ais_path", None)
+        index = getattr(record, "ais_index", None)
+        if value is not None:
+            keys.add((str(Path(value).resolve()), None if index is None else int(index)))
+    return keys
+
+
 def _file_digest(path: Path, cache: Dict[str, str]) -> str:
     """Return a cached SHA-256 digest for one file."""
 
@@ -64,14 +76,21 @@ def audit_dataset_splits(
     val_records = list(getattr(val_dataset, "samples", []))
     train_vis = _resolved_paths(train_records, "vis_path")
     train_ir = _resolved_paths(train_records, "ir_path")
-    train_ais = _resolved_paths(train_records, "ais_path")
+    train_ais = _resolved_paths(
+        [record for record in train_records if getattr(record, "ais_index", None) is None],
+        "ais_path",
+    )
     val_vis = _resolved_paths(val_records, "vis_path")
     val_ir = _resolved_paths(val_records, "ir_path")
-    val_ais = _resolved_paths(val_records, "ais_path")
+    val_ais = _resolved_paths(
+        [record for record in val_records if getattr(record, "ais_index", None) is None],
+        "ais_path",
+    )
 
     path_overlap_vis = sorted(train_vis & val_vis)
     path_overlap_ir = sorted(train_ir & val_ir)
     path_overlap_ais = sorted(train_ais & val_ais)
+    ais_index_overlap = sorted(_ais_keys(train_records) & _ais_keys(val_records))
     same_base_dir = Path(train_dataset.base_dir).resolve() == Path(val_dataset.base_dir).resolve()
 
     all_records = train_records + val_records
@@ -119,6 +138,10 @@ def audit_dataset_splits(
         "path_overlap_vis_examples": path_overlap_vis[:10],
         "path_overlap_ir_examples": path_overlap_ir[:10],
         "path_overlap_ais_examples": path_overlap_ais[:10],
+        "ais_index_overlap_count": len(ais_index_overlap),
+        "ais_index_overlap_examples": [
+            {"path": path, "index": index} for path, index in ais_index_overlap[:10]
+        ],
         "missing_file_count": len(missing_files),
         "missing_file_examples": missing_files[:10],
         "label_path_mismatch_count": len(label_path_mismatches),
@@ -147,11 +170,13 @@ def audit_dataset_splits(
             record.ais_path
             for record in train_records
             if getattr(record, "ais_path", None) is not None
+            and getattr(record, "ais_index", None) is None
         ]
         val_ais_paths = [
             record.ais_path
             for record in val_records
             if getattr(record, "ais_path", None) is not None
+            and getattr(record, "ais_index", None) is None
         ]
         ais_count, ais_examples = _content_overlaps(train_ais_paths, val_ais_paths)
         audit.update(
@@ -170,6 +195,7 @@ def audit_dataset_splits(
         or path_overlap_vis
         or path_overlap_ir
         or path_overlap_ais
+        or ais_index_overlap
         or audit["content_overlap_vis_count"]
         or audit["content_overlap_ir_count"]
         or audit["content_overlap_ais_count"]
@@ -189,6 +215,8 @@ def data_audit_errors(audit: Dict[str, object]) -> List[str]:
         or audit.get("path_overlap_ais_count")
     ):
         errors.append("target train and validation share VIS/IR/AIS paths")
+    if audit.get("ais_index_overlap_count"):
+        errors.append("target train and validation reuse global AIS rows")
     if (
         audit.get("content_overlap_vis_count")
         or audit.get("content_overlap_ir_count")

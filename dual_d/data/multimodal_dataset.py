@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import random
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -40,7 +41,7 @@ from torchvision.transforms import functional as transform_functional
 from .ais_signal import (
     REFERENCE_AIS_FILENAME,
     ais_files,
-    group_reference_ais_by_label,
+    load_reference_ais_mat,
     load_ais_signal,
     resolve_reference_ais_file,
 )
@@ -51,12 +52,19 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 @dataclass
 class SampleRecord:
-    """One aligned visible/infrared/AIS sample."""
+    """One class-level VIS/IR sample with optional AIS provenance.
+
+    VIS and IR are intentionally represented as a weak class-level pair. The
+    dataset does not assume that the two files depict the same acquisition
+    event. ``ais_index`` identifies a row in a global AIS file when the AIS
+    source has no image-level correspondence.
+    """
 
     vis_path: Path
     ir_path: Path
     raw_label: str
     ais_path: Optional[Path] = None
+    ais_index: Optional[int] = None
 
 
 def _image_files(directory: Path) -> List[Path]:
@@ -82,12 +90,11 @@ def _phase_root(root_dir: Path, phase: str) -> Path:
 
 
 class PairedImageTransform:
-    """Apply shared geometry and modality-specific normalization to a VIS/IR pair.
+    """Legacy transform that keeps geometry synchronized for real pairs.
 
-    Random crop and horizontal-flip parameters are sampled once and reused for
-    both modalities. This preserves pixel-level correspondence between the two
-    sensors; applying two independent ``Compose`` objects can silently misalign
-    an otherwise paired sample.
+    This class remains available for callers that truly have pixel-registered
+    VIS/IR data. The default dataset path uses ``IndependentImageTransform``
+    because the project data is not physically paired.
     """
 
     def __init__(
@@ -152,6 +159,58 @@ class PairedImageTransform:
         return vis_tensor, ir_tensor
 
 
+class IndependentImageTransform(PairedImageTransform):
+    """Apply modality-specific geometry for class-level, unpaired VIS/IR data."""
+
+    def __call__(self, vis_img: Image.Image, ir_img: Image.Image):
+        """Transform VIS and IR independently while preserving normalization."""
+
+        if self.train_like:
+            output_size = [self.resize_size, self.resize_size]
+            vis_img = transform_functional.resize(vis_img, output_size)
+            ir_img = transform_functional.resize(ir_img, output_size)
+
+            vis_top, vis_left, vis_height, vis_width = transforms.RandomCrop.get_params(
+                vis_img,
+                output_size=(self.image_size, self.image_size),
+            )
+            ir_top, ir_left, ir_height, ir_width = transforms.RandomCrop.get_params(
+                ir_img,
+                output_size=(self.image_size, self.image_size),
+            )
+            vis_img = transform_functional.crop(
+                vis_img, vis_top, vis_left, vis_height, vis_width
+            )
+            ir_img = transform_functional.crop(
+                ir_img, ir_top, ir_left, ir_height, ir_width
+            )
+            if bool(torch.rand(()) < 0.5):
+                vis_img = transform_functional.hflip(vis_img)
+            if bool(torch.rand(()) < 0.5):
+                ir_img = transform_functional.hflip(ir_img)
+            if self.augmentation_strength > 0:
+                vis_img = self.vis_jitter(vis_img)
+                ir_img = self.ir_jitter(ir_img)
+        else:
+            output_size = [self.image_size, self.image_size]
+            vis_img = transform_functional.resize(vis_img, output_size)
+            ir_img = transform_functional.resize(ir_img, output_size)
+
+        vis_tensor = transform_functional.to_tensor(vis_img)
+        ir_tensor = transform_functional.to_tensor(ir_img)
+        vis_tensor = transform_functional.normalize(
+            vis_tensor,
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+        ir_tensor = transform_functional.normalize(
+            ir_tensor,
+            mean=[0.5, 0.5, 0.5],
+            std=[0.5, 0.5, 0.5],
+        )
+        return vis_tensor, ir_tensor
+
+
 def build_transforms(
     phase: str,
     image_size: int = 224,
@@ -159,6 +218,7 @@ def build_transforms(
     val_augment: bool = False,
     train_augment: bool = True,
     augmentation_strength: float = 0.0,
+    synchronize_modalities: bool = False,
 ):
     """Build visible and infrared transforms.
 
@@ -169,11 +229,13 @@ def build_transforms(
         val_augment: If true, validation uses train-style random augmentation.
 
     Returns:
-        A paired transform that applies identical geometry to both modalities.
+        An independent transform by default. Synchronized geometry is reserved
+        for genuinely registered VIS/IR acquisitions.
     """
 
     train_like = (phase == "train" and train_augment) or val_augment
-    return PairedImageTransform(
+    transform_type = PairedImageTransform if synchronize_modalities else IndependentImageTransform
+    return transform_type(
         train_like,
         image_size,
         resize_size,
@@ -201,7 +263,8 @@ class MultiModalDomainDataset(Dataset):
             first and fall back to sorted index when set to ``auto``.
         ais_sequence_length: Fixed length returned for each two-channel signal.
         ais_normalize: Apply per-sample, per-channel standardization.
-        require_ais: Whether each VIS/IR pair also includes AIS data.
+        require_ais: Whether AIS is returned. A global MAT file is treated as
+            an unpaired, label-independent prior and split by MAT row index.
         global_label_map: Optional mapping from raw class names to contiguous
             label ids. Pass the source-domain map into the target domain to keep
             labels aligned.
@@ -231,6 +294,7 @@ class MultiModalDomainDataset(Dataset):
         val_augment: bool = False,
         train_augment: bool = True,
         augmentation_strength: float = 0.0,
+        synchronize_modalities: bool = False,
     ):
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -253,8 +317,13 @@ class MultiModalDomainDataset(Dataset):
             raise ValueError("ais_sequence_length must be positive.")
         self.ais_normalize = bool(ais_normalize)
         self.require_ais = bool(require_ais)
+        self.synchronize_modalities = bool(synchronize_modalities)
         self.reference_ais_file = None
-        self.reference_ais_by_label = {}
+        self.reference_ais_features = None
+        self.reference_ais_labels = None
+        self.reference_ais_pool_indices = np.empty(0, dtype=np.int64)
+        self.ais_alignment_mode = "none"
+        self.vis_ir_count_mismatch_count = 0
         self.ais_signal_length = self.ais_sequence_length
         if self.require_ais:
             reference_root = self.ais_data_path or self.ais_root
@@ -264,9 +333,21 @@ class MultiModalDomainDataset(Dataset):
                 filename=REFERENCE_AIS_FILENAME,
             )
             if self.reference_ais_file is not None:
-                self.reference_ais_by_label, self.ais_signal_length = (
-                    group_reference_ais_by_label(str(self.reference_ais_file.resolve()))
-                )
+                (
+                    self.reference_ais_features,
+                    self.reference_ais_labels,
+                ) = load_reference_ais_mat(str(self.reference_ais_file.resolve()))
+                self.ais_signal_length = int(self.reference_ais_features.shape[2])
+                # A global MAT file has no image correspondence. Partition its
+                # rows by split so validation never reuses training waveforms.
+                row_ids = np.arange(self.reference_ais_features.shape[0], dtype=np.int64)
+                if phase == "val":
+                    self.reference_ais_pool_indices = row_ids[row_ids % 5 == 0]
+                else:
+                    self.reference_ais_pool_indices = row_ids[row_ids % 5 != 0]
+                if self.reference_ais_pool_indices.size == 0:
+                    raise RuntimeError("The global AIS file has no rows for this split.")
+                self.ais_alignment_mode = "global_unpaired_prior"
 
         self.samples = self._collect_samples()
         if not self.samples:
@@ -292,20 +373,19 @@ class MultiModalDomainDataset(Dataset):
             )
 
         if self.reference_ais_file is not None:
-            missing_ais_labels = []
-            for raw_label in raw_labels:
-                try:
-                    ais_label = int(raw_label)
-                except ValueError:
-                    missing_ais_labels.append(raw_label)
-                    continue
-                if ais_label not in self.reference_ais_by_label:
-                    missing_ais_labels.append(raw_label)
-            if missing_ais_labels:
-                raise RuntimeError(
-                    "JMDA-Net AIS MAT file has no samples for image labels: "
-                    f"{missing_ais_labels}. The image/AIS class numbering must match."
+            # Store the exact global row used by every record. This makes the
+            # otherwise invisible train/validation AIS reuse auditable.
+            assignment_rows = list(self.reference_ais_pool_indices.tolist())
+            random.Random(
+                f"{self.reference_ais_file.resolve()}|{self.base_dir.resolve()}|{self.phase}"
+            ).shuffle(assignment_rows)
+            for sample_index, sample in enumerate(self.samples):
+                sample.ais_index = int(
+                    assignment_rows[sample_index % len(assignment_rows)]
                 )
+
+        if self.require_ais and self.reference_ais_file is None:
+            self.ais_alignment_mode = "per_sample"
 
         self.labels = [self.label_map[sample.raw_label] for sample in self.samples]
         self.transform = build_transforms(
@@ -315,6 +395,7 @@ class MultiModalDomainDataset(Dataset):
             val_augment,
             train_augment,
             augmentation_strength,
+            synchronize_modalities=synchronize_modalities,
         )
 
     def _resolve_layout(self, layout: str, vis_folder: str, ir_folder: str) -> str:
@@ -386,9 +467,24 @@ class MultiModalDomainDataset(Dataset):
         vis_files: Sequence[Path],
         ir_files: Sequence[Path],
     ) -> List[Tuple[Path, Path]]:
-        """Preserve the established sorted-index VIS/IR pairing convention."""
+        """Build a deterministic class-level weak pairing without truncation.
 
-        return list(zip(vis_files, ir_files))
+        The two sensors were collected independently. We therefore shuffle the
+        two pools separately and cycle the shorter pool instead of asserting
+        same-index or same-stem correspondence.
+        """
+
+        if not vis_files or not ir_files:
+            return []
+        vis_order = list(vis_files)
+        ir_order = list(ir_files)
+        random.Random("vis|" + "|".join(path.name for path in vis_order)).shuffle(vis_order)
+        random.Random("ir|" + "|".join(path.name for path in ir_order)).shuffle(ir_order)
+        pair_count = max(len(vis_order), len(ir_order))
+        return [
+            (vis_order[index % len(vis_order)], ir_order[index % len(ir_order)])
+            for index in range(pair_count)
+        ]
 
     def _align_class_samples(
         self,
@@ -396,11 +492,13 @@ class MultiModalDomainDataset(Dataset):
         vis_files: Sequence[Path],
         ir_files: Sequence[Path],
     ) -> List[SampleRecord]:
-        """Align one class of VIS/IR pairs, optionally with real AIS files."""
+        """Align one class of weak VIS/IR pairs and optional per-file AIS."""
 
         image_pairs = self._pair_images(vis_files, ir_files)
         if not image_pairs:
             return []
+        if len(vis_files) != len(ir_files):
+            self.vis_ir_count_mismatch_count += 1
 
         if not self.require_ais or self.reference_ais_file is not None:
             return [
@@ -492,9 +590,18 @@ class MultiModalDomainDataset(Dataset):
         if self.require_ais:
             try:
                 if self.reference_ais_file is not None:
-                    ais_label = int(sample.raw_label)
-                    class_pool = self.reference_ais_by_label[ais_label]
-                    ais_array = class_pool[index % len(class_pool)]
+                    if self.reference_ais_features is None or not len(self.reference_ais_pool_indices):
+                        raise RuntimeError("Global AIS pool was not initialized.")
+                    ais_row = sample.ais_index
+                    if ais_row is None:
+                        ais_row = int(
+                            self.reference_ais_pool_indices[index % len(self.reference_ais_pool_indices)]
+                        )
+                    ais_array = self.reference_ais_features[int(ais_row)]
+                    if self.ais_normalize:
+                        mean = ais_array.mean(axis=1, keepdims=True)
+                        std = ais_array.std(axis=1, keepdims=True).clip(min=1e-6)
+                        ais_array = (ais_array - mean) / std
                     result["ais"] = torch.from_numpy(
                         np.ascontiguousarray(ais_array, dtype=np.float32)
                     )
@@ -508,6 +615,7 @@ class MultiModalDomainDataset(Dataset):
                         sequence_length=self.ais_sequence_length,
                         normalize=self.ais_normalize,
                     )
+                result["ais_index"] = int(sample.ais_index) if sample.ais_index is not None else -1
             except Exception as exc:
                 source = self.reference_ais_file or sample.ais_path
                 raise RuntimeError(f"Failed to read AIS sample: {source}") from exc

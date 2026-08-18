@@ -5,11 +5,11 @@
   "detach_contrastive_positives": true,
   "loss_weights": {
     "classification": 1.0,
-    "adv_primary": 0.1,
-    "adv_auxiliary": 0.1,
-    "cycle": 0.5,
-    "identity": 0.05,
-    "contrastive": 0.05,
+    "adv_primary": 0.05,
+    "adv_auxiliary": 0.05,
+    "cycle": 0.25,
+    "identity": 0.1,
+    "contrastive": 0.1,
     "prototype_contrastive": 0.1
   },
   "primary_discriminator": {

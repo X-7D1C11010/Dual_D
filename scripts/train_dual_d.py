@@ -124,8 +124,11 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--use-ais",
         action=argparse.BooleanOptionalAction,
-        default=default("use_ais", True),
-        help="Enable the AIS data and feature-encoding branch.",
+        default=default("use_ais", False),
+        help=(
+            "Enable the AIS branch as an explicit ablation. A global MAT file is "
+            "treated as an unpaired, label-independent prior."
+        ),
     )
     parser.add_argument(
         "--source-ais-root",
@@ -186,6 +189,18 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=default("num_workers", 4))
     parser.add_argument("--device", default=default("device", "auto"))
     parser.add_argument("--seed", type=int, default=default("seed", 42))
+    parser.add_argument(
+        "--multi-gpu",
+        action=argparse.BooleanOptionalAction,
+        default=default("multi_gpu", True),
+        help="Use DataParallel for feature encoders/classifier when multiple CUDA GPUs exist.",
+    )
+    parser.add_argument(
+        "--min-steps-per-epoch",
+        type=int,
+        default=default("min_steps_per_epoch", 8),
+        help="Minimum class-balanced optimizer steps for small target domains.",
+    )
 
     parser.add_argument("--image-size", type=int, default=default("image_size", 224))
     parser.add_argument("--resize-size", type=int, default=default("resize_size", 256))
@@ -195,13 +210,19 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         default=default("augmentation_strength", 0.5),
         help="Modality-specific photometric jitter strength in [0, 1].",
     )
+    parser.add_argument(
+        "--synchronize-modalities",
+        action=argparse.BooleanOptionalAction,
+        default=default("synchronize_modalities", False),
+        help="Reuse geometric augmentation only for genuinely registered VIS/IR pairs.",
+    )
     parser.add_argument("--feature-dim", type=int, default=default("feature_dim", 512))
     parser.add_argument("--proj-dim", type=int, default=default("proj_dim", 128))
 
     parser.add_argument(
         "--pretrained-visual",
         action=argparse.BooleanOptionalAction,
-        default=default("pretrained_visual", False),
+        default=default("pretrained_visual", True),
         help="Use torchvision ImageNet weights for ResNet-18 visual extractor.",
     )
     parser.add_argument(
@@ -220,15 +241,15 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--classifier-dropout",
         type=float,
-        default=default("classifier_dropout", 0.3),
+        default=default("classifier_dropout", 0.4),
     )
     parser.add_argument("--tal-weight", type=float, default=default("tal_weight", 0.3))
-    parser.add_argument("--lr-main", type=float, default=default("lr_main", 5e-4))
+    parser.add_argument("--lr-main", type=float, default=default("lr_main", 1e-4))
     parser.add_argument("--lr-visual", type=float, default=default("lr_visual", 1e-5))
-    parser.add_argument("--lr-discriminator", type=float, default=default("lr_discriminator", 5e-4))
-    parser.add_argument("--weight-decay", type=float, default=default("weight_decay", 1e-4))
+    parser.add_argument("--lr-discriminator", type=float, default=default("lr_discriminator", 5e-5))
+    parser.add_argument("--weight-decay", type=float, default=default("weight_decay", 5e-4))
     parser.add_argument("--lr-factor", type=float, default=default("lr_factor", 0.5))
-    parser.add_argument("--lr-patience", type=int, default=default("lr_patience", 10))
+    parser.add_argument("--lr-patience", type=int, default=default("lr_patience", 6))
     parser.add_argument("--min-lr", type=float, default=default("min_lr", 1e-6))
     parser.add_argument(
         "--min-lr-discriminator",
@@ -238,24 +259,24 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--discriminator-update-interval",
         type=int,
-        default=default("discriminator_update_interval", 2),
+        default=default("discriminator_update_interval", 3),
     )
-    parser.add_argument("--grad-clip", type=float, default=default("grad_clip", 1.0))
+    parser.add_argument("--grad-clip", type=float, default=default("grad_clip", 5.0))
     parser.add_argument(
         "--adversarial-warmup-epochs",
         type=int,
-        default=default("adversarial_warmup_epochs", 5),
+        default=default("adversarial_warmup_epochs", 10),
         help="Epochs before discriminator updates and generator adversarial terms begin.",
     )
     parser.add_argument(
         "--adversarial-ramp-epochs",
         type=int,
-        default=default("adversarial_ramp_epochs", 15),
+        default=default("adversarial_ramp_epochs", 30),
         help="Epochs used to linearly ramp adversarial generator weights to 1.",
     )
     parser.add_argument(
         "--monitor-metric",
-        default=default("monitor_metric", "val_f1_macro_present"),
+        default=default("monitor_metric", "val_acc"),
         choices=["val_acc", "val_f1_macro_present", "val_loss"],
         help="Metric used by both LR schedulers, checkpointing, and early stopping.",
     )
@@ -268,7 +289,7 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--early-stopping-min-epochs",
         type=int,
-        default=default("early_stopping_min_epochs", 75),
+        default=default("early_stopping_min_epochs", 25),
         help="Do not stop before this epoch even if the patience counter is exhausted.",
     )
     parser.add_argument(
@@ -327,6 +348,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--epochs must be positive.")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive.")
+    if args.min_steps_per_epoch <= 0:
+        parser.error("--min-steps-per-epoch must be positive.")
     if args.ais_sequence_length <= 0:
         parser.error("--ais-sequence-length must be positive.")
     if not 0.0 <= args.ais_dropout < 1.0:

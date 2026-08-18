@@ -127,6 +127,7 @@ def build_datasets(args):
         image_size=args.image_size,
         resize_size=args.resize_size,
         augmentation_strength=getattr(args, "augmentation_strength", 0.0),
+        synchronize_modalities=getattr(args, "synchronize_modalities", False),
     )
     label_map = source_train.get_label_map()
     target_train = MultiModalDomainDataset(
@@ -147,6 +148,7 @@ def build_datasets(args):
         image_size=args.image_size,
         resize_size=args.resize_size,
         augmentation_strength=getattr(args, "augmentation_strength", 0.0),
+        synchronize_modalities=getattr(args, "synchronize_modalities", False),
     )
     target_val = MultiModalDomainDataset(
         root_dir=args.target_root,
@@ -167,6 +169,7 @@ def build_datasets(args):
         resize_size=args.resize_size,
         val_augment=args.val_augment,
         augmentation_strength=getattr(args, "augmentation_strength", 0.0),
+        synchronize_modalities=getattr(args, "synchronize_modalities", False),
     )
     target_train_eval = MultiModalDomainDataset(
         root_dir=args.target_root,
@@ -188,6 +191,7 @@ def build_datasets(args):
         val_augment=False,
         train_augment=False,
         augmentation_strength=0.0,
+        synchronize_modalities=getattr(args, "synchronize_modalities", False),
     )
     return source_train, target_train, target_train_eval, target_val, label_map
 
@@ -235,6 +239,28 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
         num_classes=num_classes,
         dropout=getattr(args, "classifier_dropout", 0.30),
     ).to(device)
+
+    # The feature extractors and classifier have ordinary tensor forward paths,
+    # so they can use both server GPUs without wrapping the custom dual-loss
+    # coordinator (whose auxiliary methods are not DataParallel forwards).
+    if (
+        bool(getattr(args, "multi_gpu", False))
+        and device.type == "cuda"
+        and torch.cuda.device_count() > 1
+    ):
+        output_device = device.index if device.index is not None else 0
+        device_ids = [output_device] + [
+            index for index in range(torch.cuda.device_count()) if index != output_device
+        ]
+        net_vis = nn.DataParallel(net_vis, device_ids=device_ids, output_device=output_device)
+        net_ir = nn.DataParallel(net_ir, device_ids=device_ids, output_device=output_device)
+        if net_ais is not None:
+            net_ais = nn.DataParallel(net_ais, device_ids=device_ids, output_device=output_device)
+        classifier = nn.DataParallel(
+            classifier,
+            device_ids=device_ids,
+            output_device=output_device,
+        )
     return ModelBundle(net_vis, net_ir, net_ais, tal, dual_adapter, classifier)
 
 
@@ -748,6 +774,11 @@ def run_training(args) -> Dict[str, object]:
             "AIS input: JMDA-compatible I/Q tensor shape [2, %d]",
             args.effective_ais_sequence_length,
         )
+        args.effective_ais_alignment = getattr(
+            target_train,
+            "ais_alignment_mode",
+            "per_sample",
+        )
     num_classes = len(label_map)
     save_json({"args": vars(args), "label_map": label_map}, run_dir / "resolved_config.json")
     save_json(label_map, run_dir / "label_map.json")
@@ -766,7 +797,8 @@ def run_training(args) -> Dict[str, object]:
     audit_errors = data_audit_errors(data_audit)
     logger.info(
         "Data audit: same_dir=%s | path_overlap(vis/ir/ais)=%d/%d/%d | "
-        "content_overlap(vis/ir/ais)=%d/%d/%d | stem_mismatch(vis-ir/vis-ais)=%d/%d",
+        "content_overlap(vis/ir/ais)=%d/%d/%d | ais_index_overlap=%d | "
+        "stem_mismatch(vis-ir/vis-ais)=%d/%d",
         data_audit["same_base_dir"],
         data_audit["path_overlap_vis_count"],
         data_audit["path_overlap_ir_count"],
@@ -774,6 +806,7 @@ def run_training(args) -> Dict[str, object]:
         data_audit["content_overlap_vis_count"],
         data_audit["content_overlap_ir_count"],
         data_audit["content_overlap_ais_count"],
+        data_audit.get("ais_index_overlap_count", 0),
         data_audit["vis_ir_stem_mismatch_count"],
         data_audit["vis_ais_stem_mismatch_count"],
     )
@@ -798,7 +831,12 @@ def run_training(args) -> Dict[str, object]:
             _compact_distribution(split_summary),
         )
 
-    paired_loader = PairedClassSampler(source_train, target_train, args.batch_size)
+    paired_loader = PairedClassSampler(
+        source_train,
+        target_train,
+        args.batch_size,
+        min_steps_per_epoch=getattr(args, "min_steps_per_epoch", 8),
+    )
     paired_common_classes = list(paired_loader.classes)
     save_json(
         {
@@ -814,6 +852,18 @@ def run_training(args) -> Dict[str, object]:
         num_classes,
         ", ".join(str(class_id) for class_id in paired_common_classes),
     )
+    logger.info(
+        "VIS/IR pairing: %s | count-mismatch classes train/val: %d/%d | "
+        "AIS alignment: %s | AIS rows train/val: %s/%s",
+        "synchronized" if getattr(args, "synchronize_modalities", False) else "class-level-unpaired",
+        getattr(source_train, "vis_ir_count_mismatch_count", 0),
+        getattr(target_val, "vis_ir_count_mismatch_count", 0),
+        getattr(source_train, "ais_alignment_mode", "none"),
+        getattr(source_train, "reference_ais_pool_indices", np.empty(0)).size,
+        getattr(target_val, "reference_ais_pool_indices", np.empty(0)).size,
+    )
+    if bool(getattr(args, "multi_gpu", False)) and device.type == "cuda":
+        logger.info("CUDA devices available: %d | encoder data parallel requested", torch.cuda.device_count())
     val_loader = DataLoader(
         target_val,
         batch_size=args.batch_size,
@@ -849,7 +899,7 @@ def run_training(args) -> Dict[str, object]:
     )
     criterion_cls = LabelSmoothingCrossEntropy(eps=args.label_smoothing)
     optimizer_main, optimizer_disc = build_optimizers(args, models)
-    monitor_metric = getattr(args, "monitor_metric", "val_f1_macro_present")
+    monitor_metric = getattr(args, "monitor_metric", "val_acc")
     monitor_mode = "min" if monitor_metric == "val_loss" else "max"
     scheduler_main = ReduceLROnPlateau(
         optimizer_main,
@@ -867,6 +917,9 @@ def run_training(args) -> Dict[str, object]:
     )
 
     best_acc = -1.0
+    best_acc_epoch = 0
+    best_f1 = -1.0
+    best_f1_epoch = 0
     best_score = float("inf") if monitor_mode == "min" else float("-inf")
     best_metrics: Dict[str, object] = {}
     start_time = time.time()
@@ -1002,7 +1055,16 @@ def run_training(args) -> Dict[str, object]:
         )
         save_checkpoint(last_state, run_dir / "checkpoints" / "last_model.pt")
 
-        best_acc = max(best_acc, float(val_metrics["accuracy"]))
+        current_acc = float(val_metrics["accuracy"])
+        current_f1 = float(val_metrics["f1_macro_present"])
+        if current_acc > best_acc:
+            best_acc = current_acc
+            best_acc_epoch = epoch
+            save_checkpoint(last_state, run_dir / "checkpoints" / "best_acc_model.pt")
+        if current_f1 > best_f1:
+            best_f1 = current_f1
+            best_f1_epoch = epoch
+            save_checkpoint(last_state, run_dir / "checkpoints" / "best_f1_model.pt")
         min_delta = float(getattr(args, "early_stopping_min_delta", 0.0))
         improved = (
             monitor_value < best_score - min_delta
@@ -1052,6 +1114,9 @@ def run_training(args) -> Dict[str, object]:
     summary = {
         "run_dir": str(run_dir),
         "best_acc": best_acc,
+        "best_acc_epoch": best_acc_epoch,
+        "best_f1_macro_present": best_f1,
+        "best_f1_epoch": best_f1_epoch,
         "best_monitor_metric": monitor_metric,
         "best_monitor_value": best_score,
         "best_metrics": best_metrics,
