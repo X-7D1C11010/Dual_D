@@ -4,29 +4,29 @@
   "include_reconstruction_fakes": false,
   "detach_contrastive_positives": true,
   "loss_weights": {
-    "classification": 1.0,
-    "adv_primary": 0.05,
-    "adv_auxiliary": 0.05,
-    "cycle": 0.25,
-    "identity": 0.1,
-    "contrastive": 0.1,
-    "prototype_contrastive": 0.1
+    "classification": 0.5,
+    "adv_primary": 0.04,
+    "adv_auxiliary": 0.04,
+    "cycle": 0.35,
+    "identity": 0.2,
+    "contrastive": 0.08,
+    "prototype_contrastive": 0.08
   },
   "primary_discriminator": {
-    "hidden_dims": [256, 128],
-    "dropout": 0.4,
+    "hidden_dims": [128, 64],
+    "dropout": 0.5,
     "use_spectral_norm": true
   },
   "auxiliary_discriminator": {
-    "hidden_dims": [256, 128],
-    "dropout": 0.4,
+    "hidden_dims": [128, 64],
+    "dropout": 0.5,
     "use_spectral_norm": true
   },
   "generator": {
-    "hidden_dim": 256,
+    "hidden_dim": 192,
     "num_layers": 2,
     "dropout": 0.1,
-    "residual_scale": 0.5,
+    "residual_scale": 0.3,
     "use_layer_norm": true
   }
 }

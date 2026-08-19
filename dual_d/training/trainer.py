@@ -582,7 +582,11 @@ def train_one_epoch(
         pred_tgt = models.classifier(feat_tgt)
         loss_cls_source = criterion_cls(pred_src, source_labels)
         loss_cls_target = criterion_cls(pred_tgt, target_labels)
-        loss_cls = loss_cls_source + loss_cls_target
+        target_cls_weight = max(
+            float(getattr(args, "target_classification_weight", 1.0)),
+            0.0,
+        )
+        loss_cls = loss_cls_source + target_cls_weight * loss_cls_target
 
         loss_dual_g, g_logs = models.dual_adapter.compute_generator_loss(
             outputs=dual_outputs,
@@ -1124,27 +1128,32 @@ def run_training(args) -> Dict[str, object]:
             row["epoch_seconds"],
         )
 
-        last_state = checkpoint_state(
-            args,
-            models,
-            optimizer_main,
-            optimizer_disc,
-            epoch,
-            {"train": train_metrics, "val": val_metrics},
-            label_map,
-        )
-        save_checkpoint(last_state, run_dir / "checkpoints" / "last_model.pt")
+        save_checkpoints = bool(getattr(args, "save_checkpoints", False))
+        last_state = None
+        if save_checkpoints:
+            last_state = checkpoint_state(
+                args,
+                models,
+                optimizer_main,
+                optimizer_disc,
+                epoch,
+                {"train": train_metrics, "val": val_metrics},
+                label_map,
+            )
+            save_checkpoint(last_state, run_dir / "checkpoints" / "last_model.pt")
 
         current_acc = float(val_metrics["accuracy"])
         current_f1 = float(val_metrics["f1_macro_present"])
         if current_acc > best_acc:
             best_acc = current_acc
             best_acc_epoch = epoch
-            save_checkpoint(last_state, run_dir / "checkpoints" / "best_acc_model.pt")
+            if save_checkpoints and last_state is not None:
+                save_checkpoint(last_state, run_dir / "checkpoints" / "best_acc_model.pt")
         if current_f1 > best_f1:
             best_f1 = current_f1
             best_f1_epoch = epoch
-            save_checkpoint(last_state, run_dir / "checkpoints" / "best_f1_model.pt")
+            if save_checkpoints and last_state is not None:
+                save_checkpoint(last_state, run_dir / "checkpoints" / "best_f1_model.pt")
         min_delta = float(getattr(args, "early_stopping_min_delta", 0.0))
         improved = (
             monitor_value < best_score - min_delta
@@ -1163,7 +1172,8 @@ def run_training(args) -> Dict[str, object]:
                 "monitor_value": monitor_value,
                 "epoch": epoch,
             }
-            save_checkpoint(last_state, run_dir / "checkpoints" / "best_model.pt")
+            if save_checkpoints and last_state is not None:
+                save_checkpoint(last_state, run_dir / "checkpoints" / "best_model.pt")
             save_json(best_metrics, run_dir / "best_metrics.json")
             logger.info(
                 "New best %s: %.4f at epoch %d",

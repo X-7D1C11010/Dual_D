@@ -341,6 +341,7 @@ class ThreeModalPipelineTests(unittest.TestCase):
                     "0",
                     "--adversarial-warmup-epochs",
                     "1",
+                    "--save-checkpoints",
                 ]
             )
             batch_summary = run_experiment_matrix(args)
@@ -398,6 +399,7 @@ class ThreeModalPipelineTests(unittest.TestCase):
                     "0",
                     "--adversarial-warmup-epochs",
                     "1",
+                    "--save-checkpoints",
                 ]
             )
             batch_summary = run_experiment_matrix(args)

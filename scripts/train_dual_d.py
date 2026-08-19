@@ -25,8 +25,7 @@ Command examples:
 Outputs:
     output_dir/run_name/train.log
     output_dir/run_name/metrics.csv
-    output_dir/run_name/checkpoints/best_model.pt
-    output_dir/run_name/checkpoints/last_model.pt
+    output_dir/run_name/checkpoints/*.pt (when --save-checkpoints is enabled)
     output_dir/run_name/best_metrics.json
     output_dir/run_name/result_summary.json
     output_dir/run_name/resolved_config.json
@@ -100,7 +99,7 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--iterations",
         type=int,
-        default=default("iterations", 1),
+        default=default("iterations", 3),
         help="Independent training repetitions per target domain.",
     )
     parser.add_argument("--output-dir", default=default("output_dir", str(PROJECT_ROOT / "runs")))
@@ -247,6 +246,15 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         type=float,
         default=default("classifier_dropout", 0.4),
     )
+    parser.add_argument(
+        "--target-classification-weight",
+        type=float,
+        default=default("target_classification_weight", 1.0),
+        help=(
+            "Weight for direct target-domain classification in the main loss. "
+            "Lower values reduce memorization on small target splits."
+        ),
+    )
     parser.add_argument("--tal-weight", type=float, default=default("tal_weight", 0.3))
     parser.add_argument("--lr-main", type=float, default=default("lr_main", 1e-4))
     parser.add_argument("--lr-visual", type=float, default=default("lr_visual", 1e-5))
@@ -325,6 +333,12 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         choices=["raw", "source_like", "residual"],
         help="Target validation feature mode before classifier.",
     )
+    parser.add_argument(
+        "--save-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=default("save_checkpoints", False),
+        help="Write model checkpoint files; disabled by default.",
+    )
     return parser
 
 
@@ -364,6 +378,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--label-smoothing must be in [0, 1).")
     if not 0.0 <= args.classifier_dropout < 1.0:
         parser.error("--classifier-dropout must be in [0, 1).")
+    if args.target_classification_weight < 0.0:
+        parser.error("--target-classification-weight must be non-negative.")
     if not 0.0 <= args.augmentation_strength <= 1.0:
         parser.error("--augmentation-strength must be in [0, 1].")
     if args.train_eval_interval <= 0:
