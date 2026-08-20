@@ -4,11 +4,11 @@
   "include_reconstruction_fakes": false,
   "detach_contrastive_positives": true,
   "loss_weights": {
-    "classification": 0.5,
+    "classification": 0.75,
     "adv_primary": 0.04,
     "adv_auxiliary": 0.04,
-    "cycle": 0.35,
-    "identity": 0.2,
+    "cycle": 0.3,
+    "identity": 0.15,
     "contrastive": 0.08,
     "prototype_contrastive": 0.08
   },

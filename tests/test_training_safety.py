@@ -13,6 +13,7 @@ import torch
 
 from dual_d.data.audit import audit_dataset_splits, data_audit_errors
 from dual_d.data.multimodal_dataset import PairedImageTransform, SampleRecord
+from dual_d.data.paired_sampler import PairedClassSampler
 from dual_d.losses import class_prototype_contrastive_loss
 from dual_d.training.trainer import _adversarial_scale
 
@@ -24,6 +25,22 @@ def _write_image(path: Path, value: int) -> None:
 
 
 class TrainingSafetyTests(unittest.TestCase):
+    def test_paired_sampler_keeps_partial_batch_and_minimum_steps(self) -> None:
+        class Dataset:
+            def __init__(self, size: int) -> None:
+                self.labels = [0] * size
+
+            def __len__(self) -> int:
+                return len(self.labels)
+
+        source = Dataset(10)
+        target = Dataset(5)
+        natural = PairedClassSampler(source, target, batch_size=4, min_steps_per_epoch=1)
+        resampled = PairedClassSampler(source, target, batch_size=4, min_steps_per_epoch=4)
+
+        self.assertEqual(len(natural), 2)
+        self.assertEqual(len(resampled), 4)
+
     def test_paired_transform_reuses_geometric_randomness(self) -> None:
         grid = np.arange(16 * 16, dtype=np.uint8).reshape(16, 16)
         image = Image.fromarray(np.repeat(grid[..., None], 3, axis=2))

@@ -201,7 +201,7 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-steps-per-epoch",
         type=int,
-        default=default("min_steps_per_epoch", 8),
+        default=default("min_steps_per_epoch", 4),
         help="Minimum class-balanced optimizer steps for small target domains.",
     )
 
@@ -210,7 +210,7 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--augmentation-strength",
         type=float,
-        default=default("augmentation_strength", 0.5),
+        default=default("augmentation_strength", 0.6),
         help="Modality-specific photometric jitter strength in [0, 1].",
     )
     parser.add_argument(
@@ -244,22 +244,26 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--classifier-dropout",
         type=float,
-        default=default("classifier_dropout", 0.4),
+        default=default("classifier_dropout", 0.45),
     )
     parser.add_argument(
         "--target-classification-weight",
         type=float,
-        default=default("target_classification_weight", 1.0),
+        default=default("target_classification_weight", 0.75),
         help=(
             "Weight for direct target-domain classification in the main loss. "
             "Lower values reduce memorization on small target splits."
         ),
     )
     parser.add_argument("--tal-weight", type=float, default=default("tal_weight", 0.3))
-    parser.add_argument("--lr-main", type=float, default=default("lr_main", 1e-4))
-    parser.add_argument("--lr-visual", type=float, default=default("lr_visual", 1e-5))
-    parser.add_argument("--lr-discriminator", type=float, default=default("lr_discriminator", 5e-5))
-    parser.add_argument("--weight-decay", type=float, default=default("weight_decay", 5e-4))
+    parser.add_argument("--lr-main", type=float, default=default("lr_main", 7.5e-5))
+    parser.add_argument("--lr-visual", type=float, default=default("lr_visual", 7.5e-6))
+    parser.add_argument(
+        "--lr-discriminator",
+        type=float,
+        default=default("lr_discriminator", 3.75e-5),
+    )
+    parser.add_argument("--weight-decay", type=float, default=default("weight_decay", 7.5e-4))
     parser.add_argument("--lr-factor", type=float, default=default("lr_factor", 0.5))
     parser.add_argument("--lr-patience", type=int, default=default("lr_patience", 6))
     parser.add_argument("--min-lr", type=float, default=default("min_lr", 1e-6))
@@ -295,13 +299,13 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--early-stopping-patience",
         type=int,
-        default=default("early_stopping_patience", 15),
+        default=default("early_stopping_patience", 10),
         help="Stop after this many unimproved epochs; 0 disables early stopping.",
     )
     parser.add_argument(
         "--early-stopping-min-epochs",
         type=int,
-        default=default("early_stopping_min_epochs", 25),
+        default=default("early_stopping_min_epochs", 20),
         help="Do not stop before this epoch even if the patience counter is exhausted.",
     )
     parser.add_argument(

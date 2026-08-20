@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 from collections import defaultdict
+import math
 import random
 from typing import DefaultDict, Dict, Iterable, List
 
@@ -78,7 +79,9 @@ class PairedClassSampler:
 
         natural_batches = max(
             1,
-            min(len(self.source_dataset), len(self.target_dataset)) // self.batch_size,
+            math.ceil(
+                min(len(self.source_dataset), len(self.target_dataset)) / self.batch_size
+            ),
         )
         # Small target domains otherwise produce only a few optimizer updates.
         # Re-sampling uses fresh stochastic augmentation and keeps labels valid.
@@ -108,6 +111,8 @@ class PairedClassSampler:
 
         natural_batches = max(
             1,
-            min(len(self.source_dataset), len(self.target_dataset)) // self.batch_size,
+            math.ceil(
+                min(len(self.source_dataset), len(self.target_dataset)) / self.batch_size
+            ),
         )
         return max(natural_batches, self.min_steps_per_epoch)

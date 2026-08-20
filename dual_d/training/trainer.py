@@ -914,7 +914,7 @@ def run_training(args) -> Dict[str, object]:
         source_train,
         target_train,
         args.batch_size,
-        min_steps_per_epoch=getattr(args, "min_steps_per_epoch", 8),
+        min_steps_per_epoch=getattr(args, "min_steps_per_epoch", 4),
     )
     paired_common_classes = list(paired_loader.classes)
     save_json(
