@@ -792,6 +792,63 @@ def evaluate(
     return metrics
 
 
+@torch.no_grad()
+def save_feature_embeddings(
+    models: ModelBundle,
+    dataloader: DataLoader,
+    device: torch.device,
+    output_path: Path,
+    max_samples: int = 512,
+) -> None:
+    """Save target validation raw/source-like features for post-hoc plots.
+
+    This snapshot is intentionally small and contains no model weights. It is
+    written only when the monitored validation metric improves, so ablation
+    runs can visualize representations without producing large checkpoints.
+    """
+
+    max_samples = max(int(max_samples), 1)
+    models.net_vis.eval()
+    models.net_ir.eval()
+    if models.net_ais is not None:
+        models.net_ais.eval()
+    models.tal.eval()
+    models.dual_adapter.eval()
+
+    raw_features = []
+    source_like_features = []
+    labels = []
+    sample_count = 0
+    for batch in dataloader:
+        vis_feat = models.net_vis(batch["vis"].to(device))
+        ir_feat = models.net_ir(batch["ir"].to(device))
+        modalities = [vis_feat, ir_feat]
+        if models.net_ais is not None:
+            if "ais" not in batch:
+                raise RuntimeError("AIS is enabled but feature snapshot has no AIS tensor.")
+            modalities.append(models.net_ais(batch["ais"].to(device)))
+        projected_target = models.tal.project_target(modalities)
+        raw = torch.cat(projected_target, dim=1)
+        source_like = models.dual_adapter.inference_features(raw, mode="source_like")
+        remaining = max_samples - sample_count
+        raw_features.append(raw[:remaining].cpu().numpy())
+        source_like_features.append(source_like[:remaining].cpu().numpy())
+        labels.append(batch["label"][:remaining].cpu().numpy())
+        sample_count += min(int(raw.size(0)), remaining)
+        if sample_count >= max_samples:
+            break
+
+    if not labels:
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_path,
+        raw=np.concatenate(raw_features, axis=0),
+        source_like=np.concatenate(source_like_features, axis=0),
+        labels=np.concatenate(labels, axis=0).astype(np.int64),
+    )
+
+
 def checkpoint_state(
     args,
     models: ModelBundle,
@@ -1175,6 +1232,14 @@ def run_training(args) -> Dict[str, object]:
             if save_checkpoints and last_state is not None:
                 save_checkpoint(last_state, run_dir / "checkpoints" / "best_model.pt")
             save_json(best_metrics, run_dir / "best_metrics.json")
+            if bool(getattr(args, "save_feature_embeddings", False)):
+                save_feature_embeddings(
+                    models=models,
+                    dataloader=val_loader,
+                    device=device,
+                    output_path=run_dir / "feature_embeddings.npz",
+                    max_samples=getattr(args, "feature_visualization_samples", 512),
+                )
             logger.info(
                 "New best %s: %.4f at epoch %d",
                 monitor_metric,

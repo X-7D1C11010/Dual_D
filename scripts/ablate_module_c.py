@@ -12,11 +12,11 @@ Analyse a completed ablation directory::
 
     python scripts/ablate_module_c.py --runs-root runs/module_c_ablation
 
-Launch all variants for two target domains::
+Launch all variants for all four target domains::
 
     python scripts/ablate_module_c.py --run \
         --source-root /data/clear --target-parent-root /data \
-        --target-domains 逆光 雨天 --iterations 3
+        --target-domains 黑天 逆光 雾天 雨天 --iterations 3
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import csv
 import html
 import json
 import math
+import numpy as np
 from pathlib import Path
 import re
 import subprocess
@@ -139,6 +140,9 @@ def run_variants(args: argparse.Namespace, variants: Sequence[str]) -> None:
             "--iterations",
             str(args.iterations),
             "--no-save-checkpoints",
+            "--save-feature-embeddings",
+            "--feature-visualization-samples",
+            str(args.feature_visualization_samples),
             "--no-use-ais",
         ]
         if args.target_root:
@@ -236,6 +240,7 @@ def _summarize_run(run_dir: Path, monitor_metric: str) -> Dict[str, Any] | None:
         "generalization_gap": (
             train_full - val_acc if train_full is not None and val_acc is not None else None
         ),
+        "feature_embeddings": str(run_dir / "feature_embeddings.npz") if (run_dir / "feature_embeddings.npz").exists() else None,
     }
     for metric in set(LOSS_METRIC.values()) | {
         "train_dual_d_adv_primary",
@@ -295,6 +300,14 @@ def _load_matplotlib():
     import matplotlib
 
     matplotlib.use("Agg")
+    # Explicit CJK font fallback prevents Chinese labels from becoming boxes.
+    from matplotlib import font_manager
+
+    candidates = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "Arial Unicode MS", "DejaVu Sans"]
+    available = {font.name for font in font_manager.fontManager.ttflist}
+    selected = next((name for name in candidates if name in available), "DejaVu Sans")
+    matplotlib.rcParams["font.sans-serif"] = [selected, *[name for name in candidates if name != selected]]
+    matplotlib.rcParams["axes.unicode_minus"] = False
     import matplotlib.pyplot as plt
 
     return plt
@@ -571,6 +584,92 @@ def _plot_constraint_diagnostic(
     plt.close(figure)
 
 
+def _pca_2d(features: np.ndarray) -> np.ndarray:
+    """Project feature rows to two comparable PCA coordinates."""
+
+    if features.ndim != 2 or features.shape[0] == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    centered = features.astype(np.float32) - features.mean(axis=0, keepdims=True)
+    if centered.shape[1] == 1:
+        return np.concatenate([centered, np.zeros_like(centered)], axis=1)
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    components = vh[:2]
+    if components.shape[0] == 1:
+        components = np.vstack([components, np.zeros_like(components)])
+    return centered @ components.T
+
+
+def _feature_snapshot(summaries: Sequence[Mapping[str, Any]], variant: str, domain: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    raw_parts, translated_parts, label_parts = [], [], []
+    for summary in summaries:
+        if summary.get("variant") != variant or summary.get("domain") != domain:
+            continue
+        path = Path(str(summary["run_dir"])) / "feature_embeddings.npz"
+        if not path.exists():
+            continue
+        with np.load(path) as data:
+            raw_parts.append(np.asarray(data["raw"], dtype=np.float32))
+            translated_parts.append(np.asarray(data["source_like"], dtype=np.float32))
+            label_parts.append(np.asarray(data["labels"], dtype=np.int64))
+    if not label_parts:
+        return None
+    raw = np.concatenate(raw_parts, axis=0)
+    translated = np.concatenate(translated_parts, axis=0)
+    labels = np.concatenate(label_parts, axis=0)
+    joint = np.concatenate([raw, translated], axis=0)
+    coordinates = _pca_2d(joint)
+    return coordinates[: len(raw)], coordinates[len(raw):], labels, joint
+
+
+def _plot_feature_diagnostics(summaries: Sequence[Mapping[str, Any]], output_dir: Path, plt) -> List[str]:
+    """Compare full vs leave-one-out feature geometry for every domain/constraint."""
+
+    domains = _domain_order(summaries)
+    generated: List[str] = []
+    for constraint in CONSTRAINTS:
+        ablated_variant = f"no_{constraint}"
+        for domain in domains:
+            full = _feature_snapshot(summaries, "full", domain)
+            ablated = _feature_snapshot(summaries, ablated_variant, domain)
+            if full is None or ablated is None:
+                continue
+            full_raw, full_translated, full_labels, _ = full
+            abl_raw, abl_translated, abl_labels, _ = ablated
+            # Refit PCA jointly so the two panels share a coordinate system.
+            raw_joint = np.concatenate([full_raw, abl_raw], axis=0)
+            translated_joint = np.concatenate([full_translated, abl_translated], axis=0)
+            raw_coords = _pca_2d(raw_joint)
+            translated_coords = _pca_2d(translated_joint)
+            figure, axes = plt.subplots(2, 2, figsize=(11, 8), squeeze=False)
+            panels = [
+                (axes[0, 0], raw_coords[: len(full_labels)], full_labels, "完整模块 C：原始投影"),
+                (axes[0, 1], translated_coords[: len(full_labels)], full_labels, "完整模块 C：source-like"),
+                (axes[1, 0], raw_coords[len(full_labels):], abl_labels, f"去除 {CONSTRAINTS[constraint]}：原始投影"),
+                (axes[1, 1], translated_coords[len(full_labels):], abl_labels, f"去除 {CONSTRAINTS[constraint]}：source-like"),
+            ]
+            class_ids = sorted(set(full_labels.tolist()) | set(abl_labels.tolist()))
+            cmap = plt.get_cmap("tab20")
+            for axis, coordinates, labels, title in panels:
+                for index, class_id in enumerate(class_ids):
+                    mask = labels == class_id
+                    if np.any(mask):
+                        axis.scatter(coordinates[mask, 0], coordinates[mask, 1], s=24, alpha=0.78, color=cmap(index % 20), label=f"类 {class_id}")
+                axis.set_title(title, fontsize=10)
+                axis.set_xlabel("主成分 1")
+                axis.set_ylabel("主成分 2")
+                axis.grid(alpha=0.2)
+            handles, labels = axes[0, 1].get_legend_handles_labels()
+            if handles:
+                figure.legend(handles, labels, loc="lower center", ncol=min(7, len(labels)), frameon=False)
+            figure.suptitle(f"{domain}：模块 C 约束特征可视化", fontsize=14)
+            figure.tight_layout(rect=(0, 0.06, 1, 0.94))
+            filename = f"feature_{constraint}_{re.sub(r'[^0-9A-Za-z一-龥]+', '_', domain)}.png"
+            figure.savefig(output_dir / filename, dpi=180)
+            plt.close(figure)
+            generated.append(filename)
+    return generated
+
+
 def _write_html_report(output_dir: Path, aggregates: Sequence[Mapping[str, Any]], constraints: Sequence[str]) -> None:
     rows = []
     for row in aggregates:
@@ -583,6 +682,7 @@ def _write_html_report(output_dir: Path, aggregates: Sequence[Mapping[str, Any]]
             + "</tr>"
         )
     image_stems = ["module_c_overview", "module_c_effect_heatmap"] + [f"constraint_{name}" for name in constraints]
+    image_stems.extend(path.stem for path in output_dir.glob("feature_*.png"))
     image_tags_parts = []
     for stem in image_stems:
         image = next((candidate for candidate in (f"{stem}.png", f"{stem}.svg") if (output_dir / candidate).exists()), None)
@@ -625,6 +725,7 @@ def analyse(args: argparse.Namespace) -> Dict[str, Any]:
     available_constraints = [name for name in CONSTRAINTS if any(row["variant"] == f"no_{name}" for row in summaries)]
     for constraint in available_constraints:
         _plot_constraint_diagnostic(summaries, constraint, output_dir, plt)
+    _plot_feature_diagnostics(summaries, output_dir, plt)
     _write_html_report(output_dir, aggregates, available_constraints)
     return payload
 
@@ -637,7 +738,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-root", default="")
     parser.add_argument("--target-root", default="")
     parser.add_argument("--target-parent-root", default="")
-    parser.add_argument("--target-domains", nargs="+", default=["逆光", "雨天"])
+    parser.add_argument("--target-domains", nargs="+", default=["黑天", "逆光", "雾天", "雨天"])
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -650,6 +751,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--analysis-glob", default="module_c_*")
     parser.add_argument("--monitor-metric", default="val_f1_macro_present")
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=VARIANTS)
+    parser.add_argument("--feature-visualization-samples", type=int, default=512)
     return parser
 
 

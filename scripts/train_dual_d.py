@@ -343,6 +343,18 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         default=default("save_checkpoints", False),
         help="Write model checkpoint files; disabled by default.",
     )
+    parser.add_argument(
+        "--save-feature-embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=default("save_feature_embeddings", False),
+        help="Save best target-validation raw/source-like features for visualization.",
+    )
+    parser.add_argument(
+        "--feature-visualization-samples",
+        type=int,
+        default=default("feature_visualization_samples", 512),
+        help="Maximum validation samples stored in feature_embeddings.npz.",
+    )
     return parser
 
 
@@ -394,6 +406,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--early-stopping-patience must be non-negative.")
     if args.early_stopping_min_epochs < 0:
         parser.error("--early-stopping-min-epochs must be non-negative.")
+    if args.feature_visualization_samples <= 0:
+        parser.error("--feature-visualization-samples must be positive.")
     return args
 
 

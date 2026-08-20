@@ -64,5 +64,7 @@
   "data_audit_hashes": true,
   "strict_data_audit": true,
   "eval_feature_mode": "source_like",
-  "save_checkpoints": false
+  "save_checkpoints": false,
+  "save_feature_embeddings": false,
+  "feature_visualization_samples": 512
 }
