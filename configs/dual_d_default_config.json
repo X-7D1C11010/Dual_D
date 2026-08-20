@@ -4,13 +4,13 @@
   "include_reconstruction_fakes": false,
   "detach_contrastive_positives": true,
   "loss_weights": {
-    "classification": 0.75,
-    "adv_primary": 0.04,
-    "adv_auxiliary": 0.04,
-    "cycle": 0.3,
+    "classification": 0.65,
+    "adv_primary": 0.035,
+    "adv_auxiliary": 0.035,
+    "cycle": 0.32,
     "identity": 0.15,
     "contrastive": 0.08,
-    "prototype_contrastive": 0.08
+    "prototype_contrastive": 0.09
   },
   "primary_discriminator": {
     "hidden_dims": [128, 64],
