@@ -34,15 +34,11 @@ class ModuleCAblationTests(unittest.TestCase):
         for constraint in CONSTRAINTS:
             config = make_variant_config(base, f"no_{constraint}")
             weights = config["loss_weights"]
-            if constraint == "adversarial":
-                self.assertEqual(weights["adv_primary"], 0.0)
-                self.assertEqual(weights["adv_auxiliary"], 0.0)
-            else:
-                key = {
-                    "paired_contrastive": "contrastive",
-                    "classification_feedback": "classification",
-                }.get(constraint, constraint)
-                self.assertEqual(weights[key], 0.0)
+            key = {
+                "paired_contrastive": "contrastive",
+                "classification_feedback": "classification",
+            }.get(constraint, constraint)
+            self.assertEqual(weights[key], 0.0)
 
     def test_summary_uses_best_epoch_and_aggregates_repetitions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

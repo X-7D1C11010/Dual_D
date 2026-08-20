@@ -33,7 +33,7 @@ import subprocess
 import sys
 from collections import OrderedDict, defaultdict
 from statistics import mean, pstdev
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -43,7 +43,6 @@ DEFAULT_DUAL_CONFIG = PROJECT_ROOT / "configs" / "dual_d_default_config.json"
 # Keep names stable: they are used in output directories, tables and figures.
 CONSTRAINTS = OrderedDict(
     [
-        ("adversarial", "both discriminator fooling terms"),
         ("cycle", "bidirectional cycle consistency"),
         ("identity", "identity preservation"),
         ("paired_contrastive", "class-aware multi-positive contrast"),
@@ -53,7 +52,6 @@ CONSTRAINTS = OrderedDict(
 )
 VARIANTS = ["full", *[f"no_{name}" for name in CONSTRAINTS]]
 LOSS_METRIC = {
-    "adversarial": "train_dual_d_adv_total",
     "cycle": "train_dual_d_cycle",
     "identity": "train_dual_d_identity",
     "paired_contrastive": "train_dual_d_contrastive",
@@ -85,10 +83,7 @@ def make_variant_config(base: Mapping[str, Any], variant: str) -> Dict[str, Any]
     if variant == "full":
         return config
     constraint = variant.removeprefix("no_")
-    if constraint == "adversarial":
-        weights["adv_primary"] = 0.0
-        weights["adv_auxiliary"] = 0.0
-    elif constraint == "paired_contrastive":
+    if constraint == "paired_contrastive":
         weights["contrastive"] = 0.0
     elif constraint == "prototype_contrastive":
         weights["prototype_contrastive"] = 0.0
@@ -263,15 +258,6 @@ def discover_summaries(runs_root: Path, pattern: str, monitor_metric: str) -> Li
     if not summaries:
         raise FileNotFoundError(f"No readable metrics.csv found under {runs_root} with pattern {pattern!r}")
     return summaries
-
-
-def _group(summaries: Iterable[Mapping[str, Any]], key: str) -> Dict[tuple[str, str], List[float]]:
-    grouped: Dict[tuple[str, str], List[float]] = defaultdict(list)
-    for row in summaries:
-        value = _to_float(row.get(key))
-        if value is not None:
-            grouped[(str(row["variant"]), str(row["domain"]))].append(value)
-    return grouped
 
 
 def aggregate_summaries(summaries: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
