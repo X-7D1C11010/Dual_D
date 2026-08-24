@@ -189,6 +189,12 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--device", default=default("device", "auto"))
     parser.add_argument("--seed", type=int, default=default("seed", 42))
     parser.add_argument(
+        "--deterministic-training",
+        action=argparse.BooleanOptionalAction,
+        default=default("deterministic_training", False),
+        help="Prefer deterministic PyTorch/CUDA kernels for paired ablation runs.",
+    )
+    parser.add_argument(
         "--multi-gpu",
         action=argparse.BooleanOptionalAction,
         default=default("multi_gpu", True),
@@ -291,6 +297,18 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         help="Epochs used to linearly ramp adversarial generator weights to 1.",
     )
     parser.add_argument(
+        "--module-c-warmup-epochs",
+        type=int,
+        default=default("module_c_warmup_epochs", 5),
+        help="Epochs that train classification/TAL before Module-C constraints begin.",
+    )
+    parser.add_argument(
+        "--module-c-ramp-epochs",
+        type=int,
+        default=default("module_c_ramp_epochs", 10),
+        help="Epochs used to linearly ramp all Module-C constraint weights to 1.",
+    )
+    parser.add_argument(
         "--monitor-metric",
         default=default("monitor_metric", "val_acc"),
         choices=["val_acc", "val_f1_macro_present", "val_loss"],
@@ -347,7 +365,7 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         "--save-feature-embeddings",
         action=argparse.BooleanOptionalAction,
         default=default("save_feature_embeddings", False),
-        help="Save best target-validation raw/source-like features for visualization.",
+        help="Save best source/target raw and translated features for diagnostics.",
     )
     parser.add_argument(
         "--feature-visualization-samples",

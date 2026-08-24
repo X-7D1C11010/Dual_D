@@ -114,11 +114,10 @@ def paired_contrastive_loss(
     anchor_norm = F.normalize(anchor_features, p=2, dim=1)
     positive_norm = F.normalize(positive_features, p=2, dim=1)
     logits = torch.matmul(anchor_norm, positive_norm.t()) / float(temperature)
-    log_probs = F.log_softmax(logits, dim=1)
 
     if labels is None:
         target = torch.arange(anchor_features.size(0), device=anchor_features.device)
-        return F.nll_loss(log_probs, target)
+        return F.cross_entropy(logits, target)
 
     anchor_labels = labels.view(-1)
     candidate_labels = (
@@ -128,10 +127,23 @@ def paired_contrastive_loss(
         raise ValueError("Anchor label count does not match anchor feature count.")
     if candidate_labels.numel() != positive_features.size(0):
         raise ValueError("Candidate label count does not match positive feature count.")
-    mask = anchor_labels.unsqueeze(1).eq(candidate_labels.unsqueeze(0)).to(log_probs.dtype)
-    mask_sum = mask.sum(dim=1).clamp_min(1.0)
-    per_sample = -(mask * log_probs).sum(dim=1) / mask_sum
-    return per_sample.mean()
+    # Aggregate all same-class cross-domain positives into one probability
+    # mass.  Averaging one log-probability per positive makes the unavoidable
+    # loss floor depend on how often a class was sampled in the batch.  The
+    # log-sum-exp form is invariant to that count and is therefore more stable
+    # for the small, class-imbalanced weather domains used by this project.
+    positive_mask = anchor_labels.unsqueeze(1).eq(candidate_labels.unsqueeze(0))
+    valid_anchors = positive_mask.any(dim=1)
+    if not bool(valid_anchors.any()):
+        return anchor_features.new_tensor(0.0)
+    valid_logits = logits[valid_anchors]
+    valid_mask = positive_mask[valid_anchors]
+    positive_log_mass = torch.logsumexp(
+        valid_logits.masked_fill(~valid_mask, float("-inf")),
+        dim=1,
+    )
+    all_log_mass = torch.logsumexp(valid_logits, dim=1)
+    return (all_log_mass - positive_log_mass).mean()
 
 
 def batch_class_prototypes(

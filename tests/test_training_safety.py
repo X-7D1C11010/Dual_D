@@ -11,11 +11,13 @@ import numpy as np
 from PIL import Image
 import torch
 
+from dual_d.collaborative_training import DualDiscriminatorCoordinator
+from dual_d.config import DualDConfig, LossWeights
 from dual_d.data.audit import audit_dataset_splits, data_audit_errors
 from dual_d.data.multimodal_dataset import PairedImageTransform, SampleRecord
 from dual_d.data.paired_sampler import PairedClassSampler
-from dual_d.losses import class_prototype_contrastive_loss
-from dual_d.training.trainer import _adversarial_scale
+from dual_d.losses import class_prototype_contrastive_loss, paired_contrastive_loss
+from dual_d.training.trainer import _adversarial_scale, _module_c_scale
 
 
 def _write_image(path: Path, value: int) -> None:
@@ -82,6 +84,66 @@ class TrainingSafetyTests(unittest.TestCase):
         self.assertEqual(_adversarial_scale(args, 10), 0.5)
         self.assertEqual(_adversarial_scale(args, 15), 1.0)
         self.assertEqual(_adversarial_scale(args, 100), 1.0)
+
+    def test_module_c_warmup_and_ramp(self) -> None:
+        args = SimpleNamespace(module_c_warmup_epochs=5, module_c_ramp_epochs=10)
+        self.assertEqual(_module_c_scale(args, 5), 0.0)
+        self.assertEqual(_module_c_scale(args, 10), 0.5)
+        self.assertEqual(_module_c_scale(args, 15), 1.0)
+
+    def test_multi_positive_contrast_is_not_penalized_by_positive_count(self) -> None:
+        anchors = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        candidates = torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]
+        )
+        anchor_labels = torch.tensor([0, 1])
+        candidate_labels = torch.tensor([0, 0, 1, 1])
+        loss = paired_contrastive_loss(
+            anchors,
+            candidates,
+            labels=anchor_labels,
+            positive_labels=candidate_labels,
+            temperature=0.1,
+        )
+        self.assertLess(float(loss), 1e-3)
+
+    def test_classification_feedback_updates_translator_not_classifier(self) -> None:
+        config = DualDConfig(
+            feature_dim=4,
+            freeze_classifier_during_feedback=True,
+            loss_weights=LossWeights(
+                classification=1.0,
+                adv_primary=0.0,
+                adv_auxiliary=0.0,
+                cycle=0.0,
+                identity=0.0,
+                contrastive=0.0,
+                prototype_contrastive=0.0,
+            ),
+        )
+        coordinator = DualDiscriminatorCoordinator(config)
+        classifier = torch.nn.Linear(4, 2)
+        source = torch.randn(4, 4)
+        target = torch.randn(4, 4)
+        source_labels = torch.tensor([0, 1, 0, 1])
+        target_labels = torch.tensor([1, 0, 1, 0])
+
+        outputs = coordinator(source, target)
+        loss, _ = coordinator.compute_generator_loss(
+            outputs,
+            classifier=classifier,
+            criterion_cls=torch.nn.CrossEntropyLoss(),
+            source_labels=source_labels,
+            target_labels=target_labels,
+            num_classes=2,
+        )
+        loss.backward()
+
+        self.assertTrue(all(parameter.grad is None for parameter in classifier.parameters()))
+        translator_gradients = [
+            parameter.grad for parameter in coordinator.generator_parameters()
+        ]
+        self.assertTrue(any(gradient is not None for gradient in translator_gradients))
 
     def test_class_prototype_contrastive_prefers_matching_class(self) -> None:
         prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0]])

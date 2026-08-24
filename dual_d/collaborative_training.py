@@ -80,6 +80,51 @@ class DualDiscriminatorCoordinator(nn.Module):
             dropout=config.auxiliary_discriminator.dropout,
             use_spectral_norm=config.auxiliary_discriminator.use_spectral_norm,
         )
+        # Persistent class prototypes are initialized lazily because the
+        # number of classes belongs to the dataset rather than the model JSON.
+        self.register_buffer("source_prototypes_ema", torch.empty(0, config.feature_dim))
+        self.register_buffer("target_prototypes_ema", torch.empty(0, config.feature_dim))
+        self.register_buffer("source_prototype_seen", torch.empty(0, dtype=torch.bool))
+        self.register_buffer("target_prototype_seen", torch.empty(0, dtype=torch.bool))
+
+    @torch.no_grad()
+    def _update_ema_prototypes(
+        self,
+        source_features: torch.Tensor,
+        source_labels: torch.Tensor,
+        target_features: torch.Tensor,
+        target_labels: torch.Tensor,
+        num_classes: int,
+    ) -> None:
+        """Update class-balanced source and target feature prototypes."""
+
+        if self.source_prototypes_ema.size(0) != num_classes:
+            shape = (num_classes, self.config.feature_dim)
+            self.source_prototypes_ema = source_features.new_zeros(shape)
+            self.target_prototypes_ema = target_features.new_zeros(shape)
+            self.source_prototype_seen = torch.zeros(
+                num_classes, dtype=torch.bool, device=source_features.device
+            )
+            self.target_prototype_seen = torch.zeros(
+                num_classes, dtype=torch.bool, device=target_features.device
+            )
+
+        momentum = max(0.0, min(float(self.config.prototype_momentum), 0.9999))
+        for features, labels, stored, seen in (
+            (source_features, source_labels, self.source_prototypes_ema, self.source_prototype_seen),
+            (target_features, target_labels, self.target_prototypes_ema, self.target_prototype_seen),
+        ):
+            batch_prototypes, present = batch_class_prototypes(
+                features.detach(), labels, num_classes
+            )
+            first_observation = present & ~seen
+            repeated = present & seen
+            stored[first_observation] = batch_prototypes[first_observation]
+            stored[repeated] = (
+                momentum * stored[repeated]
+                + (1.0 - momentum) * batch_prototypes[repeated]
+            )
+            seen |= present
 
     def forward(
         self,
@@ -170,6 +215,7 @@ class DualDiscriminatorCoordinator(nn.Module):
         target_labels: Optional[torch.Tensor] = None,
         num_classes: Optional[int] = None,
         adversarial_scale: float = 1.0,
+        module_c_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute generator-side cooperative loss.
 
@@ -180,6 +226,7 @@ class DualDiscriminatorCoordinator(nn.Module):
 
         weights = self.config.loss_weights
         adversarial_scale = max(0.0, min(float(adversarial_scale), 1.0))
+        module_c_scale = max(0.0, min(float(module_c_scale), 1.0))
 
         primary_adv = generator_fooling_loss(
             self.primary_discriminator(outputs.source_like)
@@ -238,22 +285,18 @@ class DualDiscriminatorCoordinator(nn.Module):
                 resolved_num_classes = int(num_classes)
 
             if resolved_num_classes > 0:
-                source_prototype_features = outputs.source_features
-                target_prototype_features = outputs.target_features
-                if self.config.detach_contrastive_positives:
-                    source_prototype_features = source_prototype_features.detach()
-                    target_prototype_features = target_prototype_features.detach()
-
-                source_prototypes, source_prototype_mask = batch_class_prototypes(
-                    source_prototype_features,
-                    source_labels,
-                    resolved_num_classes,
-                )
-                target_prototypes, target_prototype_mask = batch_class_prototypes(
-                    target_prototype_features,
-                    target_labels,
-                    resolved_num_classes,
-                )
+                if self.training:
+                    self._update_ema_prototypes(
+                        outputs.source_features,
+                        source_labels,
+                        outputs.target_features,
+                        target_labels,
+                        resolved_num_classes,
+                    )
+                source_prototypes = self.source_prototypes_ema.detach()
+                target_prototypes = self.target_prototypes_ema.detach()
+                source_prototype_mask = self.source_prototype_seen
+                target_prototype_mask = self.target_prototype_seen
                 prototype_contrastive_loss = 0.5 * (
                     class_prototype_contrastive_loss(
                         outputs.source_like,
@@ -273,25 +316,48 @@ class DualDiscriminatorCoordinator(nn.Module):
 
         classification_loss = outputs.source_features.new_tensor(0.0)
         if classifier is not None and criterion_cls is not None:
-            if target_labels is not None:
-                classification_loss = classification_loss + criterion_cls(
-                    classifier(outputs.source_like),
-                    target_labels,
-                )
-            if source_labels is not None:
-                classification_loss = classification_loss + criterion_cls(
-                    classifier(outputs.target_like),
-                    source_labels,
-                )
+            classifier_parameters = list(classifier.parameters())
+            original_requires_grad = [parameter.requires_grad for parameter in classifier_parameters]
+            freeze_classifier = bool(self.config.freeze_classifier_during_feedback)
+            if freeze_classifier:
+                for parameter in classifier_parameters:
+                    parameter.requires_grad_(False)
+            try:
+                if target_labels is not None:
+                    classification_loss = classification_loss + criterion_cls(
+                        classifier(outputs.source_like),
+                        target_labels,
+                    )
+                if source_labels is not None:
+                    classification_loss = classification_loss + criterion_cls(
+                        classifier(outputs.target_like),
+                        source_labels,
+                    )
+            finally:
+                if freeze_classifier:
+                    for parameter, requires_grad in zip(
+                        classifier_parameters, original_requires_grad
+                    ):
+                        parameter.requires_grad_(requires_grad)
+
+        weighted_cycle = module_c_scale * weights.cycle * cycle_loss
+        weighted_identity = module_c_scale * weights.identity * identity_loss
+        weighted_contrast = module_c_scale * weights.contrastive * contrast_loss
+        weighted_prototype = (
+            module_c_scale * weights.prototype_contrastive * prototype_contrastive_loss
+        )
+        weighted_classification = (
+            module_c_scale * weights.classification * classification_loss
+        )
 
         total_loss = (
             adversarial_scale * weights.adv_primary * primary_adv
             + adversarial_scale * weights.adv_auxiliary * auxiliary_adv
-            + weights.cycle * cycle_loss
-            + weights.identity * identity_loss
-            + weights.contrastive * contrast_loss
-            + weights.prototype_contrastive * prototype_contrastive_loss
-            + weights.classification * classification_loss
+            + weighted_cycle
+            + weighted_identity
+            + weighted_contrast
+            + weighted_prototype
+            + weighted_classification
         )
         logs = {
             "dual_d/generator_total": safe_item(total_loss),
@@ -303,6 +369,12 @@ class DualDiscriminatorCoordinator(nn.Module):
             "dual_d/prototype_contrastive": safe_item(prototype_contrastive_loss),
             "dual_d/classification_feedback": safe_item(classification_loss),
             "dual_d/adversarial_scale": adversarial_scale,
+            "dual_d/module_c_scale": module_c_scale,
+            "dual_d/weighted_cycle": safe_item(weighted_cycle),
+            "dual_d/weighted_identity": safe_item(weighted_identity),
+            "dual_d/weighted_contrastive": safe_item(weighted_contrast),
+            "dual_d/weighted_prototype_contrastive": safe_item(weighted_prototype),
+            "dual_d/weighted_classification_feedback": safe_item(weighted_classification),
         }
         return total_loss, logs
 

@@ -89,12 +89,19 @@ class DualDConfig:
             also treated as fake samples for the corresponding discriminator.
         detach_contrastive_positives: If true, real positive features are used as
             fixed anchors for generated features during generator optimization.
+        prototype_momentum: Exponential moving-average momentum for persistent
+            source/target class prototypes.
+        freeze_classifier_during_feedback: Prevent generated-feature feedback
+            from updating classifier weights.  Gradients still flow through the
+            classifier into the feature translators.
     """
 
     feature_dim: int = 384
     contrastive_temperature: float = 0.20
     include_reconstruction_fakes: bool = True
     detach_contrastive_positives: bool = True
+    prototype_momentum: float = 0.95
+    freeze_classifier_during_feedback: bool = True
     loss_weights: LossWeights = field(default_factory=LossWeights)
     primary_discriminator: DiscriminatorConfig = field(default_factory=DiscriminatorConfig)
     auxiliary_discriminator: DiscriminatorConfig = field(default_factory=DiscriminatorConfig)
@@ -119,6 +126,10 @@ class DualDConfig:
             contrastive_temperature=float(data.get("contrastive_temperature", 0.20)),
             include_reconstruction_fakes=bool(data.get("include_reconstruction_fakes", True)),
             detach_contrastive_positives=bool(data.get("detach_contrastive_positives", True)),
+            prototype_momentum=float(data.get("prototype_momentum", 0.95)),
+            freeze_classifier_during_feedback=bool(
+                data.get("freeze_classifier_during_feedback", True)
+            ),
             loss_weights=LossWeights(**loss_data),
             primary_discriminator=DiscriminatorConfig(**primary_data),
             auxiliary_discriminator=DiscriminatorConfig(**auxiliary_data),

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import os
 from pathlib import Path
 import random
 import time
@@ -64,13 +65,18 @@ class ModelBundle:
     classifier: Classifier
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, deterministic: bool = False) -> None:
     """Set common random seeds for reproducible runs."""
 
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -193,6 +199,28 @@ def build_datasets(args):
         synchronize_modalities=getattr(args, "synchronize_modalities", False),
     )
     label_map = source_train.get_label_map()
+    source_train_eval = MultiModalDomainDataset(
+        root_dir=args.source_root,
+        domain_type="source",
+        phase=args.train_phase,
+        layout=args.source_layout,
+        vis_folder=args.vis_folder,
+        ir_folder=args.ir_folder,
+        ais_folder=args.ais_folder,
+        ais_root=getattr(args, "source_ais_root", "") or None,
+        ais_data_path=getattr(args, "source_ais_data_path", "") or None,
+        ais_match=args.ais_match,
+        ais_sequence_length=args.ais_sequence_length,
+        ais_normalize=args.ais_normalize,
+        require_ais=getattr(args, "use_ais", False),
+        global_label_map=label_map,
+        image_size=args.image_size,
+        resize_size=args.resize_size,
+        val_augment=False,
+        train_augment=False,
+        augmentation_strength=0.0,
+        synchronize_modalities=getattr(args, "synchronize_modalities", False),
+    )
     target_train = MultiModalDomainDataset(
         root_dir=args.target_root,
         domain_type="target",
@@ -256,7 +284,14 @@ def build_datasets(args):
         augmentation_strength=0.0,
         synchronize_modalities=getattr(args, "synchronize_modalities", False),
     )
-    return source_train, target_train, target_train_eval, target_val, label_map
+    return (
+        source_train,
+        source_train_eval,
+        target_train,
+        target_train_eval,
+        target_val,
+        label_map,
+    )
 
 
 def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
@@ -436,6 +471,18 @@ def _adversarial_scale(args, epoch: int) -> float:
     return min((epoch - warmup_epochs) / float(ramp_epochs), 1.0)
 
 
+def _module_c_scale(args, epoch: int) -> float:
+    """Return the warm-up/ramp scale for all Module-C constraints."""
+
+    warmup_epochs = max(int(getattr(args, "module_c_warmup_epochs", 0)), 0)
+    ramp_epochs = max(int(getattr(args, "module_c_ramp_epochs", 0)), 0)
+    if epoch <= warmup_epochs:
+        return 0.0
+    if ramp_epochs == 0:
+        return 1.0
+    return min((epoch - warmup_epochs) / float(ramp_epochs), 1.0)
+
+
 def _gradient_norm(parameters) -> float:
     """Compute the global L2 norm of currently populated gradients."""
 
@@ -514,6 +561,7 @@ def train_one_epoch(
     models.dual_adapter.train()
     models.classifier.train()
     adversarial_scale = _adversarial_scale(args, epoch)
+    module_c_scale = _module_c_scale(args, epoch)
 
     totals = {
         "loss_total": 0.0,
@@ -532,6 +580,8 @@ def train_one_epoch(
         "disc_steps": 0.0,
         "grad_norm_main": 0.0,
         "grad_norm_disc": 0.0,
+        "grad_clip_main_steps": 0.0,
+        "grad_clip_disc_steps": 0.0,
     }
 
     for step, (source_batch, target_batch) in enumerate(paired_loader, start=1):
@@ -572,6 +622,8 @@ def train_one_epoch(
             optimizer_disc.step()
             totals["loss_dual_d"] += float(loss_dual_d.detach().cpu())
             totals["grad_norm_disc"] += grad_norm_disc
+            if args.grad_clip > 0 and grad_norm_disc > args.grad_clip:
+                totals["grad_clip_disc_steps"] += 1.0
             _accumulate_logs(totals, d_logs)
             totals["disc_steps"] += 1.0
 
@@ -597,6 +649,7 @@ def train_one_epoch(
             target_labels=target_labels,
             num_classes=num_classes,
             adversarial_scale=adversarial_scale,
+            module_c_scale=module_c_scale,
         )
         _accumulate_logs(totals, g_logs)
         loss_total = loss_cls + args.tal_weight * loss_tal + loss_dual_g
@@ -627,6 +680,8 @@ def train_one_epoch(
             grad_norm_main = float(grad_norm_main.detach().cpu())
         else:
             grad_norm_main = _gradient_norm(main_parameters)
+        if args.grad_clip > 0 and grad_norm_main > args.grad_clip:
+            totals["grad_clip_main_steps"] += 1.0
 
         optimizer_main.step()
         models.tal.apply_orthogonal_projection()
@@ -672,7 +727,12 @@ def train_one_epoch(
         "train_loss_dual_d": totals["loss_dual_d"] / disc_steps,
         "train_grad_norm_main": totals["grad_norm_main"] / steps,
         "train_grad_norm_discriminator": totals["grad_norm_disc"] / disc_steps,
+        "train_grad_clip_fraction_main": totals["grad_clip_main_steps"] / steps,
+        "train_grad_clip_fraction_discriminator": (
+            totals["grad_clip_disc_steps"] / disc_steps
+        ),
         "train_adversarial_scale": adversarial_scale,
+        "train_module_c_scale": module_c_scale,
         "train_acc": totals["target_correct"] / sample_total,
         "train_acc_source": totals["source_correct"] / sample_total,
         "train_acc_target": totals["target_correct"] / sample_total,
@@ -724,6 +784,21 @@ def train_one_epoch(
             totals,
             "dual_d_classification_feedback",
             steps,
+        ),
+        "train_dual_d_weighted_cycle": _average_logged_metric(
+            totals, "dual_d_weighted_cycle", steps
+        ),
+        "train_dual_d_weighted_identity": _average_logged_metric(
+            totals, "dual_d_weighted_identity", steps
+        ),
+        "train_dual_d_weighted_contrastive": _average_logged_metric(
+            totals, "dual_d_weighted_contrastive", steps
+        ),
+        "train_dual_d_weighted_prototype_contrastive": _average_logged_metric(
+            totals, "dual_d_weighted_prototype_contrastive", steps
+        ),
+        "train_dual_d_weighted_classification_feedback": _average_logged_metric(
+            totals, "dual_d_weighted_classification_feedback", steps
         ),
     }
 
@@ -795,16 +870,19 @@ def evaluate(
 @torch.no_grad()
 def save_feature_embeddings(
     models: ModelBundle,
-    dataloader: DataLoader,
+    source_dataloader: DataLoader,
+    target_dataloader: DataLoader,
     device: torch.device,
     output_path: Path,
     max_samples: int = 512,
 ) -> None:
-    """Save target validation raw/source-like features for post-hoc plots.
+    """Save source and target features for post-hoc alignment diagnostics.
 
     This snapshot is intentionally small and contains no model weights. It is
     written only when the monitored validation metric improves, so ablation
     runs can visualize representations without producing large checkpoints.
+    Dimensionality reduction is deliberately not performed here or anywhere in
+    the train/inference path; any 2-D projection belongs only to later plots.
     """
 
     max_samples = max(int(max_samples), 1)
@@ -815,37 +893,78 @@ def save_feature_embeddings(
     models.tal.eval()
     models.dual_adapter.eval()
 
-    raw_features = []
-    source_like_features = []
-    labels = []
-    sample_count = 0
-    for batch in dataloader:
-        vis_feat = models.net_vis(batch["vis"].to(device))
-        ir_feat = models.net_ir(batch["ir"].to(device))
-        modalities = [vis_feat, ir_feat]
-        if models.net_ais is not None:
-            if "ais" not in batch:
-                raise RuntimeError("AIS is enabled but feature snapshot has no AIS tensor.")
-            modalities.append(models.net_ais(batch["ais"].to(device)))
-        projected_target = models.tal.project_target(modalities)
-        raw = torch.cat(projected_target, dim=1)
-        source_like = models.dual_adapter.inference_features(raw, mode="source_like")
-        remaining = max_samples - sample_count
-        raw_features.append(raw[:remaining].cpu().numpy())
-        source_like_features.append(source_like[:remaining].cpu().numpy())
-        labels.append(batch["label"][:remaining].cpu().numpy())
-        sample_count += min(int(raw.size(0)), remaining)
-        if sample_count >= max_samples:
-            break
+    def collect(dataloader: DataLoader, domain: str):
+        raw_parts = []
+        translated_parts = []
+        label_parts = []
+        sample_ids = []
+        sample_count = 0
+        for batch in dataloader:
+            vis_feat = models.net_vis(batch["vis"].to(device))
+            ir_feat = models.net_ir(batch["ir"].to(device))
+            modalities = [vis_feat, ir_feat]
+            if models.net_ais is not None:
+                if "ais" not in batch:
+                    raise RuntimeError(
+                        "AIS is enabled but feature snapshot has no AIS tensor."
+                    )
+                modalities.append(models.net_ais(batch["ais"].to(device)))
+            projected = (
+                models.tal.project_source(modalities)
+                if domain == "source"
+                else models.tal.project_target(modalities)
+            )
+            raw = torch.cat(projected, dim=1)
+            remaining = max_samples - sample_count
+            raw_parts.append(raw[:remaining].cpu().numpy())
+            if domain == "target":
+                translated = models.dual_adapter.inference_features(
+                    raw, mode="source_like"
+                )
+                translated_parts.append(translated[:remaining].cpu().numpy())
+            label_parts.append(batch["label"][:remaining].cpu().numpy())
+            paths = list(batch.get("vis_path", []))[:remaining]
+            sample_ids.extend(str(path) for path in paths)
+            sample_count += min(int(raw.size(0)), remaining)
+            if sample_count >= max_samples:
+                break
+        raw_array = (
+            np.concatenate(raw_parts, axis=0)
+            if raw_parts
+            else np.empty((0, 0), dtype=np.float32)
+        )
+        translated_array = (
+            np.concatenate(translated_parts, axis=0)
+            if translated_parts
+            else np.empty((0, raw_array.shape[1] if raw_array.ndim == 2 else 0), dtype=np.float32)
+        )
+        label_array = (
+            np.concatenate(label_parts, axis=0).astype(np.int64)
+            if label_parts
+            else np.empty(0, dtype=np.int64)
+        )
+        return raw_array, translated_array, label_array, np.asarray(sample_ids, dtype=str)
 
-    if not labels:
+    source_raw, _, source_labels, source_ids = collect(source_dataloader, "source")
+    target_raw, target_source_like, target_labels, target_ids = collect(
+        target_dataloader, "target"
+    )
+    if not len(source_labels) or not len(target_labels):
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        raw=np.concatenate(raw_features, axis=0),
-        source_like=np.concatenate(source_like_features, axis=0),
-        labels=np.concatenate(labels, axis=0).astype(np.int64),
+        source_raw=source_raw,
+        source_labels=source_labels,
+        source_sample_ids=source_ids,
+        target_raw=target_raw,
+        target_source_like=target_source_like,
+        target_labels=target_labels,
+        target_sample_ids=target_ids,
+        # Backward-compatible aliases for older analysis consumers.
+        raw=target_raw,
+        source_like=target_source_like,
+        labels=target_labels,
     )
 
 
@@ -879,7 +998,10 @@ def checkpoint_state(
 def run_training(args) -> Dict[str, object]:
     """Run a complete standalone Dual_D training experiment."""
 
-    set_seed(args.seed)
+    set_seed(
+        args.seed,
+        deterministic=bool(getattr(args, "deterministic_training", False)),
+    )
     device = resolve_device(args.device)
     validate_cuda_architecture(device)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -894,11 +1016,24 @@ def run_training(args) -> Dict[str, object]:
     logger.info(f"Run directory: {run_dir}")
     logger.info(f"Device: {device}")
 
-    source_train, target_train, target_train_eval, target_val, label_map = build_datasets(args)
+    (
+        source_train,
+        source_train_eval,
+        target_train,
+        target_train_eval,
+        target_val,
+        label_map,
+    ) = build_datasets(args)
     if bool(getattr(args, "use_ais", False)):
         ais_lengths = {
             int(dataset.ais_signal_length)
-            for dataset in (source_train, target_train, target_train_eval, target_val)
+            for dataset in (
+                source_train,
+                source_train_eval,
+                target_train,
+                target_train_eval,
+                target_val,
+            )
         }
         if len(ais_lengths) != 1:
             raise RuntimeError(
@@ -1000,6 +1135,14 @@ def run_training(args) -> Dict[str, object]:
     )
     val_loader = DataLoader(
         target_val,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        drop_last=False,
+        pin_memory=device.type == "cuda",
+    )
+    source_eval_loader = DataLoader(
+        source_train_eval,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -1235,7 +1378,8 @@ def run_training(args) -> Dict[str, object]:
             if bool(getattr(args, "save_feature_embeddings", False)):
                 save_feature_embeddings(
                     models=models,
-                    dataloader=val_loader,
+                    source_dataloader=source_eval_loader,
+                    target_dataloader=val_loader,
                     device=device,
                     output_path=run_dir / "feature_embeddings.npz",
                     max_samples=getattr(args, "feature_visualization_samples", 512),

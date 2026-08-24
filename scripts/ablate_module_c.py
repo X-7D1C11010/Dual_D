@@ -1,10 +1,11 @@
 """Run and analyse leave-one-constraint-out experiments for Module C.
 
-Module C is evaluated with one complete run plus one run for every individual
-constraint removed from the generator objective.  The script can launch the
-existing training entrypoint (``--run``), or analyse already written
-``metrics.csv`` files.  Analysis writes machine-readable summaries and
-constraint-specific PNG diagnostics; no metric is filtered or rewritten.
+Module C is evaluated with the full model, a joint no-Module-C baseline, and
+one run for every individual constraint removed from the generator objective.
+The script can launch the existing training entrypoint (``--run``), or analyse
+one manifest-backed experiment directory. Analysis reports accuracy, macro
+precision, macro recall and macro F1 at one shared selected epoch, plus
+run-isolated feature diagnostics; no metric is filtered or rewritten.
 
 Examples
 --------
@@ -24,6 +25,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import csv
+from datetime import datetime
 import html
 import json
 import math
@@ -33,7 +35,7 @@ import re
 import subprocess
 import sys
 from collections import OrderedDict, defaultdict
-from statistics import mean, pstdev
+from statistics import mean, pstdev, stdev
 from typing import Any, Dict, List, Mapping, Sequence
 
 
@@ -46,12 +48,26 @@ CONSTRAINTS = OrderedDict(
     [
         ("cycle", "bidirectional cycle consistency"),
         ("identity", "identity preservation"),
-        ("paired_contrastive", "class-aware multi-positive contrast"),
-        ("prototype_contrastive", "batch class-prototype contrast"),
+        ("paired_contrastive", "class-balanced cross-domain supervised contrast"),
+        ("prototype_contrastive", "EMA class-prototype contrast"),
         ("classification_feedback", "generated-feature classification feedback"),
     ]
 )
-VARIANTS = ["full", *[f"no_{name}" for name in CONSTRAINTS]]
+VARIANTS = ["full", "no_module_c", *[f"no_{name}" for name in CONSTRAINTS]]
+DOMAIN_DISPLAY = {
+    "黑天": "Night",
+    "逆光": "Backlight",
+    "雾天": "Fog",
+    "雨天": "Rain",
+}
+METRICS = OrderedDict(
+    [
+        ("best_val_acc", "Accuracy"),
+        ("best_val_precision", "Macro Precision"),
+        ("best_val_recall", "Macro Recall"),
+        ("best_val_f1", "Macro F1"),
+    ]
+)
 LOSS_METRIC = {
     "cycle": "train_dual_d_cycle",
     "identity": "train_dual_d_identity",
@@ -82,6 +98,16 @@ def make_variant_config(base: Mapping[str, Any], variant: str) -> Dict[str, Any]
     weights = dict(config.get("loss_weights", {}))
     config["loss_weights"] = weights
     if variant == "full":
+        return config
+    if variant == "no_module_c":
+        for key in (
+            "cycle",
+            "identity",
+            "contrastive",
+            "prototype_contrastive",
+            "classification",
+        ):
+            weights[key] = 0.0
         return config
     constraint = variant.removeprefix("no_")
     if constraint == "paired_contrastive":
@@ -114,14 +140,35 @@ def _append_option(command: List[str], flag: str, value: Any) -> None:
         command.extend([flag, str(value)])
 
 
-def run_variants(args: argparse.Namespace, variants: Sequence[str]) -> None:
+def run_variants(args: argparse.Namespace, variants: Sequence[str]) -> Path:
     if not args.source_root:
         raise ValueError("--source-root is required with --run")
     if bool(args.target_root) == bool(args.target_parent_root):
         raise ValueError("Provide exactly one of --target-root or --target-parent-root with --run")
 
-    output_dir = Path(args.output_dir)
+    experiment_id = args.experiment_id or datetime.now().strftime("module_c_%Y%m%d_%H%M%S")
+    if not re.fullmatch(r"[0-9A-Za-z_.-]+", experiment_id):
+        raise ValueError("--experiment-id may contain only letters, digits, dot, dash and underscore")
+    output_dir = Path(args.output_dir) / experiment_id
+    output_dir.mkdir(parents=True, exist_ok=False)
     config_paths = write_variant_configs(Path(args.base_dual_config), output_dir, variants)
+    domains = (
+        [Path(args.target_root).name]
+        if args.target_root
+        else [str(item) for item in args.target_domains]
+    )
+    _json_dump(
+        {
+            "experiment_id": experiment_id,
+            "variants": list(variants),
+            "domains": domains,
+            "iterations": int(args.iterations),
+            "expected_runs": len(variants) * len(domains) * int(args.iterations),
+            "monitor_metric": args.monitor_metric,
+            "pca_feature_view": bool(args.pca_feature_view),
+        },
+        output_dir / "experiment_manifest.json",
+    )
     train_script = PROJECT_ROOT / "scripts" / "train_dual_d.py"
     for variant in variants:
         command = [
@@ -143,7 +190,10 @@ def run_variants(args: argparse.Namespace, variants: Sequence[str]) -> None:
             "--save-feature-embeddings",
             "--feature-visualization-samples",
             str(args.feature_visualization_samples),
+            "--monitor-metric",
+            str(args.monitor_metric),
             "--no-use-ais",
+            "--deterministic-training",
         ]
         if args.target_root:
             command.extend(["--target-root", str(args.target_root)])
@@ -158,6 +208,7 @@ def run_variants(args: argparse.Namespace, variants: Sequence[str]) -> None:
         print("Running Module-C variant:", variant)
         print(" ".join(command))
         subprocess.run(command, cwd=str(PROJECT_ROOT), check=True)
+    return output_dir
 
 
 def _to_float(value: Any) -> float | None:
@@ -206,6 +257,23 @@ def _infer_domain(run_dir: Path) -> str:
     return match.group("domain") if match else "all"
 
 
+def _infer_iteration(run_dir: Path) -> int | None:
+    match = re.search(r"_iter(?P<iteration>\d+)", run_dir.name)
+    return int(match.group("iteration")) if match else None
+
+
+def _resolved_seed(run_dir: Path) -> int | None:
+    path = run_dir / "resolved_config.json"
+    if not path.exists():
+        return None
+    try:
+        data = _json_load(path)
+        value = data.get("args", {}).get("seed")
+        return int(value) if value is not None else None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
 def _best_row(rows: Sequence[Mapping[str, Any]], metric: str) -> Mapping[str, Any]:
     candidates = [row for row in rows if _to_float(row.get(metric)) is not None]
     if not candidates:
@@ -225,6 +293,8 @@ def _summarize_run(run_dir: Path, monitor_metric: str) -> Dict[str, Any] | None:
         return None
     best = _best_row(rows, monitor_metric)
     val_acc = _to_float(best.get("val_acc"))
+    val_precision = _to_float(best.get("val_precision_macro_present"))
+    val_recall = _to_float(best.get("val_recall_macro_present"))
     val_f1 = _to_float(best.get("val_f1_macro_present"))
     train_full = _to_float(best.get("train_full_acc"))
     summary: Dict[str, Any] = {
@@ -232,9 +302,13 @@ def _summarize_run(run_dir: Path, monitor_metric: str) -> Dict[str, Any] | None:
         "run": run_dir.name,
         "variant": _infer_variant(run_dir),
         "domain": _infer_domain(run_dir),
+        "iteration": _infer_iteration(run_dir),
+        "seed": _resolved_seed(run_dir),
         "epochs": len(rows),
         "best_epoch": _to_float(best.get("epoch")),
         "best_val_acc": val_acc,
+        "best_val_precision": val_precision,
+        "best_val_recall": val_recall,
         "best_val_f1": val_f1,
         "best_train_full_acc": train_full,
         "generalization_gap": (
@@ -262,6 +336,16 @@ def discover_summaries(runs_root: Path, pattern: str, monitor_metric: str) -> Li
             summaries.append(summary)
     if not summaries:
         raise FileNotFoundError(f"No readable metrics.csv found under {runs_root} with pattern {pattern!r}")
+    keys: Dict[tuple[str, str, int | None], str] = {}
+    for summary in summaries:
+        key = (summary["variant"], summary["domain"], summary["iteration"])
+        if key in keys:
+            raise RuntimeError(
+                "Duplicate ablation run key "
+                f"{key}: {keys[key]} and {summary['run_dir']}. "
+                "Analyse one manifest-backed experiment directory at a time."
+            )
+        keys[key] = str(summary["run_dir"])
     return summaries
 
 
@@ -269,16 +353,68 @@ def aggregate_summaries(summaries: Sequence[Mapping[str, Any]]) -> List[Dict[str
     grouped: Dict[tuple[str, str], List[Mapping[str, Any]]] = defaultdict(list)
     for row in summaries:
         grouped[(str(row["variant"]), str(row["domain"]))].append(row)
-    keys = ["best_val_acc", "best_val_f1", "best_train_full_acc", "generalization_gap"]
+    keys = [
+        "best_val_acc",
+        "best_val_precision",
+        "best_val_recall",
+        "best_val_f1",
+        "best_train_full_acc",
+        "generalization_gap",
+    ]
     output: List[Dict[str, Any]] = []
     for (variant, domain), rows in sorted(grouped.items()):
         result: Dict[str, Any] = {"variant": variant, "domain": domain, "runs": len(rows)}
         for key in keys:
             values = [float(row[key]) for row in rows if _to_float(row.get(key)) is not None]
             result[f"{key}_mean"] = mean(values) if values else None
-            result[f"{key}_std"] = pstdev(values) if len(values) > 1 else 0.0 if values else None
+            result[f"{key}_std"] = stdev(values) if len(values) > 1 else 0.0 if values else None
+            result[f"{key}_ci95"] = (
+                1.96 * stdev(values) / math.sqrt(len(values))
+                if len(values) > 1
+                else 0.0 if values else None
+            )
         output.append(result)
     return output
+
+
+def validate_manifest(
+    runs_root: Path,
+    summaries: Sequence[Mapping[str, Any]],
+) -> None:
+    """Require exactly the run matrix declared by a new experiment manifest."""
+
+    path = runs_root / "experiment_manifest.json"
+    if not path.exists():
+        return
+    manifest = _json_load(path)
+    expected = {
+        (str(variant), str(domain), iteration)
+        for variant in manifest["variants"]
+        for domain in manifest["domains"]
+        for iteration in range(1, int(manifest["iterations"]) + 1)
+    }
+    actual = {
+        (str(row["variant"]), str(row["domain"]), int(row["iteration"]))
+        for row in summaries
+        if row.get("iteration") is not None
+    }
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    incomplete = [
+        str(row["run_dir"])
+        for row in summaries
+        if not row.get("feature_embeddings")
+        or not (Path(str(row["run_dir"])) / "result_summary.json").exists()
+    ]
+    if missing or unexpected or incomplete:
+        raise RuntimeError(
+            "Ablation experiment is incomplete or contaminated: "
+            f"missing={missing}, unexpected={unexpected}, incomplete={incomplete}"
+        )
+    if len(summaries) != int(manifest["expected_runs"]):
+        raise RuntimeError(
+            f"Expected {manifest['expected_runs']} runs, found {len(summaries)}."
+        )
 
 
 def _write_csv(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
@@ -300,17 +436,21 @@ def _load_matplotlib():
     import matplotlib
 
     matplotlib.use("Agg")
-    # Explicit CJK font fallback prevents Chinese labels from becoming boxes.
-    from matplotlib import font_manager
-
-    candidates = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "Arial Unicode MS", "DejaVu Sans"]
-    available = {font.name for font in font_manager.fontManager.ttflist}
-    selected = next((name for name in candidates if name in available), "DejaVu Sans")
-    matplotlib.rcParams["font.sans-serif"] = [selected, *[name for name in candidates if name != selected]]
-    matplotlib.rcParams["axes.unicode_minus"] = False
     import matplotlib.pyplot as plt
 
     return plt
+
+
+def _domain_display(domain: str) -> str:
+    return DOMAIN_DISPLAY.get(str(domain), str(domain))
+
+
+def _variant_display(variant: str) -> str:
+    if variant == "full":
+        return "Full Module C"
+    if variant == "no_module_c":
+        return "Without Module C"
+    return "Without " + variant.removeprefix("no_").replace("_", " ").title()
 
 
 def _svg_escape(value: Any) -> str:
@@ -321,7 +461,7 @@ def _svg_document(width: int, height: int, body: str) -> str:
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}" role="img">'
-        '<style>text{font-family:Arial,sans-serif;fill:#17202a} .grid{stroke:#d7dde3;stroke-width:1} '
+        '<style>text{fill:#17202a} .grid{stroke:#d7dde3;stroke-width:1} '
         '.axis{stroke:#53616d;stroke-width:1.2} .full{fill:#2f6f9f} .ablated{fill:#b85c38} '
         '.line-full{fill:none;stroke:#2f6f9f;stroke-width:2.5} .line-ablated{fill:none;stroke:#b85c38;stroke-width:2.5}</style>'
         + body
@@ -359,11 +499,11 @@ def _plot_overview_svg(summaries: Sequence[Mapping[str, Any]], output_dir: Path)
                 continue
             x = center + (domain_index - (len(domains)-1)/2) * bar_w
             bar_height = plot_h * max(0.0, min(1.0, value))
-            body.append(_svg_bar(x - bar_w/2, top + plot_h - bar_height, bar_w * 0.86, bar_height, "full" if variant == "full" else "ablated", f"{variant}, {domain}: {value:.3f}"))
+            body.append(_svg_bar(x - bar_w/2, top + plot_h - bar_height, bar_w * 0.86, bar_height, "full" if variant == "full" else "ablated", f"{variant}, {_domain_display(domain)}: {value:.3f}"))
     legend_x = left
     for index, domain in enumerate(domains):
         x = legend_x + index * 130
-        body.append(f'<rect x="{x}" y="{height-38}" width="12" height="12" fill="{colors[index % len(colors)]}"/><text x="{x+17}" y="{height-28}" font-size="12">{_svg_escape(domain)}</text>')
+        body.append(f'<rect x="{x}" y="{height-38}" width="12" height="12" fill="{colors[index % len(colors)]}"/><text x="{x+17}" y="{height-28}" font-size="12">{_svg_escape(_domain_display(domain))}</text>')
     body.append(f'<text x="18" y="{top+plot_h/2}" font-size="13" transform="rotate(-90 18 {top+plot_h/2})">Best validation F1</text>')
     (output_dir / "module_c_overview.svg").write_text(_svg_document(width, height, "".join(body)), encoding="utf-8")
 
@@ -377,7 +517,7 @@ def _plot_effect_heatmap_svg(summaries: Sequence[Mapping[str, Any]], output_dir:
     left, top, cell_w, cell_h = 190, 62, min(110, 620 / len(domains)), 38
     body = [f'<text x="{width/2}" y="28" text-anchor="middle" font-size="20">Full F1 minus leave-one-out F1</text>']
     for col, domain in enumerate(domains):
-        body.append(f'<text x="{left + col*cell_w + cell_w/2:.1f}" y="{top-14}" text-anchor="middle" font-size="12">{_svg_escape(domain)}</text>')
+        body.append(f'<text x="{left + col*cell_w + cell_w/2:.1f}" y="{top-14}" text-anchor="middle" font-size="12">{_svg_escape(_domain_display(domain))}</text>')
     for row_index, constraint in enumerate(constraints):
         y = top + row_index * cell_h
         body.append(f'<text x="{left-10}" y="{y+cell_h/2+4:.1f}" text-anchor="end" font-size="12">{_svg_escape(constraint.replace("_", " "))}</text>')
@@ -426,8 +566,8 @@ def _plot_constraint_diagnostic_svg(summaries: Sequence[Mapping[str, Any]], cons
             if value is None:
                 continue
             bar_height = (panel_bottom-top) * max(0.0, min(1.0, value))
-            body.append(_svg_bar(center+offset-13, panel_bottom-bar_height, 26, bar_height, css_class, f"{label}, {domain}: {value:.3f}"))
-        body.append(f'<text x="{center:.1f}" y="{panel_bottom+22}" text-anchor="middle" font-size="12">{_svg_escape(domain)}</text>')
+            body.append(_svg_bar(center+offset-13, panel_bottom-bar_height, 26, bar_height, css_class, f"{label}, {_domain_display(domain)}: {value:.3f}"))
+        body.append(f'<text x="{center:.1f}" y="{panel_bottom+22}" text-anchor="middle" font-size="12">{_svg_escape(_domain_display(domain))}</text>')
     body.append(f'<text x="18" y="{(top+panel_bottom)/2}" font-size="13" transform="rotate(-90 18 {(top+panel_bottom)/2})">Best validation F1</text>')
     # Constraint-specific loss curves.
     curve_top, curve_bottom = 390, 635
@@ -468,10 +608,17 @@ def _mean_std(rows: Sequence[Mapping[str, Any]], variant: str, domain: str, key:
     return mean(values), pstdev(values) if len(values) > 1 else 0.0
 
 
-def _read_curve_rows(summaries: Sequence[Mapping[str, Any]], variant: str, metric: str) -> Dict[int, List[float]]:
+def _read_curve_rows(
+    summaries: Sequence[Mapping[str, Any]],
+    variant: str,
+    metric: str,
+    domain: str | None = None,
+) -> Dict[int, List[float]]:
     curves: Dict[int, List[float]] = defaultdict(list)
     for summary in summaries:
         if summary.get("variant") != variant:
+            continue
+        if domain is not None and summary.get("domain") != domain:
             continue
         path = Path(str(summary["run_dir"])) / "metrics.csv"
         if not path.exists():
@@ -489,23 +636,40 @@ def _plot_overview(summaries: Sequence[Mapping[str, Any]], output_dir: Path, plt
     variants = [variant for variant in VARIANTS if any(row["variant"] == variant for row in summaries)]
     if not variants:
         return
-    figure, axis = plt.subplots(figsize=(max(8, 1.4 * len(variants)), 5.2))
+    figure, axes = plt.subplots(2, 2, figsize=(max(11, 1.55 * len(variants)), 8.5))
     width = 0.8 / max(len(domains), 1)
     x_positions = list(range(len(variants)))
-    for domain_index, domain in enumerate(domains):
-        values, errors = [], []
-        for variant in variants:
-            value, error = _mean_std(summaries, variant, domain, "best_val_f1")
-            values.append(value if value is not None else float("nan"))
-            errors.append(error if error is not None else 0.0)
-        offsets = [x + (domain_index - (len(domains) - 1) / 2) * width for x in x_positions]
-        axis.bar(offsets, values, width=width * 0.9, yerr=errors, capsize=3, label=domain)
-    axis.set_xticks(x_positions, [variant.replace("no_", "- ") for variant in variants], rotation=25, ha="right")
-    axis.set_ylim(0, 1.05)
-    axis.set_ylabel("Best validation F1 (present classes)")
-    axis.set_title("Module C ablation overview")
-    axis.grid(axis="y", alpha=0.25)
-    axis.legend(ncol=min(3, len(domains)), frameon=False)
+    for axis, (metric, metric_label) in zip(axes.flat, METRICS.items()):
+        for domain_index, domain in enumerate(domains):
+            values, errors = [], []
+            for variant in variants:
+                value, error = _mean_std(summaries, variant, domain, metric)
+                values.append(value if value is not None else float("nan"))
+                errors.append(error if error is not None else 0.0)
+            offsets = [
+                x + (domain_index - (len(domains) - 1) / 2) * width
+                for x in x_positions
+            ]
+            axis.bar(
+                offsets,
+                values,
+                width=width * 0.9,
+                yerr=errors,
+                capsize=2,
+                label=_domain_display(domain),
+            )
+        axis.set_xticks(
+            x_positions,
+            [_variant_display(variant) for variant in variants],
+            rotation=25,
+            ha="right",
+        )
+        axis.set_ylim(0, 1.05)
+        axis.set_ylabel(metric_label)
+        axis.set_title(metric_label + " at the selected best epoch")
+        axis.grid(axis="y", alpha=0.25)
+    axes[0, 0].legend(ncol=min(4, len(domains)), frameon=False)
+    figure.suptitle("Module C ablation overview", fontsize=15)
     figure.tight_layout()
     figure.savefig(output_dir / "module_c_overview.png", dpi=180)
     plt.close(figure)
@@ -525,8 +689,16 @@ def _plot_effect_heatmap(summaries: Sequence[Mapping[str, Any]], output_dir: Pat
             row_values.append((full - ablated) if full is not None and ablated is not None else float("nan"))
         values.append(row_values)
     figure, axis = plt.subplots(figsize=(max(7, 1.3 * len(domains)), 4.4))
-    image = axis.imshow(values, cmap="RdYlGn", vmin=-0.5, vmax=0.5, aspect="auto")
-    axis.set_xticks(range(len(domains)), domains, rotation=25, ha="right")
+    finite_values = [abs(value) for row in values for value in row if not math.isnan(value)]
+    limit = max(finite_values, default=0.05)
+    limit = max(limit, 0.01)
+    image = axis.imshow(values, cmap="RdYlGn", vmin=-limit, vmax=limit, aspect="auto")
+    axis.set_xticks(
+        range(len(domains)),
+        [_domain_display(domain) for domain in domains],
+        rotation=25,
+        ha="right",
+    )
     axis.set_yticks(range(len(constraints)), [item.replace("_", " ") for item in constraints])
     axis.set_title("Full model F1 minus leave-one-out F1")
     for row_index, row in enumerate(values):
@@ -550,148 +722,769 @@ def _plot_constraint_diagnostic(
     domains = _domain_order(summaries)
     if not any(row["variant"] == ablation_variant for row in summaries):
         return
-    figure, (performance_axis, curve_axis) = plt.subplots(2, 1, figsize=(9, 8), gridspec_kw={"height_ratios": [1, 1.35]})
+    figure, axes = plt.subplots(2, 2, figsize=(12, 8.5))
     x_positions = list(range(len(domains)))
     width = 0.35
-    for offset, variant, label, color in [(-width / 2, full_variant, "full", "#2f6f9f"), (width / 2, ablation_variant, f"without {constraint}", "#b85c38")]:
-        values, errors = [], []
-        for domain in domains:
-            value, error = _mean_std(summaries, variant, domain, "best_val_f1")
-            values.append(value if value is not None else float("nan"))
-            errors.append(error if error is not None else 0.0)
-        performance_axis.bar([x + offset for x in x_positions], values, width=width, yerr=errors, capsize=3, label=label, color=color)
-    performance_axis.set_xticks(x_positions, domains, rotation=20, ha="right")
-    performance_axis.set_ylim(0, 1.05)
-    performance_axis.set_ylabel("Best val F1")
-    performance_axis.set_title(f"{constraint.replace('_', ' ').title()}: performance impact")
-    performance_axis.grid(axis="y", alpha=0.25)
-    performance_axis.legend(frameon=False)
-
-    metric = LOSS_METRIC[constraint]
-    for variant, label, color in [(full_variant, "full", "#2f6f9f"), (ablation_variant, f"without {constraint}", "#b85c38")]:
-        curve = _read_curve_rows(summaries, variant, metric)
-        if curve:
-            epochs = sorted(curve)
-            means = [mean(curve[epoch]) for epoch in epochs]
-            curve_axis.plot(epochs, means, linewidth=2, label=label, color=color)
-    curve_axis.set_xlabel("Epoch")
-    curve_axis.set_ylabel(metric.replace("train_dual_d_", "").replace("_", " "))
-    curve_axis.set_title(f"Constraint diagnostic: {CONSTRAINTS[constraint]}")
-    curve_axis.grid(alpha=0.25)
-    curve_axis.legend(frameon=False)
+    for axis, (metric, label) in zip(axes.flat, METRICS.items()):
+        for offset, variant, legend, color in (
+            (-width / 2, full_variant, "Full Module C", "#2f6f9f"),
+            (width / 2, ablation_variant, _variant_display(ablation_variant), "#b85c38"),
+        ):
+            values, errors = [], []
+            for domain in domains:
+                value, error = _mean_std(summaries, variant, domain, metric)
+                values.append(value if value is not None else float("nan"))
+                errors.append(error if error is not None else 0.0)
+            axis.bar(
+                [x + offset for x in x_positions],
+                values,
+                width=width,
+                yerr=errors,
+                capsize=3,
+                label=legend,
+                color=color,
+            )
+        axis.set_xticks(
+            x_positions,
+            [_domain_display(domain) for domain in domains],
+            rotation=15,
+            ha="right",
+        )
+        axis.set_ylim(0, 1.05)
+        axis.set_ylabel(label)
+        axis.set_title(label)
+        axis.grid(axis="y", alpha=0.25)
+    axes[0, 0].legend(frameon=False)
+    figure.suptitle(
+        f"Impact of {constraint.replace('_', ' ').title()}", fontsize=15
+    )
     figure.tight_layout()
     figure.savefig(output_dir / f"constraint_{constraint}.png", dpi=180)
     plt.close(figure)
 
+    raw_metric = LOSS_METRIC[constraint]
+    for domain in domains:
+        loss_figure, loss_axis = plt.subplots(figsize=(7.5, 4.5))
+        for variant, legend, color in (
+            (full_variant, "Full Module C", "#2f6f9f"),
+            (ablation_variant, _variant_display(ablation_variant), "#b85c38"),
+        ):
+            curve = _read_curve_rows(summaries, variant, raw_metric, domain=domain)
+            epochs = [epoch for epoch in sorted(curve) if len(curve[epoch]) >= 2]
+            if epochs:
+                means = [mean(curve[epoch]) for epoch in epochs]
+                loss_axis.plot(epochs, means, linewidth=2, label=legend, color=color)
+        loss_axis.set_xlabel("Epoch")
+        loss_axis.set_ylabel("Raw " + raw_metric.replace("train_dual_d_", "").replace("_", " "))
+        loss_axis.set_title(
+            f"{_domain_display(domain)}: raw {CONSTRAINTS[constraint]} diagnostic"
+        )
+        loss_axis.grid(alpha=0.25)
+        loss_axis.legend(frameon=False)
+        loss_figure.tight_layout()
+        loss_figure.savefig(
+            output_dir
+            / f"loss_{constraint}_{_domain_display(domain).lower()}.png",
+            dpi=180,
+        )
+        plt.close(loss_figure)
 
-def _pca_2d(features: np.ndarray) -> np.ndarray:
-    """Project feature rows to two comparable PCA coordinates."""
 
-    if features.ndim != 2 or features.shape[0] == 0:
-        return np.empty((0, 2), dtype=np.float32)
+def _posthoc_projection(features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return one joint 2-D PCA projection used only for plotting.
+
+    PCA is not part of Dual_D, TAL, training, inference, or any reported model
+    metric.  It is a post-hoc view of one trained run and is never fitted across
+    independent seeds or model variants.
+    """
+
     centered = features.astype(np.float32) - features.mean(axis=0, keepdims=True)
-    if centered.shape[1] == 1:
-        return np.concatenate([centered, np.zeros_like(centered)], axis=1)
-    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
     components = vh[:2]
-    if components.shape[0] == 1:
-        components = np.vstack([components, np.zeros_like(components)])
-    return centered @ components.T
+    coordinates = centered @ components.T
+    variances = singular_values ** 2
+    ratios = variances[:2] / max(float(variances.sum()), 1e-12)
+    return coordinates, ratios
 
 
-def _feature_snapshot(summaries: Sequence[Mapping[str, Any]], variant: str, domain: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    raw_parts, translated_parts, label_parts = [], [], []
-    for summary in summaries:
-        if summary.get("variant") != variant or summary.get("domain") != domain:
-            continue
-        path = Path(str(summary["run_dir"])) / "feature_embeddings.npz"
-        if not path.exists():
-            continue
-        with np.load(path) as data:
-            raw_parts.append(np.asarray(data["raw"], dtype=np.float32))
-            translated_parts.append(np.asarray(data["source_like"], dtype=np.float32))
-            label_parts.append(np.asarray(data["labels"], dtype=np.int64))
-    if not label_parts:
+def _l2_normalize(features: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(features, axis=1, keepdims=True)
+    return features / np.clip(norms, 1e-12, None)
+
+
+def _cosine_silhouette(features: np.ndarray, labels: np.ndarray) -> float | None:
+    """Compute a dependency-free cosine silhouette in the original space."""
+
+    if len(features) < 3 or len(np.unique(labels)) < 2:
         return None
-    raw = np.concatenate(raw_parts, axis=0)
-    translated = np.concatenate(translated_parts, axis=0)
-    labels = np.concatenate(label_parts, axis=0)
-    joint = np.concatenate([raw, translated], axis=0)
-    coordinates = _pca_2d(joint)
-    return coordinates[: len(raw)], coordinates[len(raw):], labels, joint
+    normalized = _l2_normalize(features.astype(np.float64))
+    distances = 1.0 - normalized @ normalized.T
+    values = []
+    for index, label in enumerate(labels):
+        same = labels == label
+        same[index] = False
+        if not np.any(same):
+            continue
+        intra = float(distances[index, same].mean())
+        inter = min(
+            float(distances[index, labels == other].mean())
+            for other in np.unique(labels)
+            if other != label
+        )
+        values.append((inter - intra) / max(intra, inter, 1e-12))
+    return float(np.mean(values)) if values else None
 
 
-def _plot_feature_diagnostics(summaries: Sequence[Mapping[str, Any]], output_dir: Path, plt) -> List[str]:
-    """Compare full vs leave-one-out feature geometry for every domain/constraint."""
+def _coral_distance(source: np.ndarray, target: np.ndarray) -> float | None:
+    if len(source) < 2 or len(target) < 2:
+        return None
+    source_cov = np.cov(source.astype(np.float64), rowvar=False)
+    target_cov = np.cov(target.astype(np.float64), rowvar=False)
+    dimension = max(source.shape[1], 1)
+    return float(np.square(source_cov - target_cov).sum() / (4.0 * dimension * dimension))
 
-    domains = _domain_order(summaries)
+
+def _class_centroid_distance(
+    source: np.ndarray,
+    source_labels: np.ndarray,
+    target: np.ndarray,
+    target_labels: np.ndarray,
+) -> float | None:
+    common = sorted(set(source_labels.tolist()) & set(target_labels.tolist()))
+    distances = []
+    for class_id in common:
+        source_centroid = source[source_labels == class_id].mean(axis=0, keepdims=True)
+        target_centroid = target[target_labels == class_id].mean(axis=0, keepdims=True)
+        source_centroid = _l2_normalize(source_centroid)[0]
+        target_centroid = _l2_normalize(target_centroid)[0]
+        distances.append(1.0 - float(source_centroid @ target_centroid))
+    return float(np.mean(distances)) if distances else None
+
+
+def _class_prototype_similarity(
+    source: np.ndarray,
+    source_labels: np.ndarray,
+    target: np.ndarray,
+    target_labels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return target-by-source class prototype cosine similarity.
+
+    This diagnostic is computed in the original feature space.  It therefore
+    exposes whether each translated target class is closest to the matching
+    source class without PCA, t-SNE, UMAP or any label-fitted projection.
+    """
+
+    common = np.asarray(
+        sorted(set(source_labels.tolist()) & set(target_labels.tolist())),
+        dtype=np.int64,
+    )
+    if common.size == 0:
+        return None
+    source_prototypes = np.stack(
+        [source[source_labels == class_id].mean(axis=0) for class_id in common]
+    )
+    target_prototypes = np.stack(
+        [target[target_labels == class_id].mean(axis=0) for class_id in common]
+    )
+    similarities = _l2_normalize(target_prototypes) @ _l2_normalize(
+        source_prototypes
+    ).T
+    return common, similarities
+
+
+def _prototype_similarity_statistics(
+    similarities: np.ndarray,
+) -> tuple[float, float | None, float]:
+    """Return diagonal similarity, diagonal margin and top-1 class retrieval."""
+
+    diagonal = np.diag(similarities)
+    diagonal_mean = float(diagonal.mean())
+    top1 = float(
+        np.mean(np.argmax(similarities, axis=1) == np.arange(similarities.shape[0]))
+    )
+    if similarities.shape[0] < 2:
+        return diagonal_mean, None, top1
+    off_diagonal = similarities.copy()
+    np.fill_diagonal(off_diagonal, float("-inf"))
+    margin = float(np.mean(diagonal - np.max(off_diagonal, axis=1)))
+    return diagonal_mean, margin, top1
+
+
+def _balanced_source_indices(
+    source_labels: np.ndarray,
+    target_labels: np.ndarray,
+) -> np.ndarray:
+    selected: List[int] = []
+    for class_id in sorted(set(source_labels.tolist()) & set(target_labels.tolist())):
+        source_indices = np.flatnonzero(source_labels == class_id)
+        target_count = int(np.sum(target_labels == class_id))
+        selected.extend(source_indices[: min(len(source_indices), target_count)].tolist())
+    return np.asarray(selected, dtype=np.int64)
+
+
+def _load_feature_run(summary: Mapping[str, Any]) -> Dict[str, np.ndarray] | None:
+    path = Path(str(summary["run_dir"])) / "feature_embeddings.npz"
+    if not path.exists():
+        return None
+    with np.load(path) as data:
+        required = {
+            "source_raw",
+            "source_labels",
+            "target_raw",
+            "target_source_like",
+            "target_labels",
+        }
+        if not required.issubset(data.files):
+            return None
+        return {key: np.asarray(data[key]) for key in required}
+
+
+def _feature_metric_row(
+    summary: Mapping[str, Any],
+    snapshot: Mapping[str, np.ndarray],
+) -> Dict[str, Any]:
+    source = np.asarray(snapshot["source_raw"], dtype=np.float32)
+    source_labels = np.asarray(snapshot["source_labels"], dtype=np.int64)
+    target_raw = np.asarray(snapshot["target_raw"], dtype=np.float32)
+    translated = np.asarray(snapshot["target_source_like"], dtype=np.float32)
+    target_labels = np.asarray(snapshot["target_labels"], dtype=np.int64)
+    source_indices = _balanced_source_indices(source_labels, target_labels)
+    source = source[source_indices]
+    source_labels = source_labels[source_indices]
+    raw_silhouette = _cosine_silhouette(target_raw, target_labels)
+    translated_silhouette = _cosine_silhouette(translated, target_labels)
+    raw_centroid_distance = _class_centroid_distance(
+        source, source_labels, target_raw, target_labels
+    )
+    translated_centroid_distance = _class_centroid_distance(
+        source, source_labels, translated, target_labels
+    )
+    raw_coral = _coral_distance(source, target_raw)
+    translated_coral = _coral_distance(source, translated)
+    raw_prototype_result = _class_prototype_similarity(
+        source, source_labels, target_raw, target_labels
+    )
+    translated_prototype_result = _class_prototype_similarity(
+        source, source_labels, translated, target_labels
+    )
+    raw_diagonal = raw_margin = raw_top1 = None
+    translated_diagonal = translated_margin = translated_top1 = None
+    if raw_prototype_result is not None:
+        raw_diagonal, raw_margin, raw_top1 = _prototype_similarity_statistics(
+            raw_prototype_result[1]
+        )
+    if translated_prototype_result is not None:
+        translated_diagonal, translated_margin, translated_top1 = (
+            _prototype_similarity_statistics(translated_prototype_result[1])
+        )
+    return {
+        "run": summary["run"],
+        "variant": summary["variant"],
+        "domain": summary["domain"],
+        "iteration": summary.get("iteration"),
+        "seed": summary.get("seed"),
+        "target_raw_silhouette": raw_silhouette,
+        "target_translated_silhouette": translated_silhouette,
+        "target_silhouette_gain": (
+            translated_silhouette - raw_silhouette
+            if translated_silhouette is not None and raw_silhouette is not None
+            else None
+        ),
+        "source_target_raw_class_centroid_distance": raw_centroid_distance,
+        "source_target_translated_class_centroid_distance": translated_centroid_distance,
+        "class_centroid_alignment_gain": (
+            raw_centroid_distance - translated_centroid_distance
+            if raw_centroid_distance is not None and translated_centroid_distance is not None
+            else None
+        ),
+        "source_target_raw_coral": raw_coral,
+        "source_target_translated_coral": translated_coral,
+        "coral_alignment_gain": (
+            raw_coral - translated_coral
+            if raw_coral is not None and translated_coral is not None
+            else None
+        ),
+        "source_target_raw_prototype_diagonal": raw_diagonal,
+        "source_target_translated_prototype_diagonal": translated_diagonal,
+        "prototype_diagonal_gain": (
+            translated_diagonal - raw_diagonal
+            if translated_diagonal is not None and raw_diagonal is not None
+            else None
+        ),
+        "source_target_raw_prototype_margin": raw_margin,
+        "source_target_translated_prototype_margin": translated_margin,
+        "prototype_margin_gain": (
+            translated_margin - raw_margin
+            if translated_margin is not None and raw_margin is not None
+            else None
+        ),
+        "source_target_raw_prototype_top1": raw_top1,
+        "source_target_translated_prototype_top1": translated_top1,
+        "prototype_top1_gain": (
+            translated_top1 - raw_top1
+            if translated_top1 is not None and raw_top1 is not None
+            else None
+        ),
+    }
+
+
+def _plot_feature_diagnostics(
+    summaries: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    plt,
+    plot_projection: bool = True,
+) -> tuple[List[str], List[Dict[str, Any]]]:
+    """Measure every run and optionally plot one shared post-hoc PCA view."""
+
+    feature_dir = output_dir / "feature_diagnostics"
+    feature_dir.mkdir(parents=True, exist_ok=True)
     generated: List[str] = []
-    for constraint in CONSTRAINTS:
-        ablated_variant = f"no_{constraint}"
-        for domain in domains:
-            full = _feature_snapshot(summaries, "full", domain)
-            ablated = _feature_snapshot(summaries, ablated_variant, domain)
-            if full is None or ablated is None:
-                continue
-            full_raw, full_translated, full_labels, _ = full
-            abl_raw, abl_translated, abl_labels, _ = ablated
-            # Refit PCA jointly so the two panels share a coordinate system.
-            raw_joint = np.concatenate([full_raw, abl_raw], axis=0)
-            translated_joint = np.concatenate([full_translated, abl_translated], axis=0)
-            raw_coords = _pca_2d(raw_joint)
-            translated_coords = _pca_2d(translated_joint)
-            figure, axes = plt.subplots(2, 2, figsize=(11, 8), squeeze=False)
-            panels = [
-                (axes[0, 0], raw_coords[: len(full_labels)], full_labels, "完整模块 C：原始投影"),
-                (axes[0, 1], translated_coords[: len(full_labels)], full_labels, "完整模块 C：source-like"),
-                (axes[1, 0], raw_coords[len(full_labels):], abl_labels, f"去除 {CONSTRAINTS[constraint]}：原始投影"),
-                (axes[1, 1], translated_coords[len(full_labels):], abl_labels, f"去除 {CONSTRAINTS[constraint]}：source-like"),
+    metric_rows: List[Dict[str, Any]] = []
+    for summary in summaries:
+        snapshot = _load_feature_run(summary)
+        if snapshot is None:
+            continue
+        metric_row = _feature_metric_row(summary, snapshot)
+        metric_rows.append(metric_row)
+        if not plot_projection:
+            continue
+        source = np.asarray(snapshot["source_raw"], dtype=np.float32)
+        source_labels = np.asarray(snapshot["source_labels"], dtype=np.int64)
+        target_raw = np.asarray(snapshot["target_raw"], dtype=np.float32)
+        translated = np.asarray(snapshot["target_source_like"], dtype=np.float32)
+        target_labels = np.asarray(snapshot["target_labels"], dtype=np.int64)
+        source_indices = _balanced_source_indices(source_labels, target_labels)
+        source = source[source_indices]
+        source_labels = source_labels[source_indices]
+        joint = np.concatenate([source, target_raw, translated], axis=0)
+        coordinates, ratios = _posthoc_projection(joint)
+        source_coords = coordinates[: len(source)]
+        raw_coords = coordinates[len(source) : len(source) + len(target_raw)]
+        translated_coords = coordinates[len(source) + len(target_raw) :]
+        figure, axes = plt.subplots(2, 2, figsize=(12, 9))
+        axes[0, 0].scatter(
+            source_coords[:, 0], source_coords[:, 1], s=28, alpha=0.65,
+            color="#2f6f9f", marker="o", label="Source raw"
+        )
+        axes[0, 0].scatter(
+            raw_coords[:, 0], raw_coords[:, 1], s=32, alpha=0.75,
+            color="#b85c38", marker="x", label="Target raw"
+        )
+        axes[0, 0].set_title("Domain geometry before translation")
+        axes[0, 1].scatter(
+            source_coords[:, 0], source_coords[:, 1], s=28, alpha=0.65,
+            color="#2f6f9f", marker="o", label="Source raw"
+        )
+        axes[0, 1].scatter(
+            translated_coords[:, 0], translated_coords[:, 1], s=32, alpha=0.75,
+            color="#2a9d8f", marker="x", label="Target source-like"
+        )
+        axes[0, 1].set_title("Domain geometry after translation")
+        cmap = plt.get_cmap("tab20")
+        class_ids = sorted(set(target_labels.tolist()))
+        for class_index, class_id in enumerate(class_ids):
+            mask = target_labels == class_id
+            color = cmap(class_index % 20)
+            for start, end in zip(raw_coords[mask], translated_coords[mask]):
+                axes[1, 0].annotate(
+                    "", xy=end, xytext=start,
+                    arrowprops={"arrowstyle": "->", "color": color, "alpha": 0.35, "lw": 0.8},
+                )
+            axes[1, 0].scatter(
+                raw_coords[mask, 0], raw_coords[mask, 1], s=20,
+                color=[color], alpha=0.55
+            )
+            axes[1, 0].scatter(
+                translated_coords[mask, 0], translated_coords[mask, 1], s=28,
+                color=[color], alpha=0.9
+            )
+            source_mask = source_labels == class_id
+            if np.any(source_mask):
+                axes[1, 1].scatter(
+                    source_coords[source_mask, 0], source_coords[source_mask, 1],
+                    s=30, facecolors="none", edgecolors=[color], marker="o"
+                )
+            axes[1, 1].scatter(
+                translated_coords[mask, 0], translated_coords[mask, 1],
+                s=32, color=[color], marker="x", label=f"Class {class_id}"
+            )
+        axes[1, 0].set_title("Target movement: raw to source-like")
+        axes[1, 1].set_title("Class alignment after translation")
+        for axis in axes.flat:
+            axis.set_xlabel(f"Post-hoc PC1 ({ratios[0] * 100:.1f}% variance)")
+            axis.set_ylabel(f"Post-hoc PC2 ({ratios[1] * 100:.1f}% variance)")
+            axis.grid(alpha=0.2)
+        axes[0, 0].legend(frameon=False)
+        axes[0, 1].legend(frameon=False)
+        handles, labels = axes[1, 1].get_legend_handles_labels()
+        if handles:
+            figure.legend(
+                handles, labels, loc="lower center",
+                ncol=min(7, len(labels)), frameon=False
+            )
+        silhouette_raw = metric_row["target_raw_silhouette"]
+        silhouette_translated = metric_row["target_translated_silhouette"]
+        domain = _domain_display(str(summary["domain"]))
+        figure.suptitle(
+            f"{_variant_display(str(summary['variant']))} | {domain} | "
+            f"iteration {int(summary.get('iteration') or 0):02d}\n"
+            "Post-hoc PCA for visualization only; not part of the model | "
+            f"target silhouette {silhouette_raw:.3f} -> {silhouette_translated:.3f}",
+            fontsize=13,
+        )
+        figure.tight_layout(rect=(0, 0.07, 1, 0.93))
+        filename = (
+            f"feature_alignment_{summary['variant']}_{domain.lower()}_"
+            f"iter{int(summary.get('iteration') or 0):02d}.png"
+        )
+        target_path = feature_dir / filename
+        figure.savefig(target_path, dpi=180)
+        plt.close(figure)
+        generated.append(str(target_path.relative_to(output_dir)))
+    return generated, metric_rows
+
+
+def _aggregate_feature_metrics(
+    rows: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    grouped: Dict[tuple[str, str], List[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(str(row["variant"]), str(row["domain"]))].append(row)
+    metric_keys = (
+        "target_raw_silhouette",
+        "target_translated_silhouette",
+        "target_silhouette_gain",
+        "source_target_raw_class_centroid_distance",
+        "source_target_translated_class_centroid_distance",
+        "class_centroid_alignment_gain",
+        "source_target_raw_coral",
+        "source_target_translated_coral",
+        "coral_alignment_gain",
+        "source_target_raw_prototype_diagonal",
+        "source_target_translated_prototype_diagonal",
+        "prototype_diagonal_gain",
+        "source_target_raw_prototype_margin",
+        "source_target_translated_prototype_margin",
+        "prototype_margin_gain",
+        "source_target_raw_prototype_top1",
+        "source_target_translated_prototype_top1",
+        "prototype_top1_gain",
+    )
+    output: List[Dict[str, Any]] = []
+    for (variant, domain), group in sorted(grouped.items()):
+        result: Dict[str, Any] = {
+            "variant": variant,
+            "domain": domain,
+            "runs": len(group),
+        }
+        for key in metric_keys:
+            values = [
+                float(row[key])
+                for row in group
+                if _to_float(row.get(key)) is not None
             ]
-            class_ids = sorted(set(full_labels.tolist()) | set(abl_labels.tolist()))
-            cmap = plt.get_cmap("tab20")
-            for axis, coordinates, labels, title in panels:
-                for index, class_id in enumerate(class_ids):
-                    mask = labels == class_id
-                    if np.any(mask):
-                        axis.scatter(coordinates[mask, 0], coordinates[mask, 1], s=24, alpha=0.78, color=cmap(index % 20), label=f"类 {class_id}")
-                axis.set_title(title, fontsize=10)
-                axis.set_xlabel("主成分 1")
-                axis.set_ylabel("主成分 2")
-                axis.grid(alpha=0.2)
-            handles, labels = axes[0, 1].get_legend_handles_labels()
-            if handles:
-                figure.legend(handles, labels, loc="lower center", ncol=min(7, len(labels)), frameon=False)
-            figure.suptitle(f"{domain}：模块 C 约束特征可视化", fontsize=14)
-            figure.tight_layout(rect=(0, 0.06, 1, 0.94))
-            filename = f"feature_{constraint}_{re.sub(r'[^0-9A-Za-z一-龥]+', '_', domain)}.png"
-            figure.savefig(output_dir / filename, dpi=180)
-            plt.close(figure)
-            generated.append(filename)
+            result[f"{key}_mean"] = mean(values) if values else None
+            result[f"{key}_std"] = stdev(values) if len(values) > 1 else 0.0 if values else None
+        output.append(result)
+    return output
+
+
+def _plot_prototype_alignment_by_domain(
+    summaries: Sequence[Mapping[str, Any]], output_dir: Path, plt
+) -> List[str]:
+    """Plot repetition-averaged prototype alignment without dimensionality reduction."""
+
+    grouped: Dict[
+        tuple[str, str, tuple[int, ...]], List[np.ndarray]
+    ] = defaultdict(list)
+    margins: Dict[tuple[str, str, tuple[int, ...]], List[float]] = defaultdict(list)
+    full_raw_grouped: Dict[tuple[str, tuple[int, ...]], List[np.ndarray]] = defaultdict(list)
+    full_raw_margins: Dict[tuple[str, tuple[int, ...]], List[float]] = defaultdict(list)
+    for summary in summaries:
+        snapshot = _load_feature_run(summary)
+        if snapshot is None:
+            continue
+        source = np.asarray(snapshot["source_raw"], dtype=np.float32)
+        source_labels = np.asarray(snapshot["source_labels"], dtype=np.int64)
+        target_labels = np.asarray(snapshot["target_labels"], dtype=np.int64)
+        result = _class_prototype_similarity(
+            source,
+            source_labels,
+            np.asarray(snapshot["target_source_like"], dtype=np.float32),
+            target_labels,
+        )
+        if result is None:
+            continue
+        class_ids, similarities = result
+        key = (
+            str(summary["variant"]),
+            str(summary["domain"]),
+            tuple(int(item) for item in class_ids),
+        )
+        grouped[key].append(similarities)
+        margin = _prototype_similarity_statistics(similarities)[1]
+        if margin is not None:
+            margins[key].append(margin)
+        if str(summary["variant"]) == "full":
+            raw_result = _class_prototype_similarity(
+                source,
+                source_labels,
+                np.asarray(snapshot["target_raw"], dtype=np.float32),
+                target_labels,
+            )
+            if raw_result is not None:
+                raw_class_ids, raw_similarities = raw_result
+                raw_key = (
+                    str(summary["domain"]),
+                    tuple(int(item) for item in raw_class_ids),
+                )
+                full_raw_grouped[raw_key].append(raw_similarities)
+                raw_margin = _prototype_similarity_statistics(raw_similarities)[1]
+                if raw_margin is not None:
+                    full_raw_margins[raw_key].append(raw_margin)
+
+    generated: List[str] = []
+    domains = sorted({key[1] for key in grouped})
+    for domain in domains:
+        selected = {}
+        for variant in VARIANTS:
+            candidates = [
+                key for key in grouped if key[0] == variant and key[1] == domain
+            ]
+            if candidates:
+                selected[variant] = max(candidates, key=lambda key: len(grouped[key]))
+        if not selected:
+            continue
+        variants = [variant for variant in VARIANTS if variant in selected]
+        panels = []
+        if "full" in selected:
+            full_classes = selected["full"][2]
+            raw_key = (domain, full_classes)
+            if raw_key in full_raw_grouped:
+                panels.append(
+                    (
+                        "Full: target raw (before)",
+                        full_raw_grouped[raw_key],
+                        full_raw_margins.get(raw_key, []),
+                        full_classes,
+                        "Target class prototype",
+                    )
+                )
+        for variant in variants:
+            key = selected[variant]
+            panels.append(
+                (
+                    _variant_display(variant),
+                    grouped[key],
+                    margins.get(key, []),
+                    key[2],
+                    "Translated target class prototype",
+                )
+            )
+        columns = min(4, len(panels))
+        rows = int(math.ceil(len(panels) / columns))
+        figure, axes = plt.subplots(
+            rows, columns, figsize=(4.3 * columns, 4.1 * rows), squeeze=False
+        )
+        used_axes = []
+        image = None
+        for axis, (title, matrices, margin_values, class_ids, y_label) in zip(
+            axes.flat, panels
+        ):
+            matrix = np.mean(np.stack(matrices), axis=0)
+            image = axis.imshow(
+                matrix, cmap="RdYlGn", vmin=-1.0, vmax=1.0, aspect="equal"
+            )
+            used_axes.append(axis)
+            axis.set_xticks(range(len(class_ids)), [str(item) for item in class_ids])
+            axis.set_yticks(range(len(class_ids)), [str(item) for item in class_ids])
+            axis.set_xlabel("Source class prototype")
+            axis.set_ylabel(y_label)
+            margin_mean = mean(margin_values) if margin_values else None
+            margin_std = stdev(margin_values) if len(margin_values) > 1 else 0.0
+            margin_text = (
+                f"margin {margin_mean:+.3f} +/- {margin_std:.3f}"
+                if margin_mean is not None
+                else "margin unavailable"
+            )
+            axis.set_title(
+                f"{title}\n{margin_text} | n={len(matrices)}",
+                fontsize=10,
+            )
+            if len(class_ids) <= 10:
+                for row_index in range(matrix.shape[0]):
+                    for column_index in range(matrix.shape[1]):
+                        axis.text(
+                            column_index,
+                            row_index,
+                            f"{matrix[row_index, column_index]:.2f}",
+                            ha="center",
+                            va="center",
+                            fontsize=7,
+                            color="black",
+                        )
+        for axis in list(axes.flat)[len(panels) :]:
+            axis.axis("off")
+        if image is not None:
+            figure.colorbar(
+                image,
+                ax=used_axes,
+                fraction=0.025,
+                pad=0.02,
+                label="Cosine similarity",
+            )
+        figure.suptitle(
+            f"{_domain_display(domain)}: class-prototype alignment in the original feature space\n"
+            "No PCA, t-SNE, UMAP or supervised projection",
+            fontsize=14,
+        )
+        figure.subplots_adjust(top=0.86, wspace=0.38, hspace=0.46)
+        filename = f"prototype_alignment_{_domain_display(domain).lower()}.png"
+        figure.savefig(output_dir / filename, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+        generated.append(filename)
     return generated
+
+
+def _plot_feature_metric_effects(
+    aggregates: Sequence[Mapping[str, Any]], output_dir: Path, plt
+) -> None:
+    domains = sorted({str(row["domain"]) for row in aggregates})
+    variants = [
+        variant
+        for variant in VARIANTS
+        if variant != "full" and any(row["variant"] == variant for row in aggregates)
+    ]
+    if not domains or not variants:
+        return
+    metric_specs = (
+        (
+            "target_translated_silhouette_mean",
+            "Full minus ablation: target class silhouette",
+            1.0,
+        ),
+        (
+            "source_target_translated_prototype_margin_mean",
+            "Full minus ablation: matching-prototype margin",
+            1.0,
+        ),
+        (
+            "source_target_translated_class_centroid_distance_mean",
+            "Ablation minus full: cross-domain class-centroid distance",
+            -1.0,
+        ),
+        (
+            "source_target_translated_coral_mean",
+            "Ablation minus full: CORAL distance",
+            -1.0,
+        ),
+    )
+    figure, axes = plt.subplots(
+        2, 2, figsize=(13, max(8.2, 0.95 * len(variants))), squeeze=False
+    )
+    for axis, (metric, title, full_sign) in zip(axes.flat, metric_specs):
+        values = []
+        for variant in variants:
+            row_values = []
+            for domain in domains:
+                full = next(
+                    (
+                        _to_float(row.get(metric))
+                        for row in aggregates
+                        if row["variant"] == "full" and row["domain"] == domain
+                    ),
+                    None,
+                )
+                ablated = next(
+                    (
+                        _to_float(row.get(metric))
+                        for row in aggregates
+                        if row["variant"] == variant and row["domain"] == domain
+                    ),
+                    None,
+                )
+                if full is None or ablated is None:
+                    row_values.append(float("nan"))
+                elif full_sign > 0:
+                    row_values.append(full - ablated)
+                else:
+                    row_values.append(ablated - full)
+            values.append(row_values)
+        finite = [abs(value) for row in values for value in row if not math.isnan(value)]
+        limit = max(max(finite, default=0.01), 1e-6)
+        image = axis.imshow(
+            values, cmap="RdYlGn", vmin=-limit, vmax=limit, aspect="auto"
+        )
+        axis.set_xticks(
+            range(len(domains)), [_domain_display(domain) for domain in domains],
+            rotation=20, ha="right"
+        )
+        axis.set_yticks(
+            range(len(variants)), [_variant_display(variant) for variant in variants]
+        )
+        axis.set_title(title, fontsize=10)
+        for row_index, row in enumerate(values):
+            for column_index, value in enumerate(row):
+                if not math.isnan(value):
+                    axis.text(
+                        column_index, row_index, f"{value:+.3f}",
+                        ha="center", va="center", fontsize=8
+                    )
+        figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+    figure.suptitle(
+        "Original high-dimensional feature effects (positive values favor Full Module C)",
+        fontsize=14,
+    )
+    figure.tight_layout()
+    figure.savefig(output_dir / "feature_metric_effects.png", dpi=180)
+    plt.close(figure)
 
 
 def _write_html_report(output_dir: Path, aggregates: Sequence[Mapping[str, Any]], constraints: Sequence[str]) -> None:
     rows = []
     for row in aggregates:
+        display_row = dict(row)
+        display_row["variant"] = _variant_display(str(row.get("variant", "")))
+        display_row["domain"] = _domain_display(str(row.get("domain", "")))
         rows.append(
             "<tr>"
             + "".join(
-                f"<td>{html.escape(str(row.get(key, '')))}</td>"
-                for key in ("variant", "domain", "runs", "best_val_f1_mean", "best_val_f1_std", "generalization_gap_mean")
+                f"<td>{html.escape(str(display_row.get(key, '')))}</td>"
+                for key in (
+                    "variant",
+                    "domain",
+                    "runs",
+                    "best_val_acc_mean",
+                    "best_val_precision_mean",
+                    "best_val_recall_mean",
+                    "best_val_f1_mean",
+                    "best_val_f1_ci95",
+                )
             )
             + "</tr>"
         )
-    image_stems = ["module_c_overview", "module_c_effect_heatmap"] + [f"constraint_{name}" for name in constraints]
-    image_stems.extend(path.stem for path in output_dir.glob("feature_*.png"))
+    image_stems = [
+        "module_c_overview",
+        "module_c_effect_heatmap",
+        "feature_metric_effects",
+    ] + [f"constraint_{name}" for name in constraints]
+    feature_images = sorted(output_dir.glob("prototype_alignment_*.png"))
+    feature_images += sorted((output_dir / "feature_diagnostics").glob("*.png"))
     image_tags_parts = []
     for stem in image_stems:
         image = next((candidate for candidate in (f"{stem}.png", f"{stem}.svg") if (output_dir / candidate).exists()), None)
         if image:
             image_tags_parts.append(f'<h2>{html.escape(stem)}</h2><img src="{html.escape(image)}" alt="{html.escape(stem)}">')
+    for image in feature_images:
+        relative = image.relative_to(output_dir).as_posix()
+        image_tags_parts.append(
+            f'<h2>{html.escape(image.stem)}</h2>'
+            f'<img src="{html.escape(relative)}" alt="{html.escape(image.stem)}">'
+        )
     image_tags = "\n".join(image_tags_parts)
     document = """<!doctype html><meta charset="utf-8"><title>Module C ablation report</title>
-<style>body{font-family:Arial,sans-serif;max-width:1200px;margin:2rem auto;padding:0 1rem;color:#17202a}img{max-width:100%;height:auto}table{border-collapse:collapse;width:100%;margin-bottom:2rem}th,td{border:1px solid #ccd;padding:.4rem;text-align:right}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}</style>
-<h1>Module C ablation report</h1><table><thead><tr><th>variant</th><th>domain</th><th>runs</th><th>best F1 mean</th><th>F1 std</th><th>generalization gap</th></tr></thead><tbody>""" + "".join(rows) + "</tbody></table>" + image_tags
+<style>body{max-width:1200px;margin:2rem auto;padding:0 1rem;color:#17202a}img{max-width:100%;height:auto}table{border-collapse:collapse;width:100%;margin-bottom:2rem}th,td{border:1px solid #ccd;padding:.4rem;text-align:right}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}</style>
+<h1>Module C ablation report</h1><table><thead><tr><th>variant</th><th>domain</th><th>runs</th><th>accuracy</th><th>macro precision</th><th>macro recall</th><th>macro F1</th><th>F1 95% CI</th></tr></thead><tbody>""" + "".join(rows) + "</tbody></table>" + image_tags
     (output_dir / "ablation_report.html").write_text(document, encoding="utf-8")
 
 
@@ -699,11 +1492,13 @@ def analyse(args: argparse.Namespace) -> Dict[str, Any]:
     output_dir = Path(args.analysis_output or args.runs_root)
     output_dir.mkdir(parents=True, exist_ok=True)
     summaries = discover_summaries(Path(args.runs_root), args.analysis_glob, args.monitor_metric)
+    validate_manifest(Path(args.runs_root), summaries)
     aggregates = aggregate_summaries(summaries)
     _write_csv(summaries, output_dir / "ablation_runs.csv")
     _write_csv(aggregates, output_dir / "ablation_summary.csv")
     payload = {
         "monitor_metric": args.monitor_metric,
+        "pca_feature_view": bool(args.pca_feature_view),
         "constraints": dict(CONSTRAINTS),
         "runs": summaries,
         "aggregate": aggregates,
@@ -725,7 +1520,24 @@ def analyse(args: argparse.Namespace) -> Dict[str, Any]:
     available_constraints = [name for name in CONSTRAINTS if any(row["variant"] == f"no_{name}" for row in summaries)]
     for constraint in available_constraints:
         _plot_constraint_diagnostic(summaries, constraint, output_dir, plt)
-    _plot_feature_diagnostics(summaries, output_dir, plt)
+    feature_images, feature_metrics = _plot_feature_diagnostics(
+        summaries,
+        output_dir,
+        plt,
+        plot_projection=bool(args.pca_feature_view),
+    )
+    feature_aggregate = _aggregate_feature_metrics(feature_metrics)
+    _write_csv(feature_metrics, output_dir / "feature_diagnostics_runs.csv")
+    _write_csv(feature_aggregate, output_dir / "feature_diagnostics_summary.csv")
+    _plot_feature_metric_effects(feature_aggregate, output_dir, plt)
+    prototype_alignment_images = _plot_prototype_alignment_by_domain(
+        summaries, output_dir, plt
+    )
+    payload["feature_images"] = feature_images
+    payload["prototype_alignment_images"] = prototype_alignment_images
+    payload["feature_metrics"] = feature_metrics
+    payload["feature_metric_aggregate"] = feature_aggregate
+    _json_dump(payload, output_dir / "ablation_summary.json")
     _write_html_report(output_dir, aggregates, available_constraints)
     return payload
 
@@ -746,12 +1558,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "runs" / "module_c_ablation"))
+    parser.add_argument(
+        "--experiment-id",
+        default="",
+        help="Optional clean subdirectory name; generated automatically with --run.",
+    )
     parser.add_argument("--runs-root", default=str(PROJECT_ROOT / "runs" / "module_c_ablation"))
     parser.add_argument("--analysis-output", default="")
     parser.add_argument("--analysis-glob", default="module_c_*")
     parser.add_argument("--monitor-metric", default="val_f1_macro_present")
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=VARIANTS)
     parser.add_argument("--feature-visualization-samples", type=int, default=512)
+    parser.add_argument(
+        "--pca-feature-view",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Write optional per-run post-hoc PCA scatter plots. Original-space "
+            "prototype and quantitative diagnostics are always produced."
+        ),
+    )
     return parser
 
 
@@ -759,11 +1585,11 @@ def main() -> None:
     args = build_parser().parse_args()
     variants = list(dict.fromkeys(args.variants))
     if args.run:
-        run_variants(args, variants)
-        args.runs_root = args.output_dir
+        experiment_dir = run_variants(args, variants)
+        args.runs_root = str(experiment_dir)
         args.analysis_glob = "module_c_*"
         if not args.analysis_output:
-            args.analysis_output = args.output_dir
+            args.analysis_output = str(experiment_dir)
     payload = analyse(args)
     print(f"Analysed {len(payload['runs'])} runs; wrote results to {args.analysis_output or args.runs_root}")
 

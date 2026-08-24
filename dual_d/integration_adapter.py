@@ -68,6 +68,7 @@ class DualDTrainingAdapter(nn.Module):
         target_labels: Optional[torch.Tensor] = None,
         num_classes: Optional[int] = None,
         adversarial_scale: float = 1.0,
+        module_c_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Return loss/logs for updating translators and optional base modules."""
 
@@ -80,6 +81,7 @@ class DualDTrainingAdapter(nn.Module):
             target_labels=target_labels,
             num_classes=num_classes,
             adversarial_scale=adversarial_scale,
+            module_c_scale=module_c_scale,
         )
 
     def discriminator_parameters(self):
