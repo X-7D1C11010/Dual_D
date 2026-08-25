@@ -995,6 +995,29 @@ def checkpoint_state(
     }
 
 
+def _artifact_path(run_dir: Path, filename: str, args) -> Path:
+    """Return an iteration-safe artifact path.
+
+    Grouped matrix runs share one directory, so every per-iteration artifact
+    receives a stable suffix while retaining the legacy names for standalone
+    runs.
+    """
+
+    suffix = str(getattr(args, "artifact_suffix", "") or "").strip()
+    path = Path(filename)
+    if suffix:
+        return run_dir / f"{path.stem}_{suffix}{path.suffix}"
+    return run_dir / path
+
+
+def _checkpoint_path(run_dir: Path, filename: str, args) -> Path:
+    """Return a checkpoint path that cannot be overwritten by another iteration."""
+
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    return _artifact_path(checkpoint_dir, filename, args)
+
+
 def run_training(args) -> Dict[str, object]:
     """Run a complete standalone Dual_D training experiment."""
 
@@ -1009,8 +1032,8 @@ def run_training(args) -> Dict[str, object]:
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    logger = setup_text_logger(run_dir / "train.log")
-    metrics_logger = CSVMetricLogger(run_dir / "metrics.csv")
+    logger = setup_text_logger(_artifact_path(run_dir, "train.log", args))
+    metrics_logger = CSVMetricLogger(_artifact_path(run_dir, "metrics.csv", args))
 
     logger.info("Starting Dual_D standalone training")
     logger.info(f"Run directory: {run_dir}")
@@ -1051,8 +1074,11 @@ def run_training(args) -> Dict[str, object]:
             "per_sample",
         )
     num_classes = len(label_map)
-    save_json({"args": vars(args), "label_map": label_map}, run_dir / "resolved_config.json")
-    save_json(label_map, run_dir / "label_map.json")
+    save_json(
+        {"args": vars(args), "label_map": label_map},
+        _artifact_path(run_dir, "resolved_config.json", args),
+    )
+    save_json(label_map, _artifact_path(run_dir, "label_map.json", args))
 
     logger.info(f"Source train samples: {len(source_train)}")
     logger.info(f"Target train samples: {len(target_train)}")
@@ -1064,7 +1090,7 @@ def run_training(args) -> Dict[str, object]:
         target_val,
         hash_contents=bool(getattr(args, "data_audit_hashes", False)),
     )
-    save_json(data_audit, run_dir / "data_audit.json")
+    save_json(data_audit, _artifact_path(run_dir, "data_audit.json", args))
     audit_errors = data_audit_errors(data_audit)
     logger.info(
         "Data audit: same_dir=%s | path_overlap(vis/ir/ais)=%d/%d/%d | "
@@ -1115,7 +1141,7 @@ def run_training(args) -> Dict[str, object]:
             "paired_training_classes": paired_common_classes,
             **class_summaries,
         },
-        run_dir / "class_distribution.json",
+        _artifact_path(run_dir, "class_distribution.json", args),
     )
     logger.info(
         "Paired training classes: %d/%d | class ids [%s]",
@@ -1340,7 +1366,7 @@ def run_training(args) -> Dict[str, object]:
                 {"train": train_metrics, "val": val_metrics},
                 label_map,
             )
-            save_checkpoint(last_state, run_dir / "checkpoints" / "last_model.pt")
+            save_checkpoint(last_state, _checkpoint_path(run_dir, "last_model.pt", args))
 
         current_acc = float(val_metrics["accuracy"])
         current_f1 = float(val_metrics["f1_macro_present"])
@@ -1348,12 +1374,18 @@ def run_training(args) -> Dict[str, object]:
             best_acc = current_acc
             best_acc_epoch = epoch
             if save_checkpoints and last_state is not None:
-                save_checkpoint(last_state, run_dir / "checkpoints" / "best_acc_model.pt")
+                save_checkpoint(
+                    last_state,
+                    _checkpoint_path(run_dir, "best_acc_model.pt", args),
+                )
         if current_f1 > best_f1:
             best_f1 = current_f1
             best_f1_epoch = epoch
             if save_checkpoints and last_state is not None:
-                save_checkpoint(last_state, run_dir / "checkpoints" / "best_f1_model.pt")
+                save_checkpoint(
+                    last_state,
+                    _checkpoint_path(run_dir, "best_f1_model.pt", args),
+                )
         min_delta = float(getattr(args, "early_stopping_min_delta", 0.0))
         improved = (
             monitor_value < best_score - min_delta
@@ -1373,15 +1405,15 @@ def run_training(args) -> Dict[str, object]:
                 "epoch": epoch,
             }
             if save_checkpoints and last_state is not None:
-                save_checkpoint(last_state, run_dir / "checkpoints" / "best_model.pt")
-            save_json(best_metrics, run_dir / "best_metrics.json")
+                save_checkpoint(last_state, _checkpoint_path(run_dir, "best_model.pt", args))
+            save_json(best_metrics, _artifact_path(run_dir, "best_metrics.json", args))
             if bool(getattr(args, "save_feature_embeddings", False)):
                 save_feature_embeddings(
                     models=models,
                     source_dataloader=source_eval_loader,
                     target_dataloader=val_loader,
                     device=device,
-                    output_path=run_dir / "feature_embeddings.npz",
+                    output_path=_artifact_path(run_dir, "feature_embeddings.npz", args),
                     max_samples=getattr(args, "feature_visualization_samples", 512),
                 )
             logger.info(
@@ -1423,7 +1455,9 @@ def run_training(args) -> Dict[str, object]:
         "early_stopped": early_stopped,
         "total_seconds": time.time() - start_time,
     }
-    save_json(summary, run_dir / "result_summary.json")
+    result_path = _artifact_path(run_dir, "result_summary.json", args)
+    summary["result_path"] = str(result_path)
+    save_json(summary, result_path)
     logger.info(
         "Training complete. Best validation accuracy: %.4f | best %s: %.4f",
         best_acc,

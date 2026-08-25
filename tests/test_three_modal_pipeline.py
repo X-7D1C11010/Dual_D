@@ -415,6 +415,62 @@ class ThreeModalPipelineTests(unittest.TestCase):
             self.assertNotIn("U_matrices.2", checkpoint["tal"])
             self.assertEqual(checkpoint["classifier"]["fc.0.weight"].shape[1], 4)
 
+    def test_grouped_iterations_share_one_artifact_directory(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "晴天"
+            target_root = root / "雨天"
+            _write_vis_ir_domain(source_root, ["train"], 20)
+            _write_vis_ir_domain(target_root, ["train", "val"], 120)
+            args = build_parser({}).parse_args(
+                [
+                    "--source-root",
+                    str(source_root),
+                    "--target-root",
+                    str(target_root),
+                    "--output-dir",
+                    str(root / "runs"),
+                    "--run-name",
+                    "grouped",
+                    "--no-use-ais",
+                    "--iterations",
+                    "2",
+                    "--epochs",
+                    "1",
+                    "--batch-size",
+                    "2",
+                    "--num-workers",
+                    "0",
+                    "--device",
+                    "cpu",
+                    "--image-size",
+                    "32",
+                    "--resize-size",
+                    "36",
+                    "--feature-dim",
+                    "8",
+                    "--proj-dim",
+                    "2",
+                    "--no-pretrained-visual",
+                    "--no-freeze-visual-backbone",
+                    "--no-data-audit-hashes",
+                    "--early-stopping-patience",
+                    "0",
+                    "--group-iterations",
+                    "--no-save-checkpoints",
+                ]
+            )
+            batch_summary = run_experiment_matrix(args)
+            self.assertEqual(len(batch_summary["runs"]), 2)
+            run_dirs = {Path(row["run_dir"]) for row in batch_summary["runs"]}
+            self.assertEqual(len(run_dirs), 1)
+            run_dir = next(iter(run_dirs))
+            self.assertTrue((run_dir / "metrics_iter01.csv").is_file())
+            self.assertTrue((run_dir / "metrics_iter02.csv").is_file())
+            self.assertTrue((run_dir / "result_summary_iter01.json").is_file())
+            self.assertTrue((run_dir / "result_summary_iter02.json").is_file())
+            self.assertFalse((run_dir / "metrics.csv").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

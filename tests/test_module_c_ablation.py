@@ -141,6 +141,47 @@ class ModuleCAblationTests(unittest.TestCase):
             self.assertEqual(prototype_images, ["prototype_alignment_rain.png"])
             self.assertTrue((root / prototype_images[0]).exists())
 
+    def test_grouped_iteration_artifacts_are_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir = root / "module_c_full_雨天_20260825"
+            run_dir.mkdir()
+            for iteration, value in ((1, 0.80), (2, 0.90)):
+                suffix = f"iter{iteration:02d}"
+                (run_dir / f"resolved_config_{suffix}.json").write_text(
+                    json.dumps({"args": {"seed": 41 + iteration}}), encoding="utf-8"
+                )
+                with (run_dir / f"metrics_{suffix}.csv").open(
+                    "w", encoding="utf-8", newline=""
+                ) as handle:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=[
+                            "epoch",
+                            "val_acc",
+                            "val_precision_macro_present",
+                            "val_recall_macro_present",
+                            "val_f1_macro_present",
+                            "train_full_acc",
+                        ],
+                    )
+                    writer.writeheader()
+                    writer.writerow(
+                        {
+                            "epoch": 1,
+                            "val_acc": value,
+                            "val_precision_macro_present": value,
+                            "val_recall_macro_present": value,
+                            "val_f1_macro_present": value,
+                            "train_full_acc": value + 0.02,
+                        }
+                    )
+            summaries = discover_summaries(root, "module_c_*", "val_f1_macro_present")
+            self.assertEqual(len(summaries), 2)
+            self.assertEqual(sorted(row["iteration"] for row in summaries), [1, 2])
+            self.assertTrue(all(row["domain"] == "雨天" for row in summaries))
+            self.assertTrue(all("metrics_iter" in row["metrics_path"] for row in summaries))
+
 
 if __name__ == "__main__":
     unittest.main()

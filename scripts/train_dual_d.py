@@ -13,7 +13,7 @@ Command examples:
             --source-root /home/lixiang/lx/Data/晴天 \\
             --target-root /home/lixiang/lx/Data/雨天 \\
             --output-dir runs \\
-            --epochs 100 \\
+            --epochs 60 \\
             --batch-size 32
 
     Windows:
@@ -51,6 +51,35 @@ from dual_d.training.checkpointing import save_json  # noqa: E402
 from dual_d.data.ais_signal import resolve_reference_ais_file  # noqa: E402
 
 
+# These are the training knobs that may vary by target weather.  Keeping the
+# allow-list narrow prevents a profile from silently changing data paths,
+# model structure, or evaluation semantics.
+WEATHER_PROFILE_KEYS = frozenset(
+    {
+        "batch_size",
+        "num_workers",
+        "min_steps_per_epoch",
+        "augmentation_strength",
+        "label_smoothing",
+        "classifier_dropout",
+        "target_classification_weight",
+        "lr_main",
+        "lr_visual",
+        "lr_discriminator",
+        "weight_decay",
+        "lr_patience",
+        "discriminator_update_interval",
+        "adversarial_warmup_epochs",
+        "adversarial_ramp_epochs",
+        "module_c_warmup_epochs",
+        "module_c_ramp_epochs",
+        "early_stopping_patience",
+        "early_stopping_min_epochs",
+        "early_stopping_min_delta",
+    }
+)
+
+
 def load_json_defaults(path: str | Path | None) -> Dict[str, Any]:
     """Load JSON defaults if a config path is provided."""
 
@@ -61,6 +90,113 @@ def load_json_defaults(path: str | Path | None) -> Dict[str, Any]:
         raise FileNotFoundError(f"Config file does not exist: {config_path}")
     with config_path.open("r", encoding="utf-8") as file_obj:
         return json.load(file_obj)
+
+
+def load_weather_profiles(path: str | Path | None) -> Dict[str, Dict[str, Any]]:
+    """Load and validate optional per-weather training overrides.
+
+    The file may either contain a top-level ``profiles`` mapping plus an
+    optional ``default`` mapping, or map weather names directly to mappings.
+    Values are applied to a per-run argument copy in ``run_experiment_matrix``.
+    """
+
+    if not path:
+        return {"default": {}, "profiles": {}}
+    profile_path = Path(path)
+    if not profile_path.exists():
+        raise FileNotFoundError(f"Weather profile config does not exist: {profile_path}")
+    with profile_path.open("r", encoding="utf-8") as file_obj:
+        payload = json.load(file_obj)
+    if not isinstance(payload, dict):
+        raise ValueError("Weather profile config must be a JSON object.")
+    if "profiles" in payload:
+        profiles = payload.get("profiles")
+        default = payload.get("default", {})
+    else:
+        default = payload.get("default", {})
+        profiles = {key: value for key, value in payload.items() if key != "default"}
+    if not isinstance(default, dict) or not isinstance(profiles, dict):
+        raise ValueError("Weather profile 'default' and 'profiles' must be objects.")
+
+    def validate(name: str, values: Any) -> Dict[str, Any]:
+        if not isinstance(values, dict):
+            raise ValueError(f"Weather profile '{name}' must be an object.")
+        unknown = sorted(set(values) - WEATHER_PROFILE_KEYS)
+        if unknown:
+            raise ValueError(
+                f"Weather profile '{name}' contains unsupported keys: {', '.join(unknown)}"
+            )
+        return dict(values)
+
+    validated = {"default": validate("default", default), "profiles": {}}
+    for name, values in profiles.items():
+        validated["profiles"][str(name)] = validate(str(name), values)
+    return validated
+
+
+def apply_weather_profile(
+    args: argparse.Namespace,
+    domain: str,
+    profiles: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Apply one weather profile to a run-local argument namespace."""
+
+    overrides = dict(profiles.get("default", {}))
+    overrides.update(profiles.get("profiles", {}).get(str(domain), {}))
+    positive_ints = {
+        "batch_size",
+        "num_workers",
+        "min_steps_per_epoch",
+        "lr_patience",
+        "discriminator_update_interval",
+    }
+    nonnegative_ints = {
+        "adversarial_warmup_epochs",
+        "adversarial_ramp_epochs",
+        "module_c_warmup_epochs",
+        "module_c_ramp_epochs",
+        "early_stopping_patience",
+        "early_stopping_min_epochs",
+    }
+    bounded_floats = {
+        "augmentation_strength",
+        "label_smoothing",
+        "classifier_dropout",
+    }
+    nonnegative_floats = {
+        "target_classification_weight",
+        "lr_main",
+        "lr_visual",
+        "lr_discriminator",
+        "weight_decay",
+        "early_stopping_min_delta",
+    }
+    for key in positive_ints:
+        if key in overrides and (
+            not isinstance(overrides[key], int) or overrides[key] <= 0
+        ):
+            raise ValueError(f"Weather profile value '{key}' must be a positive integer.")
+    for key in nonnegative_ints:
+        if key in overrides and (
+            not isinstance(overrides[key], int) or overrides[key] < 0
+        ):
+            raise ValueError(f"Weather profile value '{key}' must be a non-negative integer.")
+    for key in bounded_floats:
+        if key in overrides and (
+            not isinstance(overrides[key], (int, float))
+            or not 0.0 <= overrides[key] < 1.0
+        ):
+            raise ValueError(f"Weather profile value '{key}' must be in [0, 1).")
+    for key in nonnegative_floats:
+        if key in overrides and (
+            not isinstance(overrides[key], (int, float)) or overrides[key] < 0.0
+        ):
+            raise ValueError(f"Weather profile value '{key}' must be non-negative.")
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    args.weather_profile_name = str(domain) if overrides else "default"
+    args.weather_profile_overrides = dict(overrides)
+    return overrides
 
 
 def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
@@ -74,6 +210,14 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", default=None, help="Optional JSON config file.")
+    parser.add_argument(
+        "--weather-profile-config",
+        default=default("weather_profile_config", ""),
+        help=(
+            "Optional JSON file with per-weather training overrides. Profiles are "
+            "applied to each resolved target-domain run."
+        ),
+    )
     parser.add_argument(
         "--dual-config",
         default=default(
@@ -101,6 +245,15 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         type=int,
         default=default("iterations", 3),
         help="Independent training repetitions per target domain.",
+    )
+    parser.add_argument(
+        "--group-iterations",
+        action=argparse.BooleanOptionalAction,
+        default=default("group_iterations", False),
+        help=(
+            "Store repetitions for the same variant/weather in one directory, "
+            "suffixing each artifact with its iteration number."
+        ),
     )
     parser.add_argument("--output-dir", default=default("output_dir", str(PROJECT_ROOT / "runs")))
     parser.add_argument("--run-name", default=default("run_name", ""))
@@ -183,7 +336,7 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         help="Apply per-sample I/Q standardization.",
     )
 
-    parser.add_argument("--epochs", type=int, default=default("epochs", 100))
+    parser.add_argument("--epochs", type=int, default=default("epochs", 60))
     parser.add_argument("--batch-size", type=int, default=default("batch_size", 32))
     parser.add_argument("--num-workers", type=int, default=default("num_workers", 4))
     parser.add_argument("--device", default=default("device", "auto"))
@@ -457,6 +610,9 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
     """Run every target domain for the requested number of independent trials."""
 
     experiments = resolve_experiments(args)
+    weather_profiles = load_weather_profiles(
+        getattr(args, "weather_profile_config", "")
+    )
     if not Path(args.source_root).exists():
         raise FileNotFoundError(f"Source domain does not exist: {args.source_root}")
     if args.use_ais and args.source_ais_root and not Path(args.source_ais_root).exists():
@@ -508,12 +664,18 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
             run_args.seed = int(args.seed) + run_index - 1
             run_args.target_domain_name = domain
             run_args.iteration_index = iteration
+            profile_overrides = apply_weather_profile(run_args, domain, weather_profiles)
             if total_runs > 1:
                 prefix = args.run_name.strip() or "dual_d"
                 safe_domain = Path(domain).name
-                run_args.run_name = (
-                    f"{prefix}_{safe_domain}_iter{iteration:02d}_{batch_timestamp}"
-                )
+                if bool(getattr(args, "group_iterations", False)):
+                    run_args.run_name = f"{prefix}_{safe_domain}_{batch_timestamp}"
+                    run_args.artifact_suffix = f"iter{iteration:02d}"
+                else:
+                    run_args.run_name = (
+                        f"{prefix}_{safe_domain}_iter{iteration:02d}_{batch_timestamp}"
+                    )
+                    run_args.artifact_suffix = ""
 
             print(
                 f"Starting run {run_index}/{total_runs}: "
@@ -527,6 +689,8 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
                 "target_ais_root": target_ais_root,
                 "iteration": iteration,
                 "seed": run_args.seed,
+                "weather_profile": getattr(run_args, "weather_profile_name", "default"),
+                "weather_profile_overrides": profile_overrides,
             }
             summaries.append(summary)
 
@@ -550,6 +714,8 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
         "iterations": int(args.iterations),
         "target_domains": [domain for domain, _, _ in experiments],
         "total_runs": total_runs,
+        "group_iterations": bool(getattr(args, "group_iterations", False)),
+        "weather_profile_config": getattr(args, "weather_profile_config", ""),
         "domain_statistics": domain_statistics,
         "runs": summaries,
     }

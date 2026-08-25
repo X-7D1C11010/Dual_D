@@ -17,7 +17,8 @@ Launch all variants for all four target domains::
 
     python scripts/ablate_module_c.py --run \
         --source-root /data/clear --target-parent-root /data \
-        --target-domains 黑天 逆光 雾天 雨天 --iterations 3
+        --target-domains 黑天 逆光 雾天 雨天 --iterations 3 \
+        --epochs 60 --group-iterations
 """
 
 from __future__ import annotations
@@ -163,9 +164,12 @@ def run_variants(args: argparse.Namespace, variants: Sequence[str]) -> Path:
             "variants": list(variants),
             "domains": domains,
             "iterations": int(args.iterations),
+            "epochs": int(args.epochs),
+            "group_iterations": bool(args.group_iterations),
             "expected_runs": len(variants) * len(domains) * int(args.iterations),
             "monitor_metric": args.monitor_metric,
             "pca_feature_view": bool(args.pca_feature_view),
+            "weather_profile_config": args.weather_profile_config,
         },
         output_dir / "experiment_manifest.json",
     )
@@ -186,6 +190,9 @@ def run_variants(args: argparse.Namespace, variants: Sequence[str]) -> Path:
             f"module_c_{variant}",
             "--iterations",
             str(args.iterations),
+            "--epochs",
+            str(args.epochs),
+            "--group-iterations" if args.group_iterations else "--no-group-iterations",
             "--no-save-checkpoints",
             "--save-feature-embeddings",
             "--feature-visualization-samples",
@@ -193,6 +200,7 @@ def run_variants(args: argparse.Namespace, variants: Sequence[str]) -> Path:
             "--monitor-metric",
             str(args.monitor_metric),
             "--no-use-ais",
+            "--no-multi-gpu",
             "--deterministic-training",
         ]
         if args.target_root:
@@ -200,7 +208,7 @@ def run_variants(args: argparse.Namespace, variants: Sequence[str]) -> Path:
         else:
             command.extend(["--target-parent-root", str(args.target_parent_root)])
             command.extend(["--target-domains", *[str(item) for item in args.target_domains]])
-        _append_option(command, "--epochs", args.epochs)
+        _append_option(command, "--weather-profile-config", args.weather_profile_config)
         _append_option(command, "--batch-size", args.batch_size)
         _append_option(command, "--num-workers", args.num_workers)
         _append_option(command, "--device", args.device)
@@ -253,17 +261,20 @@ def _infer_domain(run_dir: Path) -> str:
         except (OSError, json.JSONDecodeError):
             pass
     name = run_dir.name
+    for domain in DOMAIN_DISPLAY:
+        if f"_{domain}_" in name or name.endswith(f"_{domain}"):
+            return domain
     match = re.search(r"_(?P<domain>[^_]+)_iter\d+", name)
     return match.group("domain") if match else "all"
 
 
-def _infer_iteration(run_dir: Path) -> int | None:
-    match = re.search(r"_iter(?P<iteration>\d+)", run_dir.name)
+def _infer_iteration(run_dir: Path, artifact_name: str = "") -> int | None:
+    match = re.search(r"_iter(?P<iteration>\d+)", f"{run_dir.name}_{artifact_name}")
     return int(match.group("iteration")) if match else None
 
 
-def _resolved_seed(run_dir: Path) -> int | None:
-    path = run_dir / "resolved_config.json"
+def _resolved_seed(run_dir: Path, config_path: Path | None = None) -> int | None:
+    path = config_path or run_dir / "resolved_config.json"
     if not path.exists():
         return None
     try:
@@ -284,8 +295,12 @@ def _best_row(rows: Sequence[Mapping[str, Any]], metric: str) -> Mapping[str, An
     return max(candidates, key=lambda row: float(row.get(metric, float("-inf"))))
 
 
-def _summarize_run(run_dir: Path, monitor_metric: str) -> Dict[str, Any] | None:
-    metrics_path = run_dir / "metrics.csv"
+def _summarize_run(
+    run_dir: Path,
+    monitor_metric: str,
+    metrics_path: Path | None = None,
+) -> Dict[str, Any] | None:
+    metrics_path = metrics_path or run_dir / "metrics.csv"
     if not metrics_path.exists():
         return None
     rows = _read_rows(metrics_path)
@@ -299,11 +314,17 @@ def _summarize_run(run_dir: Path, monitor_metric: str) -> Dict[str, Any] | None:
     train_full = _to_float(best.get("train_full_acc"))
     summary: Dict[str, Any] = {
         "run_dir": str(run_dir),
-        "run": run_dir.name,
+        "run": f"{run_dir.name}/{metrics_path.stem}",
         "variant": _infer_variant(run_dir),
         "domain": _infer_domain(run_dir),
-        "iteration": _infer_iteration(run_dir),
-        "seed": _resolved_seed(run_dir),
+        "iteration": _infer_iteration(run_dir, metrics_path.name),
+        "seed": _resolved_seed(
+            run_dir,
+            run_dir / f"resolved_config_{metrics_path.stem.removeprefix('metrics_')}.json"
+            if metrics_path.stem.startswith("metrics_")
+            else None,
+        ),
+        "metrics_path": str(metrics_path),
         "epochs": len(rows),
         "best_epoch": _to_float(best.get("epoch")),
         "best_val_acc": val_acc,
@@ -314,7 +335,31 @@ def _summarize_run(run_dir: Path, monitor_metric: str) -> Dict[str, Any] | None:
         "generalization_gap": (
             train_full - val_acc if train_full is not None and val_acc is not None else None
         ),
-        "feature_embeddings": str(run_dir / "feature_embeddings.npz") if (run_dir / "feature_embeddings.npz").exists() else None,
+        "feature_embeddings": str(
+            run_dir
+            / (
+                f"feature_embeddings_{metrics_path.stem.removeprefix('metrics_')}.npz"
+                if metrics_path.stem.startswith("metrics_")
+                else "feature_embeddings.npz"
+            )
+        )
+        if (
+            run_dir
+            / (
+                f"feature_embeddings_{metrics_path.stem.removeprefix('metrics_')}.npz"
+                if metrics_path.stem.startswith("metrics_")
+                else "feature_embeddings.npz"
+            )
+        ).exists()
+        else None,
+        "result_path": str(
+            run_dir
+            / (
+                f"result_summary_{metrics_path.stem.removeprefix('metrics_')}.json"
+                if metrics_path.stem.startswith("metrics_")
+                else "result_summary.json"
+            )
+        ),
     }
     for metric in set(LOSS_METRIC.values()) | {
         "train_dual_d_adv_primary",
@@ -331,9 +376,11 @@ def discover_summaries(runs_root: Path, pattern: str, monitor_metric: str) -> Li
     run_dirs = sorted(path for path in runs_root.glob(pattern) if path.is_dir())
     summaries: List[Dict[str, Any]] = []
     for run_dir in run_dirs:
-        summary = _summarize_run(run_dir, monitor_metric)
-        if summary is not None:
-            summaries.append(summary)
+        metric_paths = sorted(run_dir.glob("metrics*.csv"))
+        for metrics_path in metric_paths:
+            summary = _summarize_run(run_dir, monitor_metric, metrics_path)
+            if summary is not None:
+                summaries.append(summary)
     if not summaries:
         raise FileNotFoundError(f"No readable metrics.csv found under {runs_root} with pattern {pattern!r}")
     keys: Dict[tuple[str, str, int | None], str] = {}
@@ -404,7 +451,7 @@ def validate_manifest(
         str(row["run_dir"])
         for row in summaries
         if not row.get("feature_embeddings")
-        or not (Path(str(row["run_dir"])) / "result_summary.json").exists()
+        or not Path(str(row.get("result_path", ""))).exists()
     ]
     if missing or unexpected or incomplete:
         raise RuntimeError(
@@ -620,7 +667,14 @@ def _read_curve_rows(
             continue
         if domain is not None and summary.get("domain") != domain:
             continue
-        path = Path(str(summary["run_dir"])) / "metrics.csv"
+        path = Path(
+            str(
+                summary.get(
+                    "metrics_path",
+                    Path(str(summary["run_dir"])) / "metrics.csv",
+                )
+            )
+        )
         if not path.exists():
             continue
         for row in _read_rows(path):
@@ -923,7 +977,12 @@ def _balanced_source_indices(
 
 
 def _load_feature_run(summary: Mapping[str, Any]) -> Dict[str, np.ndarray] | None:
-    path = Path(str(summary["run_dir"])) / "feature_embeddings.npz"
+    feature_path = summary.get("feature_embeddings")
+    path = (
+        Path(str(feature_path))
+        if feature_path
+        else Path(str(summary["run_dir"])) / "feature_embeddings.npz"
+    )
     if not path.exists():
         return None
     with np.load(path) as data:
@@ -1546,15 +1605,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run and analyse Module C leave-one-constraint-out experiments.")
     parser.add_argument("--run", action="store_true", help="Launch training variants before analysis.")
     parser.add_argument("--base-train-config", default=str(DEFAULT_TRAIN_CONFIG))
+    parser.add_argument(
+        "--weather-profile-config",
+        default="",
+        help=(
+            "Optional per-weather override JSON. When omitted, the value from "
+            "--base-train-config is used."
+        ),
+    )
     parser.add_argument("--base-dual-config", default=str(DEFAULT_DUAL_CONFIG))
     parser.add_argument("--source-root", default="")
     parser.add_argument("--target-root", default="")
     parser.add_argument("--target-parent-root", default="")
     parser.add_argument("--target-domains", nargs="+", default=["黑天", "逆光", "雾天", "雨天"])
     parser.add_argument("--iterations", type=int, default=3)
-    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument(
+        "--group-iterations",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep all repetitions for one variant/weather in a shared folder.",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "runs" / "module_c_ablation"))
