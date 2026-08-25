@@ -1,0 +1,71 @@
+2026-08-24 20:32:02 | Starting Dual_D standalone training
+2026-08-24 20:32:02 | Run directory: runs/module_c_ablation/module_c_20260824_171004/module_c_full_黑天_iter03_20260824_171005
+2026-08-24 20:32:02 | Device: cuda
+2026-08-24 20:32:02 | Source train samples: 992
+2026-08-24 20:32:02 | Target train samples: 465
+2026-08-24 20:32:02 | Target val samples: 120
+2026-08-24 20:32:02 | Classes: 14
+2026-08-24 20:32:02 | Data audit: same_dir=False | path_overlap(vis/ir/ais)=0/0/0 | content_overlap(vis/ir/ais)=0/0/0 | ais_index_overlap=0 | stem_mismatch(vis-ir/vis-ais)=578/0
+2026-08-24 20:32:02 | source_train classes: present 14/14 | absent 0 | counts [0:120, 1:44, 2:69, 3:45, 4:40, 5:30, 6:64, 7:80, 8:116, 9:68, 10:57, 11:83, 12:48, 13:128]
+2026-08-24 20:32:02 | target_train classes: present 8/14 | absent 6 | counts [0:100, 2:11, 3:16, 6:89, 9:162, 10:12, 11:44, 13:31]
+2026-08-24 20:32:02 | target_val classes: present 8/14 | absent 6 | counts [0:26, 2:3, 3:5, 6:23, 9:41, 10:3, 11:11, 13:8]
+2026-08-24 20:32:02 | Paired training classes: 8/14 | class ids [0, 2, 3, 6, 9, 10, 11, 13]
+2026-08-24 20:32:02 | VIS/IR pairing: class-level-unpaired | count-mismatch classes train/val: 10/0 | AIS alignment: none | AIS rows train/val: 0/0
+2026-08-24 20:32:03 | Model parameters: total=17277714 | trainable=17120210
+2026-08-24 20:33:48 | Epoch 001/100 | loss 5.2435 | cls 5.1527 | tal 0.3027 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.0918 | train_full 0.1161 | val_acc 0.1750 | val_f1 0.0951 | grad(main/disc) 15.835/0.000 | lr(main/disc) 7.00e-05/3.50e-05 | 105.2s
+2026-08-24 20:33:51 | New best val_f1_macro_present: 0.0951 at epoch 1
+2026-08-24 20:35:37 | Epoch 002/100 | loss 4.2050 | cls 4.1558 | tal 0.1638 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.2266 | train_full 0.1032 | val_acc 0.1417 | val_f1 0.0820 | grad(main/disc) 12.244/0.000 | lr(main/disc) 7.00e-05/3.50e-05 | 105.7s
+2026-08-24 20:37:24 | Epoch 003/100 | loss 3.6191 | cls 3.6078 | tal 0.0379 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.2773 | train_full 0.1806 | val_acc 0.2167 | val_f1 0.1533 | grad(main/disc) 10.978/0.000 | lr(main/disc) 7.00e-05/3.50e-05 | 107.0s
+2026-08-24 20:37:27 | New best val_f1_macro_present: 0.1533 at epoch 3
+2026-08-24 20:39:14 | Epoch 004/100 | loss 3.2338 | cls 3.2373 | tal -0.0117 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.3535 | train_full 0.3505 | val_acc 0.3833 | val_f1 0.4555 | grad(main/disc) 10.540/0.000 | lr(main/disc) 7.00e-05/3.50e-05 | 106.4s
+2026-08-24 20:39:17 | New best val_f1_macro_present: 0.4555 at epoch 4
+2026-08-24 20:41:01 | Epoch 005/100 | loss 2.9442 | cls 2.9645 | tal -0.0676 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.4844 | train_full 0.4000 | val_acc 0.4583 | val_f1 0.5206 | grad(main/disc) 9.969/0.000 | lr(main/disc) 7.00e-05/3.50e-05 | 103.9s
+2026-08-24 20:41:04 | New best val_f1_macro_present: 0.5206 at epoch 5
+2026-08-24 20:42:50 | Epoch 006/100 | loss 2.8511 | cls 2.6589 | tal -0.0468 | dual_g 0.2063 | dual_d 0.9391 | train_acc 0.5430 | train_full 0.5505 | val_acc 0.5917 | val_f1 0.6010 | grad(main/disc) 9.663/1.729 | lr(main/disc) 7.00e-05/3.50e-05 | 106.5s
+2026-08-24 20:42:53 | New best val_f1_macro_present: 0.6010 at epoch 6
+2026-08-24 20:44:41 | Epoch 007/100 | loss 2.8052 | cls 2.4382 | tal -0.0595 | dual_g 0.3849 | dual_d 0.9488 | train_acc 0.6348 | train_full 0.5570 | val_acc 0.5833 | val_f1 0.6440 | grad(main/disc) 9.814/1.746 | lr(main/disc) 7.00e-05/3.50e-05 | 107.3s
+2026-08-24 20:44:44 | New best val_f1_macro_present: 0.6440 at epoch 7
+2026-08-24 20:46:32 | Epoch 008/100 | loss 2.7831 | cls 2.2588 | tal -0.0287 | dual_g 0.5330 | dual_d 0.8446 | train_acc 0.6738 | train_full 0.6215 | val_acc 0.6167 | val_f1 0.6404 | grad(main/disc) 9.733/1.534 | lr(main/disc) 7.00e-05/3.50e-05 | 107.5s
+2026-08-24 20:48:19 | Epoch 009/100 | loss 2.7703 | cls 2.1077 | tal -0.0177 | dual_g 0.6679 | dual_d 0.8187 | train_acc 0.7070 | train_full 0.5871 | val_acc 0.6000 | val_f1 0.6555 | grad(main/disc) 9.641/1.463 | lr(main/disc) 7.00e-05/3.50e-05 | 107.0s
+2026-08-24 20:48:22 | New best val_f1_macro_present: 0.6555 at epoch 9
+2026-08-24 20:50:09 | Epoch 010/100 | loss 2.7410 | cls 1.9709 | tal -0.0252 | dual_g 0.7776 | dual_d 0.8232 | train_acc 0.7773 | train_full 0.7398 | val_acc 0.7250 | val_f1 0.7314 | grad(main/disc) 10.048/1.385 | lr(main/disc) 7.00e-05/3.50e-05 | 107.1s
+2026-08-24 20:50:12 | New best val_f1_macro_present: 0.7314 at epoch 10
+2026-08-24 20:51:59 | Epoch 011/100 | loss 2.8135 | cls 1.9307 | tal -0.0709 | dual_g 0.9040 | dual_d 0.7990 | train_acc 0.7734 | train_full 0.7806 | val_acc 0.7833 | val_f1 0.7569 | grad(main/disc) 11.853/1.386 | lr(main/disc) 7.00e-05/3.50e-05 | 107.0s
+2026-08-24 20:52:02 | New best val_f1_macro_present: 0.7569 at epoch 11
+2026-08-24 20:53:52 | Epoch 012/100 | loss 2.8766 | cls 1.8651 | tal -0.0756 | dual_g 1.0341 | dual_d 0.8017 | train_acc 0.8301 | train_full 0.8323 | val_acc 0.7917 | val_f1 0.7633 | grad(main/disc) 11.401/1.346 | lr(main/disc) 7.00e-05/3.50e-05 | 109.3s
+2026-08-24 20:53:55 | New best val_f1_macro_present: 0.7633 at epoch 12
+2026-08-24 20:55:41 | Epoch 013/100 | loss 2.8930 | cls 1.7835 | tal -0.0958 | dual_g 1.1383 | dual_d 0.8363 | train_acc 0.8574 | train_full 0.7935 | val_acc 0.7917 | val_f1 0.7807 | grad(main/disc) 10.641/1.378 | lr(main/disc) 7.00e-05/3.50e-05 | 105.8s
+2026-08-24 20:55:44 | New best val_f1_macro_present: 0.7807 at epoch 13
+2026-08-24 20:57:29 | Epoch 014/100 | loss 2.9626 | cls 1.7574 | tal -0.0627 | dual_g 1.2240 | dual_d 0.7763 | train_acc 0.8730 | train_full 0.8258 | val_acc 0.8250 | val_f1 0.7981 | grad(main/disc) 10.712/1.274 | lr(main/disc) 7.00e-05/3.50e-05 | 105.1s
+2026-08-24 20:57:32 | New best val_f1_macro_present: 0.7981 at epoch 14
+2026-08-24 20:59:12 | Epoch 015/100 | loss 2.9712 | cls 1.6666 | tal -0.1153 | dual_g 1.3392 | dual_d 0.7722 | train_acc 0.8809 | train_full 0.8968 | val_acc 0.8667 | val_f1 0.8552 | grad(main/disc) 9.847/1.255 | lr(main/disc) 7.00e-05/3.50e-05 | 100.3s
+2026-08-24 20:59:16 | New best val_f1_macro_present: 0.8552 at epoch 15
+2026-08-24 21:01:02 | Epoch 016/100 | loss 2.8155 | cls 1.6091 | tal -0.1663 | dual_g 1.2563 | dual_d 0.7899 | train_acc 0.8926 | train_full 0.8645 | val_acc 0.8417 | val_f1 0.8160 | grad(main/disc) 9.533/1.256 | lr(main/disc) 7.00e-05/3.50e-05 | 106.0s
+2026-08-24 21:02:45 | Epoch 017/100 | loss 2.7677 | cls 1.5624 | tal -0.1796 | dual_g 1.2592 | dual_d 0.8005 | train_acc 0.9004 | train_full 0.8215 | val_acc 0.8167 | val_f1 0.7911 | grad(main/disc) 10.504/1.261 | lr(main/disc) 7.00e-05/3.50e-05 | 103.0s
+2026-08-24 21:04:33 | Epoch 018/100 | loss 2.6722 | cls 1.5185 | tal -0.1689 | dual_g 1.2044 | dual_d 0.7833 | train_acc 0.9258 | train_full 0.9376 | val_acc 0.8667 | val_f1 0.8395 | grad(main/disc) 9.897/1.191 | lr(main/disc) 7.00e-05/3.50e-05 | 108.5s
+2026-08-24 21:06:16 | Epoch 019/100 | loss 2.6394 | cls 1.5016 | tal -0.1349 | dual_g 1.1783 | dual_d 0.7974 | train_acc 0.9316 | train_full 0.9333 | val_acc 0.8917 | val_f1 0.8839 | grad(main/disc) 8.841/1.226 | lr(main/disc) 7.00e-05/3.50e-05 | 102.7s
+2026-08-24 21:06:19 | New best val_f1_macro_present: 0.8839 at epoch 19
+2026-08-24 21:08:05 | Epoch 020/100 | loss 2.5316 | cls 1.4508 | tal -0.1635 | dual_g 1.1298 | dual_d 0.8307 | train_acc 0.9531 | train_full 0.9226 | val_acc 0.8750 | val_f1 0.8419 | grad(main/disc) 7.860/1.232 | lr(main/disc) 7.00e-05/3.50e-05 | 106.3s
+2026-08-24 21:09:47 | Epoch 021/100 | loss 2.5951 | cls 1.4852 | tal -0.1575 | dual_g 1.1571 | dual_d 0.8040 | train_acc 0.9414 | train_full 0.9140 | val_acc 0.8917 | val_f1 0.8733 | grad(main/disc) 9.130/1.211 | lr(main/disc) 7.00e-05/3.50e-05 | 102.2s
+2026-08-24 21:11:35 | Epoch 022/100 | loss 2.5429 | cls 1.4443 | tal -0.1352 | dual_g 1.1392 | dual_d 0.8619 | train_acc 0.9473 | train_full 0.9204 | val_acc 0.8833 | val_f1 0.8606 | grad(main/disc) 8.247/1.244 | lr(main/disc) 7.00e-05/3.50e-05 | 107.3s
+2026-08-24 21:13:21 | Epoch 023/100 | loss 2.5126 | cls 1.4261 | tal -0.1512 | dual_g 1.1318 | dual_d 0.8511 | train_acc 0.9531 | train_full 0.9290 | val_acc 0.8917 | val_f1 0.8825 | grad(main/disc) 8.971/1.240 | lr(main/disc) 7.00e-05/3.50e-05 | 106.4s
+2026-08-24 21:15:06 | Epoch 024/100 | loss 2.4742 | cls 1.4164 | tal -0.1690 | dual_g 1.1085 | dual_d 0.8675 | train_acc 0.9512 | train_full 0.9527 | val_acc 0.9333 | val_f1 0.9077 | grad(main/disc) 7.913/1.250 | lr(main/disc) 7.00e-05/3.50e-05 | 104.6s
+2026-08-24 21:15:09 | New best val_f1_macro_present: 0.9077 at epoch 24
+2026-08-24 21:17:01 | Epoch 025/100 | loss 2.4150 | cls 1.3658 | tal -0.1438 | dual_g 1.0923 | dual_d 0.8486 | train_acc 0.9648 | train_full 0.9484 | val_acc 0.9000 | val_f1 0.8773 | grad(main/disc) 6.762/1.227 | lr(main/disc) 7.00e-05/3.50e-05 | 111.8s
+2026-08-24 21:18:49 | Epoch 026/100 | loss 2.4148 | cls 1.4077 | tal -0.1868 | dual_g 1.0631 | dual_d 0.9169 | train_acc 0.9629 | train_full 0.9484 | val_acc 0.9333 | val_f1 0.8985 | grad(main/disc) 6.480/1.281 | lr(main/disc) 7.00e-05/3.50e-05 | 108.5s
+2026-08-24 21:20:36 | Epoch 027/100 | loss 2.3763 | cls 1.3647 | tal -0.1875 | dual_g 1.0678 | dual_d 0.9048 | train_acc 0.9668 | train_full 0.9548 | val_acc 0.9167 | val_f1 0.8879 | grad(main/disc) 6.222/1.282 | lr(main/disc) 7.00e-05/3.50e-05 | 107.1s
+2026-08-24 21:22:19 | Epoch 028/100 | loss 2.3642 | cls 1.3530 | tal -0.1502 | dual_g 1.0563 | dual_d 0.9199 | train_acc 0.9746 | train_full 0.9828 | val_acc 0.9333 | val_f1 0.9173 | grad(main/disc) 6.072/1.259 | lr(main/disc) 7.00e-05/3.50e-05 | 102.8s
+2026-08-24 21:22:22 | New best val_f1_macro_present: 0.9173 at epoch 28
+2026-08-24 21:24:07 | Epoch 029/100 | loss 2.3475 | cls 1.3483 | tal -0.1724 | dual_g 1.0509 | dual_d 0.9044 | train_acc 0.9883 | train_full 0.9763 | val_acc 0.9417 | val_f1 0.9393 | grad(main/disc) 5.922/1.267 | lr(main/disc) 7.00e-05/3.50e-05 | 105.1s
+2026-08-24 21:24:11 | New best val_f1_macro_present: 0.9393 at epoch 29
+2026-08-24 21:25:55 | Epoch 030/100 | loss 2.3381 | cls 1.3565 | tal -0.1834 | dual_g 1.0367 | dual_d 0.8786 | train_acc 0.9785 | train_full 0.9269 | val_acc 0.9083 | val_f1 0.8718 | grad(main/disc) 6.432/1.184 | lr(main/disc) 7.00e-05/3.50e-05 | 104.5s
+2026-08-24 21:27:40 | Epoch 031/100 | loss 2.3222 | cls 1.3468 | tal -0.1900 | dual_g 1.0324 | dual_d 0.9228 | train_acc 0.9707 | train_full 0.9763 | val_acc 0.9500 | val_f1 0.9336 | grad(main/disc) 5.167/1.259 | lr(main/disc) 7.00e-05/3.50e-05 | 105.4s
+2026-08-24 21:29:31 | Epoch 032/100 | loss 2.2890 | cls 1.3116 | tal -0.1793 | dual_g 1.0312 | dual_d 0.8876 | train_acc 0.9844 | train_full 0.9742 | val_acc 0.9250 | val_f1 0.9041 | grad(main/disc) 5.490/1.178 | lr(main/disc) 7.00e-05/3.50e-05 | 111.0s
+2026-08-24 21:31:25 | Epoch 033/100 | loss 2.2878 | cls 1.3198 | tal -0.1759 | dual_g 1.0207 | dual_d 0.9306 | train_acc 0.9727 | train_full 0.9742 | val_acc 0.9167 | val_f1 0.9152 | grad(main/disc) 4.943/1.251 | lr(main/disc) 7.00e-05/3.50e-05 | 113.3s
+2026-08-24 21:33:11 | Epoch 034/100 | loss 2.2681 | cls 1.3088 | tal -0.1502 | dual_g 1.0044 | dual_d 0.9113 | train_acc 0.9805 | train_full 0.9677 | val_acc 0.9250 | val_f1 0.8982 | grad(main/disc) 4.145/1.198 | lr(main/disc) 7.00e-05/3.50e-05 | 106.7s
+2026-08-24 21:35:02 | Epoch 035/100 | loss 2.2644 | cls 1.3183 | tal -0.1928 | dual_g 1.0040 | dual_d 0.9135 | train_acc 0.9902 | train_full 0.9806 | val_acc 0.9500 | val_f1 0.9397 | grad(main/disc) 4.501/1.216 | lr(main/disc) 7.00e-05/3.50e-05 | 110.1s
+2026-08-24 21:36:50 | Epoch 036/100 | loss 2.2286 | cls 1.2988 | tal -0.1947 | dual_g 0.9882 | dual_d 0.9445 | train_acc 0.9961 | train_full 0.9871 | val_acc 0.9500 | val_f1 0.9249 | grad(main/disc) 3.758/1.217 | lr(main/disc) 7.00e-05/3.50e-05 | 108.0s
+2026-08-24 21:38:36 | Epoch 037/100 | loss 2.2180 | cls 1.2883 | tal -0.1855 | dual_g 0.9853 | dual_d 0.9067 | train_acc 0.9902 | train_full 0.9785 | val_acc 0.9500 | val_f1 0.9168 | grad(main/disc) 3.836/1.155 | lr(main/disc) 7.00e-05/3.50e-05 | 106.8s
+2026-08-24 21:40:24 | Epoch 038/100 | loss 2.1815 | cls 1.2836 | tal -0.2340 | dual_g 0.9682 | dual_d 0.9094 | train_acc 0.9922 | train_full 0.9656 | val_acc 0.9333 | val_f1 0.9118 | grad(main/disc) 3.507/1.184 | lr(main/disc) 7.00e-05/3.50e-05 | 108.0s
+2026-08-24 21:40:24 | Early stopping at epoch 38 after 9 epochs without val_f1_macro_present improvement.
+2026-08-24 21:40:24 | Training complete. Best validation accuracy: 0.9500 | best val_f1_macro_present: 0.9393

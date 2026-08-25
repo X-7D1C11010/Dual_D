@@ -1,0 +1,22 @@
+{
+  "experiment_id": "module_c_20260824_171004",
+  "variants": [
+    "full",
+    "no_module_c",
+    "no_cycle",
+    "no_identity",
+    "no_paired_contrastive",
+    "no_prototype_contrastive",
+    "no_classification_feedback"
+  ],
+  "domains": [
+    "黑天",
+    "逆光",
+    "雾天",
+    "雨天"
+  ],
+  "iterations": 3,
+  "expected_runs": 84,
+  "monitor_metric": "val_f1_macro_present",
+  "pca_feature_view": false
+}
