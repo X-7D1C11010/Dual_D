@@ -1275,6 +1275,8 @@ def run_training(args) -> Dict[str, object]:
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         train_metrics = train_one_epoch(
             args=args,
             models=models,
@@ -1336,6 +1338,17 @@ def run_training(args) -> Dict[str, object]:
         else:
             sampled_mode_acc = float("nan")
         full_train_acc = train_full_metrics.get("accuracy")
+        if device.type == "cuda":
+            gibibyte = float(1024**3)
+            cuda_peak_allocated_gb = (
+                torch.cuda.max_memory_allocated(device) / gibibyte
+            )
+            cuda_peak_reserved_gb = (
+                torch.cuda.max_memory_reserved(device) / gibibyte
+            )
+        else:
+            cuda_peak_allocated_gb = 0.0
+            cuda_peak_reserved_gb = 0.0
 
         row = {
             **train_metrics,
@@ -1364,6 +1377,8 @@ def run_training(args) -> Dict[str, object]:
                 optimizer_disc.param_groups[0]["lr"]
                 / max(optimizer_main.param_groups[-1]["lr"], 1e-30)
             ),
+            "cuda_peak_allocated_gb": cuda_peak_allocated_gb,
+            "cuda_peak_reserved_gb": cuda_peak_reserved_gb,
             "epoch_seconds": time.time() - epoch_start,
         }
         metrics_logger.write_row(row)
@@ -1372,7 +1387,8 @@ def run_training(args) -> Dict[str, object]:
             "Epoch %03d/%03d | loss %.4f | cls %.4f | tal %.4f | dual_g %.4f | "
             "dual_d %.4f | train_acc %.4f | train_full %s | val_acc %.4f | "
             "val_f1 %.4f | adv/moduleC %.2f/%.2f | disc_steps %.0f | "
-            "grad(main/disc) %.3f/%.3f | lr(main/disc) %.2e/%.2e | %.1fs",
+            "grad(main/disc) %.3f/%.3f | lr(main/disc) %.2e/%.2e | "
+            "cuda_peak(alloc/resv) %.2f/%.2fGB | %.1fs",
             epoch,
             args.epochs,
             row["train_loss"],
@@ -1391,6 +1407,8 @@ def run_training(args) -> Dict[str, object]:
             row["train_grad_norm_discriminator"],
             row["lr_main"],
             row["lr_discriminator"],
+            row["cuda_peak_allocated_gb"],
+            row["cuda_peak_reserved_gb"],
             row["epoch_seconds"],
         )
 
