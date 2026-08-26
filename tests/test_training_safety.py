@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -17,7 +18,11 @@ from dual_d.data.audit import audit_dataset_splits, data_audit_errors
 from dual_d.data.multimodal_dataset import PairedImageTransform, SampleRecord
 from dual_d.data.paired_sampler import PairedClassSampler
 from dual_d.losses import class_prototype_contrastive_loss, paired_contrastive_loss
-from dual_d.training.trainer import _adversarial_scale, _module_c_scale
+from dual_d.training.trainer import (
+    _adversarial_scale,
+    _module_c_scale,
+    validate_cuda_architecture,
+)
 
 
 def _write_image(path: Path, value: int) -> None:
@@ -27,6 +32,26 @@ def _write_image(path: Path, value: int) -> None:
 
 
 class TrainingSafetyTests(unittest.TestCase):
+    @patch("dual_d.training.trainer.torch.cuda.get_arch_list", return_value=["sm_86", "sm_90"])
+    @patch("dual_d.training.trainer.torch.cuda.get_device_capability", return_value=(8, 9))
+    @patch("dual_d.training.trainer.torch.cuda.current_device", return_value=0)
+    @patch("dual_d.training.trainer.torch.cuda.is_available", return_value=True)
+    def test_cuda_architecture_accepts_same_major_forward_compatibility(
+        self, _available, _current, _capability, _arches
+    ) -> None:
+        validate_cuda_architecture(torch.device("cuda"))
+
+    @patch("dual_d.training.trainer.torch.cuda.get_device_name", return_value="RTX 5090")
+    @patch("dual_d.training.trainer.torch.cuda.get_arch_list", return_value=["sm_86", "sm_90"])
+    @patch("dual_d.training.trainer.torch.cuda.get_device_capability", return_value=(12, 0))
+    @patch("dual_d.training.trainer.torch.cuda.current_device", return_value=0)
+    @patch("dual_d.training.trainer.torch.cuda.is_available", return_value=True)
+    def test_cuda_architecture_rejects_missing_blackwell_target(
+        self, _available, _current, _capability, _arches, _name
+    ) -> None:
+        with self.assertRaisesRegex(RuntimeError, "sm_12x"):
+            validate_cuda_architecture(torch.device("cuda"))
+
     def test_paired_sampler_keeps_partial_batch_and_minimum_steps(self) -> None:
         class Dataset:
             def __init__(self, size: int) -> None:

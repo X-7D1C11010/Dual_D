@@ -1,0 +1,17 @@
+2026-08-26 10:35:13 | Starting Dual_D standalone training
+2026-08-26 10:35:13 | Run directory: runs\local_pilot\pilot_night_smoke
+2026-08-26 10:35:13 | Device: cuda
+2026-08-26 10:35:14 | Source train samples: 992
+2026-08-26 10:35:14 | Target train samples: 465
+2026-08-26 10:35:14 | Target val samples: 120
+2026-08-26 10:35:14 | Classes: 14
+2026-08-26 10:35:15 | Data audit: same_dir=False | path_overlap(vis/ir/ais)=0/0/0 | content_overlap(vis/ir/ais)=0/0/0 | ais_index_overlap=0 | stem_mismatch(vis-ir/vis-ais)=578/0
+2026-08-26 10:35:15 | source_train classes: present 14/14 | absent 0 | counts [0:120, 1:44, 2:69, 3:45, 4:40, 5:30, 6:64, 7:80, 8:116, 9:68, 10:57, 11:83, 12:48, 13:128]
+2026-08-26 10:35:15 | target_train classes: present 8/14 | absent 6 | counts [0:100, 2:11, 3:16, 6:89, 9:162, 10:12, 11:44, 13:31]
+2026-08-26 10:35:15 | target_val classes: present 8/14 | absent 6 | counts [0:26, 2:3, 3:5, 6:23, 9:41, 10:3, 11:11, 13:8]
+2026-08-26 10:35:15 | Paired training classes: 8/14 | class ids [0, 2, 3, 6, 9, 10, 11, 13]
+2026-08-26 10:35:15 | VIS/IR pairing: class-level-unpaired | count-mismatch classes train/val: 10/0 | AIS alignment: none | AIS rows train/val: 0/0
+2026-08-26 10:35:15 | Model parameters: total=17277714 | trainable=17120210
+2026-08-26 10:36:20 | Epoch 001/001 | loss 4.9725 | cls 4.8976 | tal 0.2497 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.1560 | train_full 0.1591 | val_acc 0.2083 | val_f1 0.3233 | adv/moduleC 0.00/0.00 | disc_steps 0 | grad(main/disc) 33.214/0.000 | lr(main/disc) 7.00e-05/3.50e-05 | 65.0s
+2026-08-26 10:36:20 | New best val_f1_macro_present: 0.3233 at epoch 1
+2026-08-26 10:36:20 | Training complete. Best validation accuracy: 0.2083 | best val_f1_macro_present: 0.3233

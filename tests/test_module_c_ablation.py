@@ -20,9 +20,38 @@ from scripts.ablate_module_c import (
     _plot_feature_diagnostics,
     _plot_prototype_alignment_by_domain,
 )
+from scripts.run_all_experiments import (
+    EXPERIMENT_VARIANTS,
+    build_ablation_command,
+    build_parser as build_all_experiments_parser,
+)
 
 
 class ModuleCAblationTests(unittest.TestCase):
+    def test_one_command_launcher_contains_no_duplicate_or_extra_variants(self) -> None:
+        self.assertEqual(
+            EXPERIMENT_VARIANTS,
+            [
+                "full",
+                "no_cycle",
+                "no_identity",
+                "no_paired_contrastive",
+                "no_prototype_contrastive",
+                "no_classification_feedback",
+                "no_module_c",
+            ],
+        )
+        self.assertEqual(set(EXPERIMENT_VARIANTS), set(VARIANTS))
+        args = build_all_experiments_parser().parse_args(
+            ["--source-root", "/data/clear", "--target-parent-root", "/data"]
+        )
+        command = build_ablation_command(args)
+        self.assertEqual(command.count("--run"), 1)
+        self.assertIn("--no-pca-feature-view", command)
+        variant_start = command.index("--variants") + 1
+        variant_end = command.index("--iterations")
+        self.assertEqual(command[variant_start:variant_end], EXPERIMENT_VARIANTS)
+
     def test_every_constraint_has_a_leave_one_out_variant(self) -> None:
         self.assertEqual(
             set(VARIANTS),
@@ -112,9 +141,14 @@ class ModuleCAblationTests(unittest.TestCase):
             np.savez_compressed(
                 run_dir / "feature_embeddings.npz",
                 source_raw=source,
+                source_target_like=target,
+                source_reconstruction=source,
+                source_identity=source,
                 source_labels=labels,
                 target_raw=target,
                 target_source_like=translated,
+                target_reconstruction=target,
+                target_identity=target,
                 target_labels=labels,
             )
             summaries = [
@@ -134,6 +168,8 @@ class ModuleCAblationTests(unittest.TestCase):
             self.assertEqual(len(metrics), 1)
             self.assertGreater(metrics[0]["target_silhouette_gain"], 0.0)
             self.assertGreater(metrics[0]["prototype_margin_gain"], 0.0)
+            self.assertAlmostEqual(metrics[0]["cycle_cosine_error"], 0.0)
+            self.assertAlmostEqual(metrics[0]["identity_cosine_error"], 0.0)
             self.assertTrue((root / images[0]).exists())
             prototype_images = _plot_prototype_alignment_by_domain(
                 summaries, root, _load_matplotlib()

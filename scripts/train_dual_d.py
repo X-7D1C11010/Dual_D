@@ -696,18 +696,51 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
 
     domain_statistics: Dict[str, Dict[str, float]] = {}
     for domain, _, _ in experiments:
-        accuracies = [
-            float(item["best_acc"])
-            for item in summaries
-            if item["target_domain"] == domain
+        domain_runs = [
+            item for item in summaries if item["target_domain"] == domain
         ]
-        domain_statistics[domain] = {
-            "runs": len(accuracies),
-            "best_acc_mean": mean(accuracies),
-            "best_acc_std": pstdev(accuracies) if len(accuracies) > 1 else 0.0,
-            "best_acc_min": min(accuracies),
-            "best_acc_max": max(accuracies),
+        selected_metrics = {
+            "acc": [],
+            "precision_macro_present": [],
+            "recall_macro_present": [],
+            "f1_macro_present": [],
         }
+        best_accuracies = []
+        for item in domain_runs:
+            best_accuracies.append(float(item["best_acc"]))
+            validation = item.get("best_metrics", {}).get("val", {})
+            selected_metrics["acc"].append(
+                float(validation.get("accuracy", item["best_acc"]))
+            )
+            for name in (
+                "precision_macro_present",
+                "recall_macro_present",
+                "f1_macro_present",
+            ):
+                selected_metrics[name].append(float(validation[name]))
+
+        statistics: Dict[str, float] = {"runs": len(domain_runs)}
+        for name, values in selected_metrics.items():
+            statistics[f"val_{name}_mean"] = mean(values)
+            statistics[f"val_{name}_std"] = (
+                pstdev(values) if len(values) > 1 else 0.0
+            )
+            statistics[f"val_{name}_min"] = min(values)
+            statistics[f"val_{name}_max"] = max(values)
+        # Retain the historical maximum-accuracy fields for compatibility.
+        # The four ``val_*`` groups above all come from the one epoch selected
+        # by ``monitor_metric`` and are the values that should be reported.
+        statistics.update(
+            {
+                "best_acc_mean": mean(best_accuracies),
+                "best_acc_std": (
+                    pstdev(best_accuracies) if len(best_accuracies) > 1 else 0.0
+                ),
+                "best_acc_min": min(best_accuracies),
+                "best_acc_max": max(best_accuracies),
+            }
+        )
+        domain_statistics[domain] = statistics
 
     batch_summary = {
         "batch_timestamp": batch_timestamp,
@@ -734,8 +767,12 @@ def main() -> None:
     print(f"Batch summary: {summary['summary_path']}")
     for domain, metrics in summary["domain_statistics"].items():
         print(
-            f"{domain}: best val acc {metrics['best_acc_mean']:.4f} "
-            f"± {metrics['best_acc_std']:.4f} over {metrics['runs']} run(s)"
+            f"{domain}: selected-epoch val "
+            f"ACC {metrics['val_acc_mean']:.4f} ± {metrics['val_acc_std']:.4f} | "
+            f"Precision {metrics['val_precision_macro_present_mean']:.4f} | "
+            f"Recall {metrics['val_recall_macro_present_mean']:.4f} | "
+            f"F1 {metrics['val_f1_macro_present_mean']:.4f} "
+            f"over {metrics['runs']} run(s)"
         )
 
 

@@ -21,7 +21,7 @@ import os
 from pathlib import Path
 import random
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import warnings
 
 import numpy as np
@@ -88,7 +88,14 @@ def resolve_device(device_name: str) -> torch.device:
 
 
 def validate_cuda_architecture(device: torch.device) -> None:
-    """Fail early when the installed PyTorch build lacks the GPU's SM target."""
+    """Fail early when the installed PyTorch build cannot run on the GPU.
+
+    A cubin built for a lower minor compute capability is forward compatible
+    with later GPUs in the same major family (for example, ``sm_86`` on
+    ``sm_89``).  Requiring an exact token incorrectly rejects supported Ada
+    GPUs, while a Blackwell ``sm_120`` device still requires an ``sm_12x``
+    build.
+    """
 
     if device.type != "cuda":
         return
@@ -102,14 +109,22 @@ def validate_cuda_architecture(device: torch.device) -> None:
     major, minor = torch.cuda.get_device_capability(device_index)
     required_arch = f"sm_{major}{minor}"
     compiled_arches = set(torch.cuda.get_arch_list())
-    if compiled_arches and required_arch not in compiled_arches:
+    compatible_arches = []
+    for architecture in compiled_arches:
+        token = architecture.removeprefix("sm_")
+        if not token.isdigit() or len(token) < 2:
+            continue
+        compiled_major = int(token[:-1])
+        compiled_minor = int(token[-1])
+        if compiled_major == major and compiled_minor <= minor:
+            compatible_arches.append(architecture)
+    if compiled_arches and not compatible_arches:
         name = torch.cuda.get_device_name(device_index)
         raise RuntimeError(
             "Incompatible PyTorch CUDA build: "
             f"{name} requires {required_arch}, but this installation provides "
             f"{', '.join(sorted(compiled_arches))}. Install a PyTorch/torchvision "
-            "build compiled for the RTX 5090 (CUDA 12.8+ / Blackwell support) "
-            "before starting training."
+            f"build with an sm_{major}x target before starting training."
         )
 
 
@@ -731,6 +746,7 @@ def train_one_epoch(
         "train_grad_clip_fraction_discriminator": (
             totals["grad_clip_disc_steps"] / disc_steps
         ),
+        "train_discriminator_steps": totals["disc_steps"],
         "train_adversarial_scale": adversarial_scale,
         "train_module_c_scale": module_c_scale,
         "train_acc": totals["target_correct"] / sample_total,
@@ -895,7 +911,7 @@ def save_feature_embeddings(
 
     def collect(dataloader: DataLoader, domain: str):
         raw_parts = []
-        translated_parts = []
+        generated_parts: Dict[str, List[np.ndarray]] = {}
         label_parts = []
         sample_ids = []
         sample_count = 0
@@ -917,11 +933,25 @@ def save_feature_embeddings(
             raw = torch.cat(projected, dim=1)
             remaining = max_samples - sample_count
             raw_parts.append(raw[:remaining].cpu().numpy())
-            if domain == "target":
-                translated = models.dual_adapter.inference_features(
-                    raw, mode="source_like"
+            translator = models.dual_adapter.coordinator.translator
+            if domain == "source":
+                target_like, reconstruction = translator.cycle_from_source(raw)
+                generated = {
+                    "target_like": target_like,
+                    "reconstruction": reconstruction,
+                    "identity": translator.target_to_source(raw),
+                }
+            else:
+                source_like, reconstruction = translator.cycle_from_target(raw)
+                generated = {
+                    "source_like": source_like,
+                    "reconstruction": reconstruction,
+                    "identity": translator.source_to_target(raw),
+                }
+            for name, features in generated.items():
+                generated_parts.setdefault(name, []).append(
+                    features[:remaining].cpu().numpy()
                 )
-                translated_parts.append(translated[:remaining].cpu().numpy())
             label_parts.append(batch["label"][:remaining].cpu().numpy())
             paths = list(batch.get("vis_path", []))[:remaining]
             sample_ids.extend(str(path) for path in paths)
@@ -933,20 +963,21 @@ def save_feature_embeddings(
             if raw_parts
             else np.empty((0, 0), dtype=np.float32)
         )
-        translated_array = (
-            np.concatenate(translated_parts, axis=0)
-            if translated_parts
-            else np.empty((0, raw_array.shape[1] if raw_array.ndim == 2 else 0), dtype=np.float32)
-        )
+        generated_arrays = {
+            name: np.concatenate(parts, axis=0)
+            for name, parts in generated_parts.items()
+        }
         label_array = (
             np.concatenate(label_parts, axis=0).astype(np.int64)
             if label_parts
             else np.empty(0, dtype=np.int64)
         )
-        return raw_array, translated_array, label_array, np.asarray(sample_ids, dtype=str)
+        return raw_array, generated_arrays, label_array, np.asarray(sample_ids, dtype=str)
 
-    source_raw, _, source_labels, source_ids = collect(source_dataloader, "source")
-    target_raw, target_source_like, target_labels, target_ids = collect(
+    source_raw, source_generated, source_labels, source_ids = collect(
+        source_dataloader, "source"
+    )
+    target_raw, target_generated, target_labels, target_ids = collect(
         target_dataloader, "target"
     )
     if not len(source_labels) or not len(target_labels):
@@ -955,15 +986,20 @@ def save_feature_embeddings(
     np.savez_compressed(
         output_path,
         source_raw=source_raw,
+        source_target_like=source_generated["target_like"],
+        source_reconstruction=source_generated["reconstruction"],
+        source_identity=source_generated["identity"],
         source_labels=source_labels,
         source_sample_ids=source_ids,
         target_raw=target_raw,
-        target_source_like=target_source_like,
+        target_source_like=target_generated["source_like"],
+        target_reconstruction=target_generated["reconstruction"],
+        target_identity=target_generated["identity"],
         target_labels=target_labels,
         target_sample_ids=target_ids,
         # Backward-compatible aliases for older analysis consumers.
         raw=target_raw,
-        source_like=target_source_like,
+        source_like=target_generated["source_like"],
         labels=target_labels,
     )
 
@@ -1335,7 +1371,8 @@ def run_training(args) -> Dict[str, object]:
         logger.info(
             "Epoch %03d/%03d | loss %.4f | cls %.4f | tal %.4f | dual_g %.4f | "
             "dual_d %.4f | train_acc %.4f | train_full %s | val_acc %.4f | "
-            "val_f1 %.4f | grad(main/disc) %.3f/%.3f | lr(main/disc) %.2e/%.2e | %.1fs",
+            "val_f1 %.4f | adv/moduleC %.2f/%.2f | disc_steps %.0f | "
+            "grad(main/disc) %.3f/%.3f | lr(main/disc) %.2e/%.2e | %.1fs",
             epoch,
             args.epochs,
             row["train_loss"],
@@ -1347,6 +1384,9 @@ def run_training(args) -> Dict[str, object]:
             f"{row['train_full_acc']:.4f}" if row["train_full_acc"] is not None else "n/a",
             row["val_acc"],
             row["val_f1_macro_present"],
+            row["train_adversarial_scale"],
+            row["train_module_c_scale"],
+            row["train_discriminator_steps"],
             row["train_grad_norm_main"],
             row["train_grad_norm_discriminator"],
             row["lr_main"],

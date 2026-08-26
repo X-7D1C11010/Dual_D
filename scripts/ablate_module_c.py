@@ -76,6 +76,13 @@ LOSS_METRIC = {
     "prototype_contrastive": "train_dual_d_prototype_contrastive",
     "classification_feedback": "train_dual_d_classification_feedback",
 }
+WEIGHTED_LOSS_METRIC = {
+    "cycle": "train_dual_d_weighted_cycle",
+    "identity": "train_dual_d_weighted_identity",
+    "paired_contrastive": "train_dual_d_weighted_contrastive",
+    "prototype_contrastive": "train_dual_d_weighted_prototype_contrastive",
+    "classification_feedback": "train_dual_d_weighted_classification_feedback",
+}
 
 
 def _json_load(path: Path) -> Dict[str, Any]:
@@ -817,24 +824,36 @@ def _plot_constraint_diagnostic(
     plt.close(figure)
 
     raw_metric = LOSS_METRIC[constraint]
+    weighted_metric = WEIGHTED_LOSS_METRIC[constraint]
     for domain in domains:
-        loss_figure, loss_axis = plt.subplots(figsize=(7.5, 4.5))
-        for variant, legend, color in (
-            (full_variant, "Full Module C", "#2f6f9f"),
-            (ablation_variant, _variant_display(ablation_variant), "#b85c38"),
+        loss_figure, loss_axes = plt.subplots(1, 2, figsize=(12.5, 4.5))
+        for loss_axis, metric, prefix in (
+            (loss_axes[0], raw_metric, "Raw loss (still measured)"),
+            (loss_axes[1], weighted_metric, "Weighted objective contribution"),
         ):
-            curve = _read_curve_rows(summaries, variant, raw_metric, domain=domain)
-            epochs = [epoch for epoch in sorted(curve) if len(curve[epoch]) >= 2]
-            if epochs:
-                means = [mean(curve[epoch]) for epoch in epochs]
-                loss_axis.plot(epochs, means, linewidth=2, label=legend, color=color)
-        loss_axis.set_xlabel("Epoch")
-        loss_axis.set_ylabel("Raw " + raw_metric.replace("train_dual_d_", "").replace("_", " "))
-        loss_axis.set_title(
-            f"{_domain_display(domain)}: raw {CONSTRAINTS[constraint]} diagnostic"
+            for variant, legend, color in (
+                (full_variant, "Full Module C", "#2f6f9f"),
+                (ablation_variant, _variant_display(ablation_variant), "#b85c38"),
+            ):
+                curve = _read_curve_rows(summaries, variant, metric, domain=domain)
+                epochs = [
+                    epoch for epoch in sorted(curve) if len(curve[epoch]) >= 2
+                ]
+                if epochs:
+                    means = [mean(curve[epoch]) for epoch in epochs]
+                    loss_axis.plot(
+                        epochs, means, linewidth=2, label=legend, color=color
+                    )
+            loss_axis.set_xlabel("Epoch")
+            loss_axis.set_ylabel(
+                metric.replace("train_dual_d_", "").replace("_", " ")
+            )
+            loss_axis.set_title(prefix)
+            loss_axis.grid(alpha=0.25)
+            loss_axis.legend(frameon=False)
+        loss_figure.suptitle(
+            f"{_domain_display(domain)}: {CONSTRAINTS[constraint]} ablation audit"
         )
-        loss_axis.grid(alpha=0.25)
-        loss_axis.legend(frameon=False)
         loss_figure.tight_layout()
         loss_figure.savefig(
             output_dir
@@ -896,6 +915,21 @@ def _coral_distance(source: np.ndarray, target: np.ndarray) -> float | None:
     target_cov = np.cov(target.astype(np.float64), rowvar=False)
     dimension = max(source.shape[1], 1)
     return float(np.square(source_cov - target_cov).sum() / (4.0 * dimension * dimension))
+
+
+def _cosine_reconstruction_error(
+    original: np.ndarray, reconstructed: np.ndarray
+) -> float | None:
+    """Measure direction-preserving reconstruction error in original space."""
+
+    if not len(original) or original.shape != reconstructed.shape:
+        return None
+    similarities = np.sum(
+        _l2_normalize(original.astype(np.float64))
+        * _l2_normalize(reconstructed.astype(np.float64)),
+        axis=1,
+    )
+    return float(np.mean(1.0 - similarities))
 
 
 def _class_centroid_distance(
@@ -995,7 +1029,17 @@ def _load_feature_run(summary: Mapping[str, Any]) -> Dict[str, np.ndarray] | Non
         }
         if not required.issubset(data.files):
             return None
-        return {key: np.asarray(data[key]) for key in required}
+        optional = {
+            "source_target_like",
+            "source_reconstruction",
+            "source_identity",
+            "target_reconstruction",
+            "target_identity",
+        }
+        return {
+            key: np.asarray(data[key])
+            for key in required | (optional & set(data.files))
+        }
 
 
 def _feature_metric_row(
@@ -1010,6 +1054,12 @@ def _feature_metric_row(
     source_indices = _balanced_source_indices(source_labels, target_labels)
     source = source[source_indices]
     source_labels = source_labels[source_indices]
+    source_reconstruction = snapshot.get("source_reconstruction")
+    source_identity = snapshot.get("source_identity")
+    if source_reconstruction is not None:
+        source_reconstruction = np.asarray(source_reconstruction)[source_indices]
+    if source_identity is not None:
+        source_identity = np.asarray(source_identity)[source_indices]
     raw_silhouette = _cosine_silhouette(target_raw, target_labels)
     translated_silhouette = _cosine_silhouette(translated, target_labels)
     raw_centroid_distance = _class_centroid_distance(
@@ -1036,6 +1086,33 @@ def _feature_metric_row(
         translated_diagonal, translated_margin, translated_top1 = (
             _prototype_similarity_statistics(translated_prototype_result[1])
         )
+    source_cycle_error = (
+        _cosine_reconstruction_error(source, source_reconstruction)
+        if source_reconstruction is not None
+        else None
+    )
+    target_cycle_error = (
+        _cosine_reconstruction_error(
+            target_raw, np.asarray(snapshot["target_reconstruction"])
+        )
+        if "target_reconstruction" in snapshot
+        else None
+    )
+    source_identity_error = (
+        _cosine_reconstruction_error(source, source_identity)
+        if source_identity is not None
+        else None
+    )
+    target_identity_error = (
+        _cosine_reconstruction_error(target_raw, np.asarray(snapshot["target_identity"]))
+        if "target_identity" in snapshot
+        else None
+    )
+
+    def average_available(*values: float | None) -> float | None:
+        available = [float(value) for value in values if value is not None]
+        return mean(available) if available else None
+
     return {
         "run": summary["run"],
         "variant": summary["variant"],
@@ -1083,6 +1160,16 @@ def _feature_metric_row(
             translated_top1 - raw_top1
             if translated_top1 is not None and raw_top1 is not None
             else None
+        ),
+        "source_cycle_cosine_error": source_cycle_error,
+        "target_cycle_cosine_error": target_cycle_error,
+        "cycle_cosine_error": average_available(
+            source_cycle_error, target_cycle_error
+        ),
+        "source_identity_cosine_error": source_identity_error,
+        "target_identity_cosine_error": target_identity_error,
+        "identity_cosine_error": average_available(
+            source_identity_error, target_identity_error
         ),
     }
 
@@ -1228,6 +1315,12 @@ def _aggregate_feature_metrics(
         "source_target_raw_prototype_top1",
         "source_target_translated_prototype_top1",
         "prototype_top1_gain",
+        "source_cycle_cosine_error",
+        "target_cycle_cosine_error",
+        "cycle_cosine_error",
+        "source_identity_cosine_error",
+        "target_identity_cosine_error",
+        "identity_cosine_error",
     )
     output: List[Dict[str, Any]] = []
     for (variant, domain), group in sorted(grouped.items()):
@@ -1437,9 +1530,19 @@ def _plot_feature_metric_effects(
             "Ablation minus full: CORAL distance",
             -1.0,
         ),
+        (
+            "cycle_cosine_error_mean",
+            "Ablation minus full: cycle reconstruction error",
+            -1.0,
+        ),
+        (
+            "identity_cosine_error_mean",
+            "Ablation minus full: identity preservation error",
+            -1.0,
+        ),
     )
     figure, axes = plt.subplots(
-        2, 2, figsize=(13, max(8.2, 0.95 * len(variants))), squeeze=False
+        3, 2, figsize=(13, max(11.5, 1.1 * len(variants))), squeeze=False
     )
     for axis, (metric, title, full_sign) in zip(axes.flat, metric_specs):
         values = []

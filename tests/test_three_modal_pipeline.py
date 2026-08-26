@@ -399,14 +399,14 @@ class ThreeModalPipelineTests(unittest.TestCase):
                     "0",
                     "--adversarial-warmup-epochs",
                     "1",
+                    "--save-feature-embeddings",
                     "--save-checkpoints",
                 ]
             )
             batch_summary = run_experiment_matrix(args)
+            run_dir = Path(batch_summary["runs"][0]["run_dir"])
             checkpoint = torch.load(
-                Path(batch_summary["runs"][0]["run_dir"])
-                / "checkpoints"
-                / "last_model.pt",
+                run_dir / "checkpoints" / "last_model.pt",
                 map_location="cpu",
                 weights_only=False,
             )
@@ -414,6 +414,15 @@ class ThreeModalPipelineTests(unittest.TestCase):
             self.assertIsNone(checkpoint["net_ais"])
             self.assertNotIn("U_matrices.2", checkpoint["tal"])
             self.assertEqual(checkpoint["classifier"]["fc.0.weight"].shape[1], 4)
+            with np.load(run_dir / "feature_embeddings.npz") as features:
+                self.assertTrue(
+                    {
+                        "source_reconstruction",
+                        "source_identity",
+                        "target_reconstruction",
+                        "target_identity",
+                    }.issubset(features.files)
+                )
 
     def test_grouped_iterations_share_one_artifact_directory(self) -> None:
         with TemporaryDirectory() as directory:
