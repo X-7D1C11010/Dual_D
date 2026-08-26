@@ -5,17 +5,18 @@
       "batch_size": 80,
       "num_workers": 16,
       "min_steps_per_epoch": 6,
-      "augmentation_strength": 0.6,
-      "label_smoothing": 0.1,
-      "classifier_dropout": 0.52,
-      "target_classification_weight": 0.72,
+      "augmentation_strength": 0.55,
+      "label_smoothing": 0.08,
+      "classifier_dropout": 0.48,
+      "target_classification_weight": 0.78,
       "lr_main": 0.0001,
       "lr_visual": 0.00001,
-      "weight_decay": 0.0011,
+      "weight_decay": 0.001,
       "discriminator_update_interval": 1,
       "module_c_warmup_epochs": 3,
       "module_c_ramp_epochs": 10,
-      "early_stopping_patience": 12
+      "early_stopping_patience": 15,
+      "early_stopping_min_epochs": 40
     },
     "逆光": {
       "batch_size": 80,
@@ -28,7 +29,8 @@
       "weight_decay": 0.001,
       "module_c_warmup_epochs": 4,
       "module_c_ramp_epochs": 10,
-      "early_stopping_patience": 12
+      "early_stopping_patience": 15,
+      "early_stopping_min_epochs": 25
     },
     "雾天": {
       "batch_size": 80,
@@ -39,7 +41,8 @@
       "target_classification_weight": 0.65,
       "module_c_warmup_epochs": 5,
       "module_c_ramp_epochs": 10,
-      "early_stopping_patience": 9
+      "early_stopping_patience": 15,
+      "early_stopping_min_epochs": 48
     },
     "雨天": {
       "batch_size": 80,
@@ -57,7 +60,8 @@
       "module_c_ramp_epochs": 10,
       "adversarial_warmup_epochs": 6,
       "adversarial_ramp_epochs": 18,
-      "early_stopping_patience": 12
+      "early_stopping_patience": 15,
+      "early_stopping_min_epochs": 35
     }
   }
 }

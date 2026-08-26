@@ -68,6 +68,34 @@ class TrainingSafetyTests(unittest.TestCase):
         self.assertEqual(len(natural), 2)
         self.assertEqual(len(resampled), 4)
 
+    def test_paired_sampler_fetches_class_matched_batches(self) -> None:
+        class Dataset:
+            def __init__(self, labels) -> None:
+                self.labels = list(labels)
+
+            def __len__(self) -> int:
+                return len(self.labels)
+
+            def __getitem__(self, index: int):
+                return {
+                    "index": torch.tensor(index),
+                    "label": torch.tensor(self.labels[index]),
+                }
+
+        source = Dataset([0, 0, 1, 1, 1])
+        target = Dataset([0, 1, 0, 1])
+        loader = PairedClassSampler(
+            source,
+            target,
+            batch_size=4,
+            min_steps_per_epoch=1,
+            num_workers=0,
+        )
+
+        source_batch, target_batch = next(iter(loader))
+        self.assertEqual(source_batch["label"].shape[0], 4)
+        self.assertTrue(torch.equal(source_batch["label"], target_batch["label"]))
+
     def test_paired_transform_reuses_geometric_randomness(self) -> None:
         grid = np.arange(16 * 16, dtype=np.uint8).reshape(16, 16)
         image = Image.fromarray(np.repeat(grid[..., None], 3, axis=2))

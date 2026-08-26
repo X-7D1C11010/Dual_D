@@ -491,6 +491,15 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         help="Evaluate the complete deterministic target train split every N epochs.",
     )
     parser.add_argument(
+        "--raw-eval-interval",
+        type=int,
+        default=default("raw_eval_interval", 5),
+        help=(
+            "Evaluate the secondary raw-feature validation view every N epochs. "
+            "It is also evaluated whenever the monitored validation metric improves."
+        ),
+    )
+    parser.add_argument(
         "--data-audit-hashes",
         action=argparse.BooleanOptionalAction,
         default=default("data_audit_hashes", True),
@@ -571,6 +580,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--augmentation-strength must be in [0, 1].")
     if args.train_eval_interval <= 0:
         parser.error("--train-eval-interval must be positive.")
+    if args.raw_eval_interval <= 0:
+        parser.error("--raw-eval-interval must be positive.")
     if args.adversarial_warmup_epochs < 0 or args.adversarial_ramp_epochs < 0:
         parser.error("Adversarial warmup/ramp epochs must be non-negative.")
     if args.early_stopping_patience < 0:

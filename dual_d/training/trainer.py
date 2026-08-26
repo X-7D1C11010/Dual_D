@@ -427,10 +427,10 @@ def extract_fused_features(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Extract TAL-aligned features in explicit VIS/IR or VIS/IR/AIS mode."""
 
-    source_vis = source_batch["vis"].to(device)
-    source_ir = source_batch["ir"].to(device)
-    target_vis = target_batch["vis"].to(device)
-    target_ir = target_batch["ir"].to(device)
+    source_vis = source_batch["vis"].to(device, non_blocking=True)
+    source_ir = source_batch["ir"].to(device, non_blocking=True)
+    target_vis = target_batch["vis"].to(device, non_blocking=True)
+    target_ir = target_batch["ir"].to(device, non_blocking=True)
 
     source_vis_feat = models.net_vis(source_vis)
     source_ir_feat = models.net_ir(source_ir)
@@ -444,8 +444,12 @@ def extract_fused_features(
             raise RuntimeError(
                 "AIS is enabled but the batch has no AIS tensor. Check AIS roots."
             )
-        source_modalities.append(models.net_ais(source_batch["ais"].to(device)))
-        target_modalities.append(models.net_ais(target_batch["ais"].to(device)))
+        source_modalities.append(
+            models.net_ais(source_batch["ais"].to(device, non_blocking=True))
+        )
+        target_modalities.append(
+            models.net_ais(target_batch["ais"].to(device, non_blocking=True))
+        )
 
     projected_source, projected_target, loss_tal = models.tal(
         source_modalities,
@@ -600,8 +604,8 @@ def train_one_epoch(
     }
 
     for step, (source_batch, target_batch) in enumerate(paired_loader, start=1):
-        source_labels = source_batch["label"].to(device)
-        target_labels = target_batch["label"].to(device)
+        source_labels = source_batch["label"].to(device, non_blocking=True)
+        target_labels = target_batch["label"].to(device, non_blocking=True)
         labels_for_contrast = source_labels
 
         feat_src, feat_tgt, loss_tal = extract_fused_features(
@@ -845,9 +849,9 @@ def evaluate(
     steps = 0
 
     for batch in dataloader:
-        vis = batch["vis"].to(device)
-        ir = batch["ir"].to(device)
-        labels = batch["label"].to(device)
+        vis = batch["vis"].to(device, non_blocking=True)
+        ir = batch["ir"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
 
         vis_feat = models.net_vis(vis)
         ir_feat = models.net_ir(ir)
@@ -857,7 +861,9 @@ def evaluate(
                 raise RuntimeError(
                     "AIS is enabled but the validation batch has no AIS tensor."
                 )
-            modalities.append(models.net_ais(batch["ais"].to(device)))
+            modalities.append(
+                models.net_ais(batch["ais"].to(device, non_blocking=True))
+            )
         projected_target = models.tal.project_target(modalities)
         features = torch.cat(projected_target, dim=1)
         selected_mode = feature_mode or args.eval_feature_mode
@@ -916,15 +922,17 @@ def save_feature_embeddings(
         sample_ids = []
         sample_count = 0
         for batch in dataloader:
-            vis_feat = models.net_vis(batch["vis"].to(device))
-            ir_feat = models.net_ir(batch["ir"].to(device))
+            vis_feat = models.net_vis(batch["vis"].to(device, non_blocking=True))
+            ir_feat = models.net_ir(batch["ir"].to(device, non_blocking=True))
             modalities = [vis_feat, ir_feat]
             if models.net_ais is not None:
                 if "ais" not in batch:
                     raise RuntimeError(
                         "AIS is enabled but feature snapshot has no AIS tensor."
                     )
-                modalities.append(models.net_ais(batch["ais"].to(device)))
+                modalities.append(
+                    models.net_ais(batch["ais"].to(device, non_blocking=True))
+                )
             projected = (
                 models.tal.project_source(modalities)
                 if domain == "source"
@@ -1169,6 +1177,8 @@ def run_training(args) -> Dict[str, object]:
         target_train,
         args.batch_size,
         min_steps_per_epoch=getattr(args, "min_steps_per_epoch", 4),
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
     )
     paired_common_classes = list(paired_loader.classes)
     save_json(
@@ -1184,6 +1194,17 @@ def run_training(args) -> Dict[str, object]:
         len(paired_common_classes),
         num_classes,
         ", ".join(str(class_id) for class_id in paired_common_classes),
+    )
+    logger.info(
+        "Runtime profile: batch=%d | paired_steps=%d | workers=%d | "
+        "train_eval_every=%d | raw_eval_every=%d | early_stop=%d after min_epoch=%d",
+        args.batch_size,
+        len(paired_loader),
+        args.num_workers,
+        max(int(getattr(args, "train_eval_interval", 1)), 1),
+        max(int(getattr(args, "raw_eval_interval", 5)), 1),
+        int(getattr(args, "early_stopping_patience", 0)),
+        int(getattr(args, "early_stopping_min_epochs", 0)),
     )
     logger.info(
         "VIS/IR pairing: %s | count-mismatch classes train/val: %d/%d | "
@@ -1277,6 +1298,7 @@ def run_training(args) -> Dict[str, object]:
         epoch_start = time.time()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
+        train_phase_start = time.time()
         train_metrics = train_one_epoch(
             args=args,
             models=models,
@@ -1288,6 +1310,9 @@ def run_training(args) -> Dict[str, object]:
             num_classes=num_classes,
             epoch=epoch,
         )
+        train_seconds = time.time() - train_phase_start
+
+        val_phase_start = time.time()
         val_metrics = evaluate(
             args=args,
             models=models,
@@ -1296,21 +1321,45 @@ def run_training(args) -> Dict[str, object]:
             device=device,
             num_classes=num_classes,
         )
+        val_seconds = time.time() - val_phase_start
+
+        monitor_values = {
+            "val_acc": float(val_metrics["accuracy"]),
+            "val_f1_macro_present": float(val_metrics["f1_macro_present"]),
+            "val_loss": float(val_metrics["val_loss"]),
+        }
+        monitor_value = monitor_values[monitor_metric]
+        min_delta = float(getattr(args, "early_stopping_min_delta", 0.0))
+        would_improve = (
+            monitor_value < best_score - min_delta
+            if monitor_mode == "min"
+            else monitor_value > best_score + min_delta
+        )
+
+        raw_eval_seconds = 0.0
         if args.eval_feature_mode == "raw":
             val_raw_metrics = val_metrics
         else:
-            val_raw_metrics = evaluate(
-                args=args,
-                models=models,
-                dataloader=val_loader,
-                criterion_cls=criterion_cls,
-                device=device,
-                num_classes=num_classes,
-                feature_mode="raw",
-            )
+            raw_eval_interval = max(int(getattr(args, "raw_eval_interval", 5)), 1)
+            if epoch == 1 or epoch % raw_eval_interval == 0 or would_improve:
+                raw_eval_start = time.time()
+                val_raw_metrics = evaluate(
+                    args=args,
+                    models=models,
+                    dataloader=val_loader,
+                    criterion_cls=criterion_cls,
+                    device=device,
+                    num_classes=num_classes,
+                    feature_mode="raw",
+                )
+                raw_eval_seconds = time.time() - raw_eval_start
+            else:
+                val_raw_metrics = {}
 
         train_eval_interval = max(int(getattr(args, "train_eval_interval", 1)), 1)
+        train_eval_seconds = 0.0
         if epoch == 1 or epoch % train_eval_interval == 0:
+            train_eval_start = time.time()
             train_full_metrics = evaluate(
                 args=args,
                 models=models,
@@ -1319,15 +1368,10 @@ def run_training(args) -> Dict[str, object]:
                 device=device,
                 num_classes=num_classes,
             )
+            train_eval_seconds = time.time() - train_eval_start
         else:
             train_full_metrics = {}
 
-        monitor_values = {
-            "val_acc": float(val_metrics["accuracy"]),
-            "val_f1_macro_present": float(val_metrics["f1_macro_present"]),
-            "val_loss": float(val_metrics["val_loss"]),
-        }
-        monitor_value = monitor_values[monitor_metric]
         scheduler_main.step(monitor_value)
         scheduler_disc.step(monitor_value)
 
@@ -1360,9 +1404,9 @@ def run_training(args) -> Dict[str, object]:
             "val_precision_micro": val_metrics["precision_micro"],
             "val_recall_micro": val_metrics["recall_micro"],
             "val_f1_micro": val_metrics["f1_micro"],
-            "val_raw_loss": val_raw_metrics["val_loss"],
-            "val_raw_acc": val_raw_metrics["accuracy"],
-            "val_raw_f1_macro_present": val_raw_metrics["f1_macro_present"],
+            "val_raw_loss": val_raw_metrics.get("val_loss"),
+            "val_raw_acc": val_raw_metrics.get("accuracy"),
+            "val_raw_f1_macro_present": val_raw_metrics.get("f1_macro_present"),
             "train_full_acc": full_train_acc,
             "train_full_f1_macro_present": train_full_metrics.get("f1_macro_present"),
             "train_sampled_minus_full_acc": (
@@ -1379,6 +1423,10 @@ def run_training(args) -> Dict[str, object]:
             ),
             "cuda_peak_allocated_gb": cuda_peak_allocated_gb,
             "cuda_peak_reserved_gb": cuda_peak_reserved_gb,
+            "train_seconds": train_seconds,
+            "val_seconds": val_seconds,
+            "raw_eval_seconds": raw_eval_seconds,
+            "train_eval_seconds": train_eval_seconds,
             "epoch_seconds": time.time() - epoch_start,
         }
         metrics_logger.write_row(row)
@@ -1388,7 +1436,8 @@ def run_training(args) -> Dict[str, object]:
             "dual_d %.4f | train_acc %.4f | train_full %s | val_acc %.4f | "
             "val_f1 %.4f | adv/moduleC %.2f/%.2f | disc_steps %.0f | "
             "grad(main/disc) %.3f/%.3f | lr(main/disc) %.2e/%.2e | "
-            "cuda_peak(alloc/resv) %.2f/%.2fGB | %.1fs",
+            "cuda_peak(alloc/resv) %.2f/%.2fGB | "
+            "phase(train/val/raw/train_eval) %.1f/%.1f/%.1f/%.1fs | %.1fs",
             epoch,
             args.epochs,
             row["train_loss"],
@@ -1409,6 +1458,10 @@ def run_training(args) -> Dict[str, object]:
             row["lr_discriminator"],
             row["cuda_peak_allocated_gb"],
             row["cuda_peak_reserved_gb"],
+            row["train_seconds"],
+            row["val_seconds"],
+            row["raw_eval_seconds"],
+            row["train_eval_seconds"],
             row["epoch_seconds"],
         )
 
@@ -1444,12 +1497,7 @@ def run_training(args) -> Dict[str, object]:
                     last_state,
                     _checkpoint_path(run_dir, "best_f1_model.pt", args),
                 )
-        min_delta = float(getattr(args, "early_stopping_min_delta", 0.0))
-        improved = (
-            monitor_value < best_score - min_delta
-            if monitor_mode == "min"
-            else monitor_value > best_score + min_delta
-        )
+        improved = would_improve
         if improved:
             best_score = monitor_value
             epochs_without_improvement = 0
