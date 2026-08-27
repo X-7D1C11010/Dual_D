@@ -29,7 +29,7 @@ import torch
 from torch import nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from dual_d.config import load_config
 from dual_d.data import (
@@ -889,6 +889,32 @@ def evaluate(
     return metrics
 
 
+def _balanced_snapshot_indices(labels: List[int], max_samples: int) -> List[int]:
+    """Select a deterministic class-balanced subset without replacement."""
+
+    if len(labels) <= max_samples:
+        return list(range(len(labels)))
+    buckets: Dict[int, List[int]] = {}
+    for index, label in enumerate(labels):
+        buckets.setdefault(int(label), []).append(index)
+    selected: List[int] = []
+    offset = 0
+    class_ids = sorted(buckets)
+    while len(selected) < max_samples:
+        progressed = False
+        for class_id in class_ids:
+            candidates = buckets[class_id]
+            if offset < len(candidates):
+                selected.append(candidates[offset])
+                progressed = True
+                if len(selected) >= max_samples:
+                    break
+        if not progressed:
+            break
+        offset += 1
+    return selected
+
+
 @torch.no_grad()
 def save_feature_embeddings(
     models: ModelBundle,
@@ -916,6 +942,19 @@ def save_feature_embeddings(
     models.dual_adapter.eval()
 
     def collect(dataloader: DataLoader, domain: str):
+        dataset_labels = getattr(dataloader.dataset, "labels", None)
+        if dataset_labels is not None and len(dataset_labels) > max_samples:
+            selected_indices = _balanced_snapshot_indices(
+                list(dataset_labels), max_samples
+            )
+            dataloader = DataLoader(
+                Subset(dataloader.dataset, selected_indices),
+                batch_size=dataloader.batch_size,
+                shuffle=False,
+                num_workers=min(int(dataloader.num_workers), 4),
+                pin_memory=bool(dataloader.pin_memory),
+                collate_fn=dataloader.collate_fn,
+            )
         raw_parts = []
         generated_parts: Dict[str, List[np.ndarray]] = {}
         label_parts = []
@@ -948,6 +987,8 @@ def save_feature_embeddings(
                     "target_like": target_like,
                     "reconstruction": reconstruction,
                     "identity": translator.target_to_source(raw),
+                    "raw_logits": models.classifier(raw),
+                    "target_like_logits": models.classifier(target_like),
                 }
             else:
                 source_like, reconstruction = translator.cycle_from_target(raw)
@@ -955,14 +996,20 @@ def save_feature_embeddings(
                     "source_like": source_like,
                     "reconstruction": reconstruction,
                     "identity": translator.source_to_target(raw),
+                    "raw_logits": models.classifier(raw),
+                    "source_like_logits": models.classifier(source_like),
                 }
             for name, features in generated.items():
                 generated_parts.setdefault(name, []).append(
                     features[:remaining].cpu().numpy()
                 )
             label_parts.append(batch["label"][:remaining].cpu().numpy())
-            paths = list(batch.get("vis_path", []))[:remaining]
-            sample_ids.extend(str(path) for path in paths)
+            vis_paths = list(batch.get("vis_path", []))[:remaining]
+            ir_paths = list(batch.get("ir_path", []))[:remaining]
+            sample_ids.extend(
+                f"{vis_path}|{ir_path}"
+                for vis_path, ir_path in zip(vis_paths, ir_paths)
+            )
             sample_count += min(int(raw.size(0)), remaining)
             if sample_count >= max_samples:
                 break
@@ -997,12 +1044,16 @@ def save_feature_embeddings(
         source_target_like=source_generated["target_like"],
         source_reconstruction=source_generated["reconstruction"],
         source_identity=source_generated["identity"],
+        source_raw_logits=source_generated["raw_logits"],
+        source_target_like_logits=source_generated["target_like_logits"],
         source_labels=source_labels,
         source_sample_ids=source_ids,
         target_raw=target_raw,
         target_source_like=target_generated["source_like"],
         target_reconstruction=target_generated["reconstruction"],
         target_identity=target_generated["identity"],
+        target_raw_logits=target_generated["raw_logits"],
+        target_source_like_logits=target_generated["source_like_logits"],
         target_labels=target_labels,
         target_sample_ids=target_ids,
         # Backward-compatible aliases for older analysis consumers.

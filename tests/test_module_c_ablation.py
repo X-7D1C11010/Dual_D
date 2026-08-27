@@ -17,6 +17,7 @@ from scripts.ablate_module_c import (
     discover_summaries,
     make_variant_config,
     _load_matplotlib,
+    _plot_constraint_feature_evidence,
     _plot_feature_diagnostics,
     _plot_prototype_alignment_by_domain,
 )
@@ -176,6 +177,86 @@ class ModuleCAblationTests(unittest.TestCase):
             )
             self.assertEqual(prototype_images, ["prototype_alignment_rain.png"])
             self.assertTrue((root / prototype_images[0]).exists())
+
+    def test_constraint_feature_evidence_covers_every_constraint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = np.asarray(
+                [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]],
+                dtype=np.float32,
+            )
+            target = np.asarray(
+                [[0.7, 0.3], [0.6, 0.4], [0.3, 0.7], [0.4, 0.6]],
+                dtype=np.float32,
+            )
+            aligned = np.asarray(
+                [[0.95, 0.05], [0.9, 0.1], [0.05, 0.95], [0.1, 0.9]],
+                dtype=np.float32,
+            )
+            degraded = np.asarray(
+                [[0.45, 0.55], [0.5, 0.5], [0.55, 0.45], [0.5, 0.5]],
+                dtype=np.float32,
+            )
+            labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+            good_logits = np.asarray(
+                [[4.0, 0.0], [3.0, 0.2], [0.0, 4.0], [0.2, 3.0]],
+                dtype=np.float32,
+            )
+            bad_logits = good_logits[:, ::-1].copy()
+            sample_ids = np.asarray(["a|A", "b|B", "c|C", "d|D"])
+            summaries = []
+            for variant in ["full", *[f"no_{name}" for name in CONSTRAINTS]]:
+                run_dir = root / f"module_c_{variant}_rain"
+                run_dir.mkdir()
+                is_cycle = variant == "no_cycle"
+                is_identity = variant == "no_identity"
+                is_alignment = variant in {
+                    "no_paired_contrastive",
+                    "no_prototype_contrastive",
+                }
+                is_feedback = variant == "no_classification_feedback"
+                np.savez_compressed(
+                    run_dir / "feature_embeddings.npz",
+                    source_raw=source,
+                    source_target_like=aligned,
+                    source_reconstruction=degraded if is_cycle else source,
+                    source_identity=degraded if is_identity else source,
+                    source_raw_logits=good_logits,
+                    source_target_like_logits=good_logits,
+                    source_labels=labels,
+                    source_sample_ids=sample_ids,
+                    target_raw=target,
+                    target_source_like=degraded if is_alignment else aligned,
+                    target_reconstruction=degraded if is_cycle else target,
+                    target_identity=degraded if is_identity else target,
+                    target_raw_logits=good_logits,
+                    target_source_like_logits=bad_logits if is_feedback else good_logits,
+                    target_labels=labels,
+                    target_sample_ids=sample_ids,
+                )
+                summaries.append(
+                    {
+                        "run_dir": str(run_dir),
+                        "run": run_dir.name,
+                        "variant": variant,
+                        "domain": "雨天",
+                        "iteration": 1,
+                        "seed": 42,
+                        "best_val_f1": 0.95 if variant == "full" else 0.85,
+                    }
+                )
+
+            images, evidence = _plot_constraint_feature_evidence(
+                summaries, root, _load_matplotlib()
+            )
+            self.assertEqual(len(images), len(CONSTRAINTS))
+            self.assertEqual(len(evidence), len(CONSTRAINTS))
+            self.assertEqual(
+                {row["constraint"] for row in evidence}, set(CONSTRAINTS)
+            )
+            self.assertTrue(all(row["paired_target_samples"] == 4 for row in evidence))
+            self.assertTrue(all(row["f1_gain"] > 0.0 for row in evidence))
+            self.assertTrue(all((root / image).is_file() for image in images))
 
     def test_grouped_iteration_artifacts_are_discovered(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

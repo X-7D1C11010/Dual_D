@@ -20,6 +20,7 @@ from dual_d.data.paired_sampler import PairedClassSampler
 from dual_d.losses import class_prototype_contrastive_loss, paired_contrastive_loss
 from dual_d.training.trainer import (
     _adversarial_scale,
+    _balanced_snapshot_indices,
     _module_c_scale,
     validate_cuda_architecture,
 )
@@ -32,6 +33,15 @@ def _write_image(path: Path, value: int) -> None:
 
 
 class TrainingSafetyTests(unittest.TestCase):
+    def test_feature_snapshot_selection_is_class_balanced(self) -> None:
+        labels = [0] * 20 + [1] * 5 + [2] * 2
+        selected = _balanced_snapshot_indices(labels, max_samples=9)
+        selected_labels = [labels[index] for index in selected]
+        self.assertEqual(len(selected), 9)
+        self.assertEqual(selected_labels[:6], [0, 1, 2, 0, 1, 2])
+        self.assertEqual(set(selected_labels), {0, 1, 2})
+        self.assertEqual(len(selected), len(set(selected)))
+
     @patch("dual_d.training.trainer.torch.cuda.get_arch_list", return_value=["sm_86", "sm_90"])
     @patch("dual_d.training.trainer.torch.cuda.get_device_capability", return_value=(8, 9))
     @patch("dual_d.training.trainer.torch.cuda.current_device", return_value=0)

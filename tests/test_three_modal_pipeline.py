@@ -419,9 +419,18 @@ class ThreeModalPipelineTests(unittest.TestCase):
                     {
                         "source_reconstruction",
                         "source_identity",
+                        "source_raw_logits",
+                        "source_target_like_logits",
+                        "source_sample_ids",
                         "target_reconstruction",
                         "target_identity",
+                        "target_raw_logits",
+                        "target_source_like_logits",
+                        "target_sample_ids",
                     }.issubset(features.files)
+                )
+                self.assertTrue(
+                    all("|" in sample_id for sample_id in features["target_sample_ids"])
                 )
 
     def test_grouped_iterations_share_one_artifact_directory(self) -> None:

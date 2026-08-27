@@ -1035,8 +1035,14 @@ def _load_feature_run(summary: Mapping[str, Any]) -> Dict[str, np.ndarray] | Non
             "source_target_like",
             "source_reconstruction",
             "source_identity",
+            "source_raw_logits",
+            "source_target_like_logits",
+            "source_sample_ids",
             "target_reconstruction",
             "target_identity",
+            "target_raw_logits",
+            "target_source_like_logits",
+            "target_sample_ids",
         }
         return {
             key: np.asarray(data[key])
@@ -1174,6 +1180,439 @@ def _feature_metric_row(
             source_identity_error, target_identity_error
         ),
     }
+
+
+def _row_cosine_distances(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Return sample-wise cosine distance without dimensionality reduction."""
+
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    if left.ndim != 2 or left.shape != right.shape or not len(left):
+        return np.empty(0, dtype=np.float64)
+    similarities = np.sum(_l2_normalize(left) * _l2_normalize(right), axis=1)
+    return np.clip(1.0 - similarities, 0.0, 2.0)
+
+
+def _aligned_feature_indices(
+    full: Mapping[str, np.ndarray],
+    ablated: Mapping[str, np.ndarray],
+    domain: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Match repeated weak-pair samples by stable ID and occurrence number."""
+
+    raw_key = f"{domain}_raw"
+    full_count = len(np.asarray(full[raw_key]))
+    ablated_count = len(np.asarray(ablated[raw_key]))
+    id_key = f"{domain}_sample_ids"
+    if id_key not in full or id_key not in ablated:
+        count = min(full_count, ablated_count)
+        indices = np.arange(count, dtype=np.int64)
+        return indices, indices.copy()
+
+    full_ids = [str(value) for value in np.asarray(full[id_key]).tolist()]
+    ablated_ids = [str(value) for value in np.asarray(ablated[id_key]).tolist()]
+    positions: Dict[str, List[int]] = defaultdict(list)
+    for index, sample_id in enumerate(ablated_ids):
+        positions[sample_id].append(index)
+    offsets: Dict[str, int] = defaultdict(int)
+    full_indices: List[int] = []
+    ablated_indices: List[int] = []
+    for index, sample_id in enumerate(full_ids):
+        offset = offsets[sample_id]
+        candidates = positions.get(sample_id, [])
+        if offset >= len(candidates):
+            continue
+        full_indices.append(index)
+        ablated_indices.append(candidates[offset])
+        offsets[sample_id] += 1
+    if full_indices:
+        return (
+            np.asarray(full_indices, dtype=np.int64),
+            np.asarray(ablated_indices, dtype=np.int64),
+        )
+    count = min(full_count, ablated_count)
+    indices = np.arange(count, dtype=np.int64)
+    return indices, indices.copy()
+
+
+def _matching_label_indices(
+    full: Mapping[str, np.ndarray],
+    ablated: Mapping[str, np.ndarray],
+    domain: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    full_indices, ablated_indices = _aligned_feature_indices(full, ablated, domain)
+    label_key = f"{domain}_labels"
+    full_labels = np.asarray(full[label_key], dtype=np.int64)[full_indices]
+    ablated_labels = np.asarray(ablated[label_key], dtype=np.int64)[ablated_indices]
+    matching = full_labels == ablated_labels
+    return full_indices[matching], ablated_indices[matching]
+
+
+def _prototype_sample_statistics(
+    source: np.ndarray,
+    source_labels: np.ndarray,
+    target: np.ndarray,
+    target_labels: np.ndarray,
+) -> Dict[str, np.ndarray] | None:
+    """Measure correct-class distance and nearest-wrong-class margin per sample."""
+
+    common = sorted(set(source_labels.tolist()) & set(target_labels.tolist()))
+    if len(common) < 2:
+        return None
+    prototypes = np.stack(
+        [source[source_labels == class_id].mean(axis=0) for class_id in common], axis=0
+    )
+    valid = np.isin(target_labels, common)
+    if not np.any(valid):
+        return None
+    valid_target = _l2_normalize(np.asarray(target[valid], dtype=np.float64))
+    normalized_prototypes = _l2_normalize(np.asarray(prototypes, dtype=np.float64))
+    similarities = valid_target @ normalized_prototypes.T
+    class_to_column = {class_id: index for index, class_id in enumerate(common)}
+    labels = np.asarray(target_labels[valid], dtype=np.int64)
+    correct_columns = np.asarray([class_to_column[int(label)] for label in labels])
+    rows = np.arange(len(labels))
+    correct_similarity = similarities[rows, correct_columns]
+    wrong_similarities = similarities.copy()
+    wrong_similarities[rows, correct_columns] = float("-inf")
+    nearest_wrong_similarity = np.max(wrong_similarities, axis=1)
+    return {
+        "labels": labels,
+        "correct_distance": 1.0 - correct_similarity,
+        "nearest_wrong_distance": 1.0 - nearest_wrong_similarity,
+        "margin": correct_similarity - nearest_wrong_similarity,
+    }
+
+
+def _classification_sample_statistics(
+    logits: np.ndarray, labels: np.ndarray
+) -> Dict[str, np.ndarray] | None:
+    logits = np.asarray(logits, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int64)
+    if logits.ndim != 2 or len(logits) != len(labels) or logits.shape[1] < 2:
+        return None
+    valid = (labels >= 0) & (labels < logits.shape[1])
+    if not np.any(valid):
+        return None
+    logits = logits[valid]
+    labels = labels[valid]
+    rows = np.arange(len(labels))
+    correct_logits = logits[rows, labels]
+    wrong_logits = logits.copy()
+    wrong_logits[rows, labels] = float("-inf")
+    margin = correct_logits - np.max(wrong_logits, axis=1)
+    shifted = logits - np.max(logits, axis=1, keepdims=True)
+    probabilities = np.exp(shifted)
+    probabilities /= np.clip(probabilities.sum(axis=1, keepdims=True), 1e-12, None)
+    return {
+        "labels": labels,
+        "margin": margin,
+        "correct_confidence": probabilities[rows, labels],
+        "correct": (np.argmax(logits, axis=1) == labels).astype(np.float64),
+    }
+
+
+def _summary_pair_key(summary: Mapping[str, Any]) -> tuple[str, int, int]:
+    seed = summary.get("seed")
+    return (
+        str(summary["domain"]),
+        int(summary.get("iteration") or 0),
+        int(seed) if seed is not None else -1,
+    )
+
+
+def _constraint_run_evidence(
+    constraint: str,
+    full_summary: Mapping[str, Any],
+    ablated_summary: Mapping[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]] | None:
+    full = _load_feature_run(full_summary)
+    ablated = _load_feature_run(ablated_summary)
+    if full is None or ablated is None:
+        return None
+    full_target_indices, ablated_target_indices = _matching_label_indices(
+        full, ablated, "target"
+    )
+    full_source_indices, ablated_source_indices = _matching_label_indices(
+        full, ablated, "source"
+    )
+    if not len(full_target_indices) or not len(full_source_indices):
+        return None
+
+    target_labels = np.asarray(full["target_labels"], dtype=np.int64)[full_target_indices]
+    source_labels = np.asarray(full["source_labels"], dtype=np.int64)[full_source_indices]
+    full_values: np.ndarray
+    ablated_values: np.ndarray
+    full_secondary: np.ndarray
+    ablated_secondary: np.ndarray
+    secondary_label: str
+    higher_is_better: bool
+
+    if constraint in {"cycle", "identity"}:
+        feature_key = "reconstruction" if constraint == "cycle" else "identity"
+        full_values = _row_cosine_distances(
+            np.asarray(full["target_raw"])[full_target_indices],
+            np.asarray(full[f"target_{feature_key}"])[full_target_indices],
+        )
+        ablated_values = _row_cosine_distances(
+            np.asarray(ablated["target_raw"])[ablated_target_indices],
+            np.asarray(ablated[f"target_{feature_key}"])[ablated_target_indices],
+        )
+        full_secondary = _row_cosine_distances(
+            np.asarray(full["source_raw"])[full_source_indices],
+            np.asarray(full[f"source_{feature_key}"])[full_source_indices],
+        )
+        ablated_secondary = _row_cosine_distances(
+            np.asarray(ablated["source_raw"])[ablated_source_indices],
+            np.asarray(ablated[f"source_{feature_key}"])[ablated_source_indices],
+        )
+        metric_label = f"Target {constraint} cosine error"
+        secondary_label = f"Source {constraint} cosine error"
+        higher_is_better = False
+        full_run_metric = float(np.mean(np.concatenate([full_values, full_secondary])))
+        ablated_run_metric = float(
+            np.mean(np.concatenate([ablated_values, ablated_secondary]))
+        )
+    elif constraint in {"paired_contrastive", "prototype_contrastive"}:
+        full_statistics = _prototype_sample_statistics(
+            np.asarray(full["source_raw"])[full_source_indices],
+            source_labels,
+            np.asarray(full["target_source_like"])[full_target_indices],
+            target_labels,
+        )
+        ablated_statistics = _prototype_sample_statistics(
+            np.asarray(ablated["source_raw"])[ablated_source_indices],
+            np.asarray(ablated["source_labels"], dtype=np.int64)[ablated_source_indices],
+            np.asarray(ablated["target_source_like"])[ablated_target_indices],
+            np.asarray(ablated["target_labels"], dtype=np.int64)[ablated_target_indices],
+        )
+        if full_statistics is None or ablated_statistics is None:
+            return None
+        full_values = full_statistics["margin"]
+        ablated_values = ablated_statistics["margin"]
+        target_labels = full_statistics["labels"]
+        full_secondary = full_statistics["correct_distance"]
+        ablated_secondary = ablated_statistics["correct_distance"]
+        metric_label = "Correct-vs-nearest-wrong prototype margin"
+        secondary_label = "Correct-class prototype cosine distance"
+        higher_is_better = True
+        full_run_metric = float(np.mean(full_values))
+        ablated_run_metric = float(np.mean(ablated_values))
+    else:
+        logits_key = "target_source_like_logits"
+        if logits_key not in full or logits_key not in ablated:
+            return None
+        full_statistics = _classification_sample_statistics(
+            np.asarray(full[logits_key])[full_target_indices], target_labels
+        )
+        ablated_statistics = _classification_sample_statistics(
+            np.asarray(ablated[logits_key])[ablated_target_indices],
+            np.asarray(ablated["target_labels"], dtype=np.int64)[ablated_target_indices],
+        )
+        if full_statistics is None or ablated_statistics is None:
+            return None
+        full_values = full_statistics["margin"]
+        ablated_values = ablated_statistics["margin"]
+        target_labels = full_statistics["labels"]
+        full_secondary = full_statistics["correct_confidence"]
+        ablated_secondary = ablated_statistics["correct_confidence"]
+        metric_label = "Generated-feature correct-class logit margin"
+        secondary_label = "Generated-feature correct-class confidence"
+        higher_is_better = True
+        full_run_metric = float(np.mean(full_values))
+        ablated_run_metric = float(np.mean(ablated_values))
+
+    mechanism_gain = (
+        full_run_metric - ablated_run_metric
+        if higher_is_better
+        else ablated_run_metric - full_run_metric
+    )
+    full_f1 = _to_float(full_summary.get("best_val_f1"))
+    ablated_f1 = _to_float(ablated_summary.get("best_val_f1"))
+    evidence = {
+        "constraint": constraint,
+        "domain": full_summary["domain"],
+        "iteration": full_summary.get("iteration"),
+        "seed": full_summary.get("seed"),
+        "metric": metric_label,
+        "higher_is_better": higher_is_better,
+        "full_metric_mean": full_run_metric,
+        "ablated_metric_mean": ablated_run_metric,
+        "mechanism_gain": mechanism_gain,
+        "full_secondary_mean": float(np.mean(full_secondary)),
+        "ablated_secondary_mean": float(np.mean(ablated_secondary)),
+        "full_val_f1": full_f1,
+        "ablated_val_f1": ablated_f1,
+        "f1_gain": (
+            full_f1 - ablated_f1
+            if full_f1 is not None and ablated_f1 is not None
+            else None
+        ),
+        "paired_target_samples": len(full_values),
+        "paired_source_samples": len(full_source_indices),
+    }
+    plot_data = {
+        "full_values": full_values,
+        "ablated_values": ablated_values,
+        "full_secondary": full_secondary,
+        "ablated_secondary": ablated_secondary,
+        "labels": target_labels,
+        "metric_label": metric_label,
+        "secondary_label": secondary_label,
+        "higher_is_better": higher_is_better,
+    }
+    return evidence, plot_data
+
+
+def _comparison_boxplot(axis, full_values, ablated_values, ylabel: str) -> None:
+    boxplot = axis.boxplot(
+        [full_values, ablated_values],
+        patch_artist=True,
+        showmeans=True,
+        meanprops={"marker": "D", "markerfacecolor": "black", "markeredgecolor": "black"},
+    )
+    for patch, color in zip(boxplot["boxes"], ("#2f6f9f", "#b85c38")):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.75)
+    axis.set_xticks([1, 2], ["With constraint", "Without constraint"])
+    axis.set_ylabel(ylabel)
+    axis.grid(axis="y", alpha=0.25)
+
+
+def _plot_constraint_feature_evidence(
+    summaries: Sequence[Mapping[str, Any]], output_dir: Path, plt
+) -> tuple[List[str], List[Dict[str, Any]]]:
+    """Plot paired Full-vs-ablation mechanism evidence in the original space."""
+
+    feature_dir = output_dir / "constraint_feature_evidence"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    full_index = {
+        _summary_pair_key(summary): summary
+        for summary in summaries
+        if summary["variant"] == "full"
+    }
+    generated: List[str] = []
+    evidence_rows: List[Dict[str, Any]] = []
+    for constraint in CONSTRAINTS:
+        ablation_variant = f"no_{constraint}"
+        ablated_index = {
+            _summary_pair_key(summary): summary
+            for summary in summaries
+            if summary["variant"] == ablation_variant
+        }
+        grouped: Dict[str, List[tuple[Dict[str, Any], Dict[str, Any]]]] = defaultdict(list)
+        for key in sorted(set(full_index) & set(ablated_index)):
+            result = _constraint_run_evidence(
+                constraint, full_index[key], ablated_index[key]
+            )
+            if result is None:
+                continue
+            evidence, plot_data = result
+            evidence_rows.append(evidence)
+            grouped[str(evidence["domain"])].append((evidence, plot_data))
+
+        for domain, records in grouped.items():
+            figure, axes = plt.subplots(2, 2, figsize=(14, 9))
+            full_values = np.concatenate(
+                [np.asarray(plot_data["full_values"]) for _, plot_data in records]
+            )
+            ablated_values = np.concatenate(
+                [np.asarray(plot_data["ablated_values"]) for _, plot_data in records]
+            )
+            full_secondary = np.concatenate(
+                [np.asarray(plot_data["full_secondary"]) for _, plot_data in records]
+            )
+            ablated_secondary = np.concatenate(
+                [np.asarray(plot_data["ablated_secondary"]) for _, plot_data in records]
+            )
+            _comparison_boxplot(
+                axes[0, 0], full_values, ablated_values, records[0][1]["metric_label"]
+            )
+            axes[0, 0].set_title("Target feature mechanism")
+            _comparison_boxplot(
+                axes[0, 1],
+                full_secondary,
+                ablated_secondary,
+                records[0][1]["secondary_label"],
+            )
+            axes[0, 1].set_title("Complementary feature evidence")
+
+            labels = np.concatenate(
+                [np.asarray(plot_data["labels"], dtype=np.int64) for _, plot_data in records]
+            )
+            classes = sorted(set(labels.tolist()))
+            positions = np.arange(len(classes), dtype=np.float64)
+            width = 0.38
+            full_class_means = [
+                float(np.mean(full_values[labels == class_id])) for class_id in classes
+            ]
+            ablated_class_means = [
+                float(np.mean(ablated_values[labels == class_id])) for class_id in classes
+            ]
+            axes[1, 0].bar(
+                positions - width / 2,
+                full_class_means,
+                width,
+                label="With constraint",
+                color="#2f6f9f",
+            )
+            axes[1, 0].bar(
+                positions + width / 2,
+                ablated_class_means,
+                width,
+                label="Without constraint",
+                color="#b85c38",
+            )
+            axes[1, 0].set_xticks(positions, [str(class_id) for class_id in classes])
+            axes[1, 0].set_xlabel("Class ID")
+            axes[1, 0].set_ylabel(records[0][1]["metric_label"])
+            axes[1, 0].set_title("Per-class target feature comparison")
+            axes[1, 0].grid(axis="y", alpha=0.25)
+            axes[1, 0].legend(frameon=False)
+
+            gains = [
+                (evidence["mechanism_gain"], evidence.get("f1_gain"), evidence["iteration"])
+                for evidence, _ in records
+                if evidence.get("f1_gain") is not None
+            ]
+            axes[1, 1].axhline(0.0, color="#7f8c8d", linewidth=1)
+            axes[1, 1].axvline(0.0, color="#7f8c8d", linewidth=1)
+            if gains:
+                axes[1, 1].scatter(
+                    [item[0] for item in gains],
+                    [item[1] for item in gains],
+                    s=65,
+                    color="#2a9d8f",
+                )
+                for x_value, y_value, iteration in gains:
+                    axes[1, 1].annotate(
+                        f"iter {int(iteration or 0):02d}",
+                        (x_value, y_value),
+                        xytext=(5, 5),
+                        textcoords="offset points",
+                        fontsize=9,
+                    )
+            axes[1, 1].set_xlabel("Mechanism gain (positive favors Full)")
+            axes[1, 1].set_ylabel("Macro F1 gain (Full - ablation)")
+            axes[1, 1].set_title("Feature mechanism versus classification")
+            axes[1, 1].grid(alpha=0.25)
+            axes[1, 1].margins(x=0.18, y=0.18)
+            description = CONSTRAINTS[constraint]
+            description = description[0].upper() + description[1:]
+            figure.suptitle(
+                f"{_domain_display(domain)} | {description}\n"
+                "Paired samples and seeds; metrics computed in the original feature space",
+                fontsize=14,
+            )
+            figure.tight_layout(rect=(0, 0, 1, 0.94))
+            filename = (
+                f"constraint_feature_{constraint}_{_domain_display(domain).lower()}.png"
+            )
+            target_path = feature_dir / filename
+            figure.savefig(target_path, dpi=180, bbox_inches="tight")
+            plt.close(figure)
+            generated.append(str(target_path.relative_to(output_dir)))
+    return generated, evidence_rows
 
 
 def _plot_feature_diagnostics(
@@ -1634,6 +2073,9 @@ def _write_html_report(output_dir: Path, aggregates: Sequence[Mapping[str, Any]]
     ] + [f"constraint_{name}" for name in constraints]
     feature_images = sorted(output_dir.glob("prototype_alignment_*.png"))
     feature_images += sorted((output_dir / "feature_diagnostics").glob("*.png"))
+    feature_images += sorted(
+        (output_dir / "constraint_feature_evidence").glob("*.png")
+    )
     image_tags_parts = []
     for stem in image_stems:
         image = next((candidate for candidate in (f"{stem}.png", f"{stem}.svg") if (output_dir / candidate).exists()), None)
@@ -1697,8 +2139,17 @@ def analyse(args: argparse.Namespace) -> Dict[str, Any]:
     prototype_alignment_images = _plot_prototype_alignment_by_domain(
         summaries, output_dir, plt
     )
+    constraint_feature_images, constraint_feature_evidence = (
+        _plot_constraint_feature_evidence(summaries, output_dir, plt)
+    )
+    _write_csv(
+        constraint_feature_evidence,
+        output_dir / "constraint_feature_evidence.csv",
+    )
     payload["feature_images"] = feature_images
     payload["prototype_alignment_images"] = prototype_alignment_images
+    payload["constraint_feature_images"] = constraint_feature_images
+    payload["constraint_feature_evidence"] = constraint_feature_evidence
     payload["feature_metrics"] = feature_metrics
     payload["feature_metric_aggregate"] = feature_aggregate
     _json_dump(payload, output_dir / "ablation_summary.json")
