@@ -1,7 +1,9 @@
 """Run and analyse leave-one-constraint-out experiments for Module C.
 
-Module C is evaluated with the full model, a joint no-Module-C baseline, and
-one run for every individual constraint removed from the generator objective.
+Module C is evaluated with the full model, a joint all-constraints-removed
+baseline, and one run for every individual constraint removed from the
+generator objective. The adversarial translation core remains active in that
+joint baseline, so it must not be described as removing the entire module.
 The script can launch the existing training entrypoint (``--run``), or analyse
 one manifest-backed experiment directory. Analysis reports accuracy, macro
 precision, macro recall and macro F1 at one shared selected epoch, plus
@@ -503,7 +505,7 @@ def _variant_display(variant: str) -> str:
     if variant == "full":
         return "Full Module C"
     if variant == "no_module_c":
-        return "Without Module C"
+        return "All Constraints Removed"
     return "Without " + variant.removeprefix("no_").replace("_", " ").title()
 
 

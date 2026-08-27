@@ -1,0 +1,24 @@
+2026-08-27 11:05:49 | Starting Dual_D standalone training
+2026-08-27 11:05:49 | Run directory: runs\local_weather_tuning_20260827\candidate_full_rain_seed51
+2026-08-27 11:05:49 | Device: cuda
+2026-08-27 11:05:49 | Source train samples: 992
+2026-08-27 11:05:49 | Target train samples: 96
+2026-08-27 11:05:49 | Target val samples: 26
+2026-08-27 11:05:49 | Classes: 14
+2026-08-27 11:05:50 | Data audit: same_dir=False | path_overlap(vis/ir/ais)=0/0/0 | content_overlap(vis/ir/ais)=0/0/0 | ais_index_overlap=0 | stem_mismatch(vis-ir/vis-ais)=117/0
+2026-08-27 11:05:50 | source_train classes: present 14/14 | absent 0 | counts [0:120, 1:44, 2:69, 3:45, 4:40, 5:30, 6:64, 7:80, 8:116, 9:68, 10:57, 11:83, 12:48, 13:128]
+2026-08-27 11:05:50 | target_train classes: present 6/14 | absent 8 | counts [0:7, 2:19, 9:32, 10:12, 11:6, 13:20]
+2026-08-27 11:05:50 | target_val classes: present 6/14 | absent 8 | counts [0:2, 2:5, 9:8, 10:4, 11:2, 13:5]
+2026-08-27 11:05:50 | Paired training classes: 6/14 | class ids [0, 2, 9, 10, 11, 13]
+2026-08-27 11:05:50 | Runtime profile: batch=12 | paired_steps=8 | workers=4 | train_eval_every=5 | raw_eval_every=5 | early_stop=15 after min_epoch=35
+2026-08-27 11:05:50 | VIS/IR pairing: class-level-unpaired | count-mismatch classes train/val: 10/0 | AIS alignment: none | AIS rows train/val: 0/0
+2026-08-27 11:05:50 | Model parameters: total=17277714 | trainable=17120210
+2026-08-27 11:06:21 | Epoch 001/060 | loss 5.3146 | cls 5.3634 | tal -0.1626 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.1354 | train_full 0.2396 | val_acc 0.1923 | val_f1 0.0538 | adv/moduleC 0.00/0.00 | disc_steps 0 | grad(main/disc) 37.431/0.000 | lr(main/disc) 1.20e-04/4.00e-05 | cuda_peak(alloc/resv) 3.11/3.83GB | phase(train/val/raw/train_eval) 13.3/3.5/3.4/10.9s | 31.2s
+2026-08-27 11:06:21 | New best val_f1_macro_present: 0.0538 at epoch 1
+2026-08-27 11:06:30 | Epoch 002/060 | loss 4.0644 | cls 4.1143 | tal -0.1664 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.3333 | train_full n/a | val_acc 0.3077 | val_f1 0.1831 | adv/moduleC 0.00/0.00 | disc_steps 0 | grad(main/disc) 29.621/0.000 | lr(main/disc) 1.20e-04/4.00e-05 | cuda_peak(alloc/resv) 3.11/3.83GB | phase(train/val/raw/train_eval) 2.5/3.1/3.0/0.0s | 8.7s
+2026-08-27 11:06:30 | New best val_f1_macro_present: 0.1831 at epoch 2
+2026-08-27 11:06:36 | Epoch 003/060 | loss 3.6204 | cls 3.6735 | tal -0.1769 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.4271 | train_full n/a | val_acc 0.2308 | val_f1 0.1037 | adv/moduleC 0.00/0.00 | disc_steps 0 | grad(main/disc) 25.982/0.000 | lr(main/disc) 1.20e-04/4.00e-05 | cuda_peak(alloc/resv) 3.11/3.83GB | phase(train/val/raw/train_eval) 2.4/3.2/0.0/0.0s | 5.6s
+2026-08-27 11:06:41 | Epoch 004/060 | loss 3.3143 | cls 3.1193 | tal -0.1750 | dual_g 0.2475 | dual_d 0.0000 | train_acc 0.5521 | train_full n/a | val_acc 0.1923 | val_f1 0.1111 | adv/moduleC 0.00/0.12 | disc_steps 0 | grad(main/disc) 24.555/0.000 | lr(main/disc) 1.20e-04/4.00e-05 | cuda_peak(alloc/resv) 3.11/3.83GB | phase(train/val/raw/train_eval) 2.8/3.1/0.0/0.0s | 5.8s
+2026-08-27 11:07:00 | Epoch 005/060 | loss 3.4058 | cls 2.9957 | tal -0.1581 | dual_g 0.4575 | dual_d 0.0000 | train_acc 0.5938 | train_full 0.3958 | val_acc 0.4231 | val_f1 0.3834 | adv/moduleC 0.00/0.25 | disc_steps 0 | grad(main/disc) 24.163/0.000 | lr(main/disc) 1.20e-04/4.00e-05 | cuda_peak(alloc/resv) 3.11/3.83GB | phase(train/val/raw/train_eval) 2.4/3.0/3.0/9.8s | 18.3s
+2026-08-27 11:07:00 | New best val_f1_macro_present: 0.3834 at epoch 5
+2026-08-27 11:07:06 | Epoch 006/060 | loss 3.1889 | cls 2.5757 | tal -0.0494 | dual_g 0.6280 | dual_d 0.0000 | train_acc 0.6146 | train_full n/a | val_acc 0.4615 | val_f1 0.3815 | adv/moduleC 0.00/0.38 | disc_steps 0 | grad(main/disc) 23.246/0.000 | lr(main/disc) 1.20e-04/4.00e-05 | cuda_peak(alloc/resv) 3.11/3.83GB | phase(train/val/raw/train_eval) 2.6/3.3/0.0/0.0s | 5.9s

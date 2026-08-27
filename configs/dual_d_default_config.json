@@ -3,7 +3,7 @@
   "contrastive_temperature": 0.2,
   "include_reconstruction_fakes": false,
   "detach_contrastive_positives": true,
-  "prototype_momentum": 0.95,
+  "prototype_momentum": 0.90,
   "freeze_classifier_during_feedback": true,
   "loss_weights": {
     "classification": 0.5,
@@ -12,7 +12,7 @@
     "cycle": 0.32,
     "identity": 0.05,
     "contrastive": 0.04,
-    "prototype_contrastive": 0.09
+    "prototype_contrastive": 0.06
   },
   "primary_discriminator": {
     "hidden_dims": [128, 64],
