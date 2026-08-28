@@ -1,0 +1,37 @@
+{
+  "default": {},
+  "profiles": {
+    "雾天": {
+      "batch_size": 92,
+      "num_workers": 16,
+      "min_steps_per_epoch": 4,
+      "augmentation_strength": 0.65,
+      "label_smoothing": 0.12,
+      "classifier_dropout": 0.48,
+      "target_classification_weight": 0.65,
+      "lr_main": 0.00007,
+      "lr_visual": 0.000007,
+      "lr_discriminator": 0.000035,
+      "weight_decay": 0.0009,
+      "lr_patience": 6,
+      "discriminator_update_interval": 2,
+      "adversarial_warmup_epochs": 5,
+      "adversarial_ramp_epochs": 20,
+      "module_c_warmup_epochs": 5,
+      "module_c_ramp_epochs": 10,
+      "monitor_stability_window": 1,
+      "early_stopping_patience": 15,
+      "early_stopping_min_epochs": 48,
+      "early_stopping_min_delta": 0.001,
+      "dual_loss_weights": {
+        "classification": 0.5,
+        "adv_primary": 0.035,
+        "adv_auxiliary": 0.035,
+        "cycle": 0.32,
+        "identity": 0.05,
+        "contrastive": 0.04,
+        "prototype_contrastive": 0.06
+      }
+    }
+  }
+}

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 import os
 from pathlib import Path
 import random
@@ -309,10 +310,26 @@ def build_datasets(args):
     )
 
 
+def _apply_dual_loss_weight_overrides(dual_config, overrides):
+    """Tune active loss weights while preserving ablation-config zeros."""
+
+    dual_loss_weights = dict(overrides or {})
+    for name, value in dual_loss_weights.items():
+        current_value = float(getattr(dual_config.loss_weights, name))
+        # The generated ablation config sets a removed constraint to zero.
+        # Weather tuning may change active weights but must not re-enable it.
+        if current_value != 0.0:
+            setattr(dual_config.loss_weights, name, float(value))
+    return dual_config
+
+
 def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
     """Instantiate all standalone Dual_D model modules."""
 
-    dual_config = load_config(args.dual_config)
+    dual_config = _apply_dual_loss_weight_overrides(
+        load_config(args.dual_config),
+        getattr(args, "dual_loss_weights", {}),
+    )
     use_ais = bool(getattr(args, "use_ais", False))
     num_modalities = 3 if use_ais else 2
     fused_dim = args.proj_dim * num_modalities
@@ -386,6 +403,22 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
                 RuntimeWarning,
             )
     return ModelBundle(net_vis, net_ir, net_ais, tal, dual_adapter, classifier)
+
+
+def _stable_monitor_score(
+    values: List[float], monitor_mode: str, window: int
+) -> float:
+    """Return a higher-is-better score for recent validation stability."""
+
+    if not values:
+        raise ValueError("Validation monitor history must not be empty.")
+    resolved_window = max(int(window), 1)
+    if len(values) < resolved_window:
+        return float("-inf")
+    recent = values[-resolved_window:]
+    if monitor_mode == "min":
+        return -max(recent)
+    return min(recent)
 
 
 def build_optimizers(args, models: ModelBundle):
@@ -1248,12 +1281,14 @@ def run_training(args) -> Dict[str, object]:
     )
     logger.info(
         "Runtime profile: batch=%d | paired_steps=%d | workers=%d | "
-        "train_eval_every=%d | raw_eval_every=%d | early_stop=%d after min_epoch=%d",
+        "train_eval_every=%d | raw_eval_every=%d | stability_window=%d | "
+        "early_stop=%d after min_epoch=%d",
         args.batch_size,
         len(paired_loader),
         args.num_workers,
         max(int(getattr(args, "train_eval_interval", 1)), 1),
         max(int(getattr(args, "raw_eval_interval", 5)), 1),
+        max(int(getattr(args, "monitor_stability_window", 1)), 1),
         int(getattr(args, "early_stopping_patience", 0)),
         int(getattr(args, "early_stopping_min_epochs", 0)),
     )
@@ -1293,6 +1328,19 @@ def run_training(args) -> Dict[str, object]:
     )
 
     models = build_models(args, num_classes, device)
+    args.effective_dual_config = models.dual_adapter.config.to_dict()
+    save_json(
+        {"args": vars(args), "label_map": label_map},
+        _artifact_path(run_dir, "resolved_config.json", args),
+    )
+    save_json(
+        args.effective_dual_config,
+        _artifact_path(run_dir, "resolved_dual_config.json", args),
+    )
+    logger.info(
+        "Effective Dual-D loss weights: %s",
+        json.dumps(args.effective_dual_config["loss_weights"], sort_keys=True),
+    )
     multi_gpu_active = isinstance(models.net_vis, nn.DataParallel)
     if bool(getattr(args, "multi_gpu", False)) and device.type == "cuda":
         logger.info(
@@ -1338,8 +1386,9 @@ def run_training(args) -> Dict[str, object]:
     best_acc_epoch = 0
     best_f1 = -1.0
     best_f1_epoch = 0
-    best_score = float("inf") if monitor_mode == "min" else float("-inf")
+    best_selection_score = float("-inf")
     best_metrics: Dict[str, object] = {}
+    monitor_history: List[float] = []
     start_time = time.time()
     epochs_without_improvement = 0
     epochs_completed = 0
@@ -1380,12 +1429,18 @@ def run_training(args) -> Dict[str, object]:
             "val_loss": float(val_metrics["val_loss"]),
         }
         monitor_value = monitor_values[monitor_metric]
-        min_delta = float(getattr(args, "early_stopping_min_delta", 0.0))
-        would_improve = (
-            monitor_value < best_score - min_delta
-            if monitor_mode == "min"
-            else monitor_value > best_score + min_delta
+        monitor_history.append(monitor_value)
+        monitor_stability_window = max(
+            int(getattr(args, "monitor_stability_window", 1)), 1
         )
+        monitor_stability_window = min(monitor_stability_window, int(args.epochs))
+        monitor_selection_score = _stable_monitor_score(
+            monitor_history,
+            monitor_mode,
+            monitor_stability_window,
+        )
+        min_delta = float(getattr(args, "early_stopping_min_delta", 0.0))
+        would_improve = monitor_selection_score > best_selection_score + min_delta
 
         raw_eval_seconds = 0.0
         if args.eval_feature_mode == "raw":
@@ -1466,6 +1521,8 @@ def run_training(args) -> Dict[str, object]:
                 else None
             ),
             "monitor_value": monitor_value,
+            "monitor_selection_score": monitor_selection_score,
+            "monitor_stability_window": monitor_stability_window,
             "lr_main": optimizer_main.param_groups[-1]["lr"],
             "lr_discriminator": optimizer_disc.param_groups[0]["lr"],
             "lr_discriminator_to_main_ratio": (
@@ -1550,7 +1607,7 @@ def run_training(args) -> Dict[str, object]:
                 )
         improved = would_improve
         if improved:
-            best_score = monitor_value
+            best_selection_score = monitor_selection_score
             epochs_without_improvement = 0
             best_metrics = {
                 "train": train_metrics,
@@ -1559,6 +1616,8 @@ def run_training(args) -> Dict[str, object]:
                 "val_raw": val_raw_metrics,
                 "monitor_metric": monitor_metric,
                 "monitor_value": monitor_value,
+                "monitor_selection_score": monitor_selection_score,
+                "monitor_stability_window": monitor_stability_window,
                 "epoch": epoch,
             }
             if save_checkpoints and last_state is not None:
@@ -1574,9 +1633,10 @@ def run_training(args) -> Dict[str, object]:
                     max_samples=getattr(args, "feature_visualization_samples", 512),
                 )
             logger.info(
-                "New best %s: %.4f at epoch %d",
+                "New best %s: raw=%.4f stable_score=%.4f at epoch %d",
                 monitor_metric,
                 monitor_value,
+                monitor_selection_score,
                 epoch,
             )
         else:
@@ -1606,7 +1666,8 @@ def run_training(args) -> Dict[str, object]:
         "best_f1_macro_present": best_f1,
         "best_f1_epoch": best_f1_epoch,
         "best_monitor_metric": monitor_metric,
-        "best_monitor_value": best_score,
+        "best_monitor_value": best_metrics.get("monitor_value"),
+        "best_monitor_selection_score": best_selection_score,
         "best_metrics": best_metrics,
         "epochs_completed": epochs_completed,
         "early_stopped": early_stopped,
@@ -1616,10 +1677,10 @@ def run_training(args) -> Dict[str, object]:
     summary["result_path"] = str(result_path)
     save_json(summary, result_path)
     logger.info(
-        "Training complete. Best validation accuracy: %.4f | best %s: %.4f",
+        "Training complete. Peak validation accuracy: %.4f | selected %s: %.4f",
         best_acc,
         monitor_metric,
-        best_score,
+        float(best_metrics.get("monitor_value", float("nan"))),
     )
     close_text_logger(logger)
     return summary

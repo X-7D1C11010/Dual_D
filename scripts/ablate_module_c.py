@@ -295,6 +295,16 @@ def _resolved_seed(run_dir: Path, config_path: Path | None = None) -> int | None
 
 
 def _best_row(rows: Sequence[Mapping[str, Any]], metric: str) -> Mapping[str, Any]:
+    stable_candidates = [
+        row
+        for row in rows
+        if _to_float(row.get("monitor_selection_score")) is not None
+    ]
+    if stable_candidates:
+        return max(
+            stable_candidates,
+            key=lambda row: float(row["monitor_selection_score"]),
+        )
     candidates = [row for row in rows if _to_float(row.get(metric)) is not None]
     if not candidates:
         candidates = [row for row in rows if _to_float(row.get("val_acc")) is not None]
@@ -2099,6 +2109,40 @@ def analyse(args: argparse.Namespace) -> Dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     summaries = discover_summaries(Path(args.runs_root), args.analysis_glob, args.monitor_metric)
     validate_manifest(Path(args.runs_root), summaries)
+    reference_roots = [
+        Path(path)
+        for path in getattr(args, "reference_runs_root", [])
+        if str(path).strip()
+    ]
+    for reference_root in reference_roots:
+        if not reference_root.is_dir():
+            raise FileNotFoundError(
+                f"Reference runs directory does not exist: {reference_root}"
+            )
+        summaries.extend(
+            discover_summaries(reference_root, args.analysis_glob, args.monitor_metric)
+        )
+    unique_summaries: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for summary in summaries:
+        key = (str(summary["run_dir"]), str(summary["metrics_path"]))
+        unique_summaries[key] = summary
+    summaries = list(unique_summaries.values())
+    semantic_keys: Dict[tuple[str, str, int | None], Dict[str, Any]] = {}
+    for summary in summaries:
+        semantic_key = (
+            str(summary["variant"]),
+            str(summary["domain"]),
+            summary.get("iteration"),
+        )
+        previous = semantic_keys.get(semantic_key)
+        if previous is not None:
+            raise RuntimeError(
+                "Duplicate primary/reference ablation run key "
+                f"{semantic_key}: {previous['metrics_path']} and "
+                f"{summary['metrics_path']}. Remove the overlapping reference "
+                "or training domain before analysis."
+            )
+        semantic_keys[semantic_key] = summary
     aggregates = aggregate_summaries(summaries)
     _write_csv(summaries, output_dir / "ablation_runs.csv")
     _write_csv(aggregates, output_dir / "ablation_summary.csv")
@@ -2106,6 +2150,7 @@ def analyse(args: argparse.Namespace) -> Dict[str, Any]:
         "monitor_metric": args.monitor_metric,
         "pca_feature_view": bool(args.pca_feature_view),
         "constraints": dict(CONSTRAINTS),
+        "reference_runs_root": [str(path) for path in reference_roots],
         "runs": summaries,
         "aggregate": aggregates,
     }
@@ -2193,6 +2238,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional clean subdirectory name; generated automatically with --run.",
     )
     parser.add_argument("--runs-root", default=str(PROJECT_ROOT / "runs" / "module_c_ablation"))
+    parser.add_argument(
+        "--reference-runs-root",
+        nargs="*",
+        default=[],
+        help=(
+            "Optional completed run directories included only during analysis. "
+            "They are never retrained or modified."
+        ),
+    )
     parser.add_argument("--analysis-output", default="")
     parser.add_argument("--analysis-glob", default="module_c_*")
     parser.add_argument("--monitor-metric", default="val_f1_macro_present")

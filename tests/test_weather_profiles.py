@@ -44,6 +44,37 @@ class WeatherProfileTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_weather_profiles(path)
 
+    def test_dual_loss_weights_are_validated_and_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "profiles.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "雨天": {
+                            "monitor_stability_window": 5,
+                            "dual_loss_weights": {
+                                "classification": 0.65,
+                                "cycle": 0.28,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            profiles = load_weather_profiles(path)
+            args = Namespace(monitor_stability_window=1, dual_loss_weights={})
+            overrides = apply_weather_profile(args, "雨天", profiles)
+            self.assertEqual(args.monitor_stability_window, 5)
+            self.assertEqual(args.dual_loss_weights["classification"], 0.65)
+            self.assertEqual(overrides["dual_loss_weights"]["cycle"], 0.28)
+
+            path.write_text(
+                json.dumps({"雨天": {"dual_loss_weights": {"unknown": 0.1}}}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                load_weather_profiles(path)
+
     def test_missing_profile_uses_default(self) -> None:
         profiles = {"default": {"num_workers": 8}, "profiles": {}}
         args = Namespace(num_workers=0)

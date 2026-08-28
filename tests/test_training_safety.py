@@ -19,11 +19,14 @@ from dual_d.data.multimodal_dataset import PairedImageTransform, SampleRecord
 from dual_d.data.paired_sampler import PairedClassSampler
 from dual_d.losses import class_prototype_contrastive_loss, paired_contrastive_loss
 from dual_d.training.trainer import (
+    _apply_dual_loss_weight_overrides,
     _adversarial_scale,
     _balanced_snapshot_indices,
     _module_c_scale,
+    _stable_monitor_score,
     validate_cuda_architecture,
 )
+from dual_d.config import DualDConfig
 
 
 def _write_image(path: Path, value: int) -> None:
@@ -33,6 +36,22 @@ def _write_image(path: Path, value: int) -> None:
 
 
 class TrainingSafetyTests(unittest.TestCase):
+    def test_stable_monitor_uses_recent_worst_case(self) -> None:
+        values = [0.80, 1.00, 0.96, 1.00, 0.92]
+        self.assertEqual(_stable_monitor_score(values[:2], "max", 3), float("-inf"))
+        self.assertAlmostEqual(_stable_monitor_score(values, "max", 3), 0.92)
+        self.assertAlmostEqual(_stable_monitor_score([0.4, 0.3, 0.5], "min", 3), -0.5)
+
+    def test_weather_dual_weights_do_not_reenable_ablation(self) -> None:
+        config = DualDConfig()
+        config.loss_weights.cycle = 0.0
+        _apply_dual_loss_weight_overrides(
+            config,
+            {"cycle": 0.28, "classification": 0.65},
+        )
+        self.assertEqual(config.loss_weights.cycle, 0.0)
+        self.assertEqual(config.loss_weights.classification, 0.65)
+
     def test_feature_snapshot_selection_is_class_balanced(self) -> None:
         labels = [0] * 20 + [1] * 5 + [2] * 2
         selected = _balanced_snapshot_indices(labels, max_samples=9)

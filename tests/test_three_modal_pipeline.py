@@ -414,6 +414,7 @@ class ThreeModalPipelineTests(unittest.TestCase):
             self.assertIsNone(checkpoint["net_ais"])
             self.assertNotIn("U_matrices.2", checkpoint["tal"])
             self.assertEqual(checkpoint["classifier"]["fc.0.weight"].shape[1], 4)
+            self.assertTrue((run_dir / "resolved_dual_config.json").is_file())
             with np.load(run_dir / "feature_embeddings.npz") as features:
                 self.assertTrue(
                     {

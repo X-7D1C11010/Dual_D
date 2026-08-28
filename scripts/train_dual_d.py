@@ -73,6 +73,8 @@ WEATHER_PROFILE_KEYS = frozenset(
         "adversarial_ramp_epochs",
         "module_c_warmup_epochs",
         "module_c_ramp_epochs",
+        "monitor_stability_window",
+        "dual_loss_weights",
         "early_stopping_patience",
         "early_stopping_min_epochs",
         "early_stopping_min_delta",
@@ -126,7 +128,36 @@ def load_weather_profiles(path: str | Path | None) -> Dict[str, Dict[str, Any]]:
             raise ValueError(
                 f"Weather profile '{name}' contains unsupported keys: {', '.join(unknown)}"
             )
-        return dict(values)
+        validated_values = dict(values)
+        dual_loss_weights = validated_values.get("dual_loss_weights")
+        if dual_loss_weights is not None:
+            if not isinstance(dual_loss_weights, dict):
+                raise ValueError(
+                    f"Weather profile '{name}' value 'dual_loss_weights' must be an object."
+                )
+            valid_loss_names = {
+                "classification",
+                "adv_primary",
+                "adv_auxiliary",
+                "cycle",
+                "identity",
+                "contrastive",
+                "prototype_contrastive",
+            }
+            unknown_losses = sorted(set(dual_loss_weights) - valid_loss_names)
+            if unknown_losses:
+                raise ValueError(
+                    f"Weather profile '{name}' contains unsupported Dual-D loss weights: "
+                    + ", ".join(unknown_losses)
+                )
+            for loss_name, weight in dual_loss_weights.items():
+                if not isinstance(weight, (int, float)) or weight < 0.0:
+                    raise ValueError(
+                        f"Weather profile '{name}' Dual-D weight '{loss_name}' "
+                        "must be non-negative."
+                    )
+            validated_values["dual_loss_weights"] = dict(dual_loss_weights)
+        return validated_values
 
     validated = {"default": validate("default", default), "profiles": {}}
     for name, values in profiles.items():
@@ -149,6 +180,7 @@ def apply_weather_profile(
         "min_steps_per_epoch",
         "lr_patience",
         "discriminator_update_interval",
+        "monitor_stability_window",
     }
     nonnegative_ints = {
         "adversarial_warmup_epochs",
@@ -468,6 +500,16 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         help="Metric used by both LR schedulers, checkpointing, and early stopping.",
     )
     parser.add_argument(
+        "--monitor-stability-window",
+        type=int,
+        default=default("monitor_stability_window", 1),
+        help=(
+            "Select checkpoints by the worst monitored value over the latest N "
+            "epochs. N=1 retains ordinary peak selection; larger windows reduce "
+            "single-epoch optimism on very small validation sets."
+        ),
+    )
+    parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=default("early_stopping_patience", 10),
@@ -588,6 +630,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--early-stopping-patience must be non-negative.")
     if args.early_stopping_min_epochs < 0:
         parser.error("--early-stopping-min-epochs must be non-negative.")
+    if args.monitor_stability_window <= 0:
+        parser.error("--monitor-stability-window must be positive.")
     if args.feature_visualization_samples <= 0:
         parser.error("--feature-visualization-samples must be positive.")
     return args

@@ -7,12 +7,15 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from argparse import Namespace
+from unittest import mock
 
 import numpy as np
 
 from scripts.ablate_module_c import (
     CONSTRAINTS,
     VARIANTS,
+    analyse,
     aggregate_summaries,
     discover_summaries,
     make_variant_config,
@@ -46,9 +49,11 @@ class ModuleCAblationTests(unittest.TestCase):
         args = build_all_experiments_parser().parse_args(
             ["--source-root", "/data/clear", "--target-parent-root", "/data"]
         )
+        self.assertEqual(args.target_domains, ["黑天", "逆光", "雨天"])
         command = build_ablation_command(args)
         self.assertEqual(command.count("--run"), 1)
         self.assertIn("--no-pca-feature-view", command)
+        self.assertIn("--reference-runs-root", command)
         variant_start = command.index("--variants") + 1
         variant_end = command.index("--iterations")
         self.assertEqual(command[variant_start:variant_end], EXPERIMENT_VARIANTS)
@@ -298,6 +303,106 @@ class ModuleCAblationTests(unittest.TestCase):
             self.assertEqual(sorted(row["iteration"] for row in summaries), [1, 2])
             self.assertTrue(all(row["domain"] == "雨天" for row in summaries))
             self.assertTrue(all("metrics_iter" in row["metrics_path"] for row in summaries))
+
+    def test_analysis_merges_63_new_runs_with_21_frozen_fog_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            primary_root = root / "primary"
+            reference_root = root / "reference"
+            output_root = root / "analysis"
+            primary_root.mkdir()
+            reference_root.mkdir()
+
+            def write_grouped_runs(
+                runs_root: Path,
+                domains: list[str],
+                include_required_artifacts: bool,
+            ) -> None:
+                for variant in VARIANTS:
+                    for domain in domains:
+                        run_dir = runs_root / f"module_c_{variant}_{domain}_test"
+                        run_dir.mkdir()
+                        for iteration in range(1, 4):
+                            suffix = f"iter{iteration:02d}"
+                            with (run_dir / f"metrics_{suffix}.csv").open(
+                                "w", encoding="utf-8", newline=""
+                            ) as handle:
+                                writer = csv.DictWriter(
+                                    handle,
+                                    fieldnames=[
+                                        "epoch",
+                                        "val_acc",
+                                        "val_precision_macro_present",
+                                        "val_recall_macro_present",
+                                        "val_f1_macro_present",
+                                        "train_full_acc",
+                                    ],
+                                )
+                                writer.writeheader()
+                                writer.writerow(
+                                    {
+                                        "epoch": 1,
+                                        "val_acc": 0.9,
+                                        "val_precision_macro_present": 0.9,
+                                        "val_recall_macro_present": 0.9,
+                                        "val_f1_macro_present": 0.9,
+                                        "train_full_acc": 0.92,
+                                    }
+                                )
+                            if include_required_artifacts:
+                                (run_dir / f"feature_embeddings_{suffix}.npz").write_bytes(
+                                    b"test"
+                                )
+                                (run_dir / f"result_summary_{suffix}.json").write_text(
+                                    "{}", encoding="utf-8"
+                                )
+
+            primary_domains = ["黑天", "逆光", "雨天"]
+            write_grouped_runs(primary_root, primary_domains, True)
+            write_grouped_runs(reference_root, ["雾天"], False)
+            (primary_root / "experiment_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "variants": VARIANTS,
+                        "domains": primary_domains,
+                        "iterations": 3,
+                        "expected_runs": 63,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = Namespace(
+                runs_root=str(primary_root),
+                analysis_output=str(output_root),
+                analysis_glob="module_c_*",
+                monitor_metric="val_f1_macro_present",
+                pca_feature_view=False,
+                reference_runs_root=[str(reference_root), str(reference_root)],
+            )
+            with (
+                mock.patch(
+                    "scripts.ablate_module_c._load_matplotlib",
+                    side_effect=ImportError("test without matplotlib"),
+                ),
+                mock.patch("scripts.ablate_module_c._plot_overview_svg"),
+                mock.patch("scripts.ablate_module_c._plot_effect_heatmap_svg"),
+                mock.patch("scripts.ablate_module_c._plot_constraint_diagnostic_svg"),
+                mock.patch("scripts.ablate_module_c._write_html_report"),
+            ):
+                payload = analyse(args)
+
+            self.assertEqual(len(payload["runs"]), 84)
+            self.assertEqual(len(payload["aggregate"]), 28)
+            self.assertEqual(
+                sum(row["domain"] == "雾天" for row in payload["runs"]), 21
+            )
+            self.assertEqual(
+                sum(row["runs"] for row in payload["aggregate"]), 84
+            )
+            with (output_root / "ablation_runs.csv").open(
+                "r", encoding="utf-8", newline=""
+            ) as handle:
+                self.assertEqual(len(list(csv.DictReader(handle))), 84)
 
 
 if __name__ == "__main__":

@@ -62,6 +62,7 @@
   "module_c_warmup_epochs": 5,
   "module_c_ramp_epochs": 10,
   "monitor_metric": "val_f1_macro_present",
+  "monitor_stability_window": 1,
   "early_stopping_patience": 15,
   "early_stopping_min_epochs": 36,
   "early_stopping_min_delta": 0.001,
