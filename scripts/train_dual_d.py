@@ -60,8 +60,11 @@ WEATHER_PROFILE_KEYS = frozenset(
         "num_workers",
         "min_steps_per_epoch",
         "augmentation_strength",
+        "vis_augmentation_strength",
+        "ir_augmentation_strength",
         "label_smoothing",
         "classifier_dropout",
+        "freeze_frozen_batch_norm_stats",
         "target_classification_weight",
         "lr_main",
         "lr_visual",
@@ -222,8 +225,12 @@ def apply_weather_profile(
         "early_stopping_patience",
         "early_stopping_min_epochs",
     }
-    bounded_floats = {
+    unit_floats = {
         "augmentation_strength",
+        "vis_augmentation_strength",
+        "ir_augmentation_strength",
+    }
+    probability_floats = {
         "label_smoothing",
         "classifier_dropout",
     }
@@ -235,6 +242,7 @@ def apply_weather_profile(
         "weight_decay",
         "early_stopping_min_delta",
     }
+    boolean_keys = {"freeze_frozen_batch_norm_stats"}
     for key in positive_ints:
         if key in overrides and (
             not isinstance(overrides[key], int) or overrides[key] <= 0
@@ -245,7 +253,13 @@ def apply_weather_profile(
             not isinstance(overrides[key], int) or overrides[key] < 0
         ):
             raise ValueError(f"Weather profile value '{key}' must be a non-negative integer.")
-    for key in bounded_floats:
+    for key in unit_floats:
+        if key in overrides and (
+            not isinstance(overrides[key], (int, float))
+            or not 0.0 <= overrides[key] <= 1.0
+        ):
+            raise ValueError(f"Weather profile value '{key}' must be in [0, 1].")
+    for key in probability_floats:
         if key in overrides and (
             not isinstance(overrides[key], (int, float))
             or not 0.0 <= overrides[key] < 1.0
@@ -256,6 +270,9 @@ def apply_weather_profile(
             not isinstance(overrides[key], (int, float)) or overrides[key] < 0.0
         ):
             raise ValueError(f"Weather profile value '{key}' must be non-negative.")
+    for key in boolean_keys:
+        if key in overrides and not isinstance(overrides[key], bool):
+            raise ValueError(f"Weather profile value '{key}' must be boolean.")
     for key, value in overrides.items():
         setattr(args, key, value)
     args.weather_profile_name = str(domain) if overrides else "default"
@@ -437,6 +454,24 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         help="Modality-specific photometric jitter strength in [0, 1].",
     )
     parser.add_argument(
+        "--vis-augmentation-strength",
+        type=float,
+        default=default("vis_augmentation_strength", None),
+        help=(
+            "Optional visible-light jitter strength in [0, 1]. When omitted, "
+            "--augmentation-strength is used."
+        ),
+    )
+    parser.add_argument(
+        "--ir-augmentation-strength",
+        type=float,
+        default=default("ir_augmentation_strength", None),
+        help=(
+            "Optional infrared jitter strength in [0, 1]. When omitted, "
+            "--augmentation-strength is used."
+        ),
+    )
+    parser.add_argument(
         "--synchronize-modalities",
         action=argparse.BooleanOptionalAction,
         default=default("synchronize_modalities", False),
@@ -456,6 +491,15 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=default("freeze_visual_backbone", True),
         help="Freeze early visual backbone blocks and train late blocks/projection.",
+    )
+    parser.add_argument(
+        "--freeze-frozen-batch-norm-stats",
+        action=argparse.BooleanOptionalAction,
+        default=default("freeze_frozen_batch_norm_stats", False),
+        help=(
+            "Keep running statistics fixed in BatchNorm layers whose affine "
+            "parameters are frozen."
+        ),
     )
     parser.add_argument(
         "--val-augment",
@@ -662,6 +706,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--target-classification-weight must be non-negative.")
     if not 0.0 <= args.augmentation_strength <= 1.0:
         parser.error("--augmentation-strength must be in [0, 1].")
+    if (
+        args.vis_augmentation_strength is not None
+        and not 0.0 <= args.vis_augmentation_strength <= 1.0
+    ):
+        parser.error("--vis-augmentation-strength must be in [0, 1].")
+    if (
+        args.ir_augmentation_strength is not None
+        and not 0.0 <= args.ir_augmentation_strength <= 1.0
+    ):
+        parser.error("--ir-augmentation-strength must be in [0, 1].")
     if args.train_eval_interval <= 0:
         parser.error("--train-eval-interval must be positive.")
     if args.raw_eval_interval <= 0:

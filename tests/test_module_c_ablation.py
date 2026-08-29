@@ -51,6 +51,11 @@ class ModuleCAblationTests(unittest.TestCase):
             ["--source-root", "/data/clear", "--target-parent-root", "/data"]
         )
         self.assertEqual(args.target_domains, ["黑天", "逆光", "雨天"])
+        self.assertTrue(
+            str(args.weather_profile_config).endswith(
+                "module_c_weather_profiles_v9.json"
+            )
+        )
         command = build_ablation_command(args)
         self.assertEqual(command.count("--run"), 1)
         self.assertIn("--no-pca-feature-view", command)
@@ -94,6 +99,31 @@ class ModuleCAblationTests(unittest.TestCase):
         ):
             self.assertEqual(no_module_c[key], 0.0)
 
+    def test_variants_preserve_architecture_and_non_loss_settings(self) -> None:
+        base = {
+            "feature_dim": 384,
+            "contrastive_temperature": 0.2,
+            "generator": {"hidden_dim": 192, "num_layers": 2},
+            "primary_discriminator": {"hidden_dims": [128, 64]},
+            "auxiliary_discriminator": {"hidden_dims": [128, 64]},
+            "loss_weights": {
+                "classification": 0.65,
+                "adv_primary": 0.025,
+                "adv_auxiliary": 0.025,
+                "cycle": 0.12,
+                "identity": 0.03,
+                "contrastive": 0.04,
+                "prototype_contrastive": 0.06,
+            },
+        }
+        expected_non_loss = {key: value for key, value in base.items() if key != "loss_weights"}
+        for variant in VARIANTS:
+            candidate = make_variant_config(base, variant)
+            actual_non_loss = {
+                key: value for key, value in candidate.items() if key != "loss_weights"
+            }
+            self.assertEqual(actual_non_loss, expected_non_loss)
+
     def test_summary_uses_best_epoch_and_aggregates_repetitions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -127,6 +157,80 @@ class ModuleCAblationTests(unittest.TestCase):
             self.assertAlmostEqual(aggregate[0]["best_val_precision_mean"], 0.78)
             self.assertAlmostEqual(aggregate[0]["best_val_recall_mean"], 0.79)
             self.assertAlmostEqual(aggregate[0]["best_val_f1_std"], 0.0707106781)
+
+    def test_summary_respects_trainer_selected_epoch_with_min_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir = root / "module_c_full_黑天_test"
+            run_dir.mkdir()
+            with (run_dir / "metrics_iter01.csv").open(
+                "w", encoding="utf-8", newline=""
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "epoch",
+                        "monitor_selection_score",
+                        "val_acc",
+                        "val_precision_macro_present",
+                        "val_recall_macro_present",
+                        "val_f1_macro_present",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "epoch": 40,
+                        "monitor_selection_score": 0.962567,
+                        "val_acc": 0.95,
+                        "val_precision_macro_present": 0.96,
+                        "val_recall_macro_present": 0.96,
+                        "val_f1_macro_present": 0.962567,
+                    }
+                )
+                writer.writerow(
+                    {
+                        "epoch": 46,
+                        "monitor_selection_score": 0.963426,
+                        "val_acc": 0.96,
+                        "val_precision_macro_present": 0.97,
+                        "val_recall_macro_present": 0.97,
+                        "val_f1_macro_present": 0.963426,
+                    }
+                )
+            (run_dir / "result_summary_iter01.json").write_text(
+                json.dumps({"best_metrics": {"epoch": 40}}), encoding="utf-8"
+            )
+
+            summaries = discover_summaries(root, "module_c_*", "val_f1_macro_present")
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(summaries[0]["best_epoch"], 40)
+            self.assertAlmostEqual(summaries[0]["best_val_f1"], 0.962567)
+
+    def test_grouped_partial_iteration_is_not_aggregated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir = root / "module_c_full_逆光_test"
+            run_dir.mkdir()
+            for iteration in (1, 2):
+                with (run_dir / f"metrics_iter{iteration:02d}.csv").open(
+                    "w", encoding="utf-8", newline=""
+                ) as handle:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=["epoch", "val_acc", "val_f1_macro_present"],
+                    )
+                    writer.writeheader()
+                    writer.writerow(
+                        {"epoch": 1, "val_acc": 0.9, "val_f1_macro_present": 0.9}
+                    )
+            (run_dir / "result_summary_iter01.json").write_text(
+                json.dumps({"best_metrics": {"epoch": 1}}), encoding="utf-8"
+            )
+
+            summaries = discover_summaries(root, "module_c_*", "val_f1_macro_present")
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(summaries[0]["iteration"], 1)
 
     def test_feature_plot_is_isolated_to_one_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

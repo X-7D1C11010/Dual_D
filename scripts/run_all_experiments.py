@@ -18,7 +18,7 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "train_dual_d_default.json"
 DEFAULT_DUAL_CONFIG = PROJECT_ROOT / "configs" / "dual_d_default_config.json"
-DEFAULT_PROFILE_CONFIG = PROJECT_ROOT / "configs" / "module_c_weather_profiles_v8.json"
+DEFAULT_PROFILE_CONFIG = PROJECT_ROOT / "configs" / "module_c_weather_profiles_v9.json"
 EXPERIMENT_VARIANTS = [
     "full",
     "no_cycle",

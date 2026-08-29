@@ -12,6 +12,26 @@ from scripts.train_dual_d import apply_weather_profile, load_weather_profiles
 
 
 class WeatherProfileTests(unittest.TestCase):
+    def test_v9_profiles_match_target_epoch_sizes(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        profiles = load_weather_profiles(
+            project_root / "configs" / "module_c_weather_profiles_v9.json"
+        )
+        expected = {
+            "黑天": (16, 30, 0.55, 0.35),
+            "逆光": (16, 9, 0.70, 0.40),
+            "雨天": (16, 6, 0.60, 0.40),
+        }
+        for domain, (batch_size, steps, visible, infrared) in expected.items():
+            args = Namespace(dual_loss_weights={})
+            apply_weather_profile(args, domain, profiles)
+            self.assertEqual(args.batch_size, batch_size)
+            self.assertEqual(args.min_steps_per_epoch, steps)
+            self.assertEqual(args.vis_augmentation_strength, visible)
+            self.assertEqual(args.ir_augmentation_strength, infrared)
+            self.assertTrue(args.freeze_frozen_batch_norm_stats)
+            self.assertEqual(args.monitor_stability_window, 3)
+
     def test_separate_profile_files_are_loaded_relative_to_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -76,6 +96,9 @@ class WeatherProfileTests(unittest.TestCase):
                     {
                         "雨天": {
                             "monitor_stability_window": 5,
+                            "vis_augmentation_strength": 0.75,
+                            "ir_augmentation_strength": 0.40,
+                            "freeze_frozen_batch_norm_stats": True,
                             "dual_loss_weights": {
                                 "classification": 0.65,
                                 "cycle": 0.28,
@@ -91,6 +114,9 @@ class WeatherProfileTests(unittest.TestCase):
             self.assertEqual(args.monitor_stability_window, 5)
             self.assertEqual(args.dual_loss_weights["classification"], 0.65)
             self.assertEqual(overrides["dual_loss_weights"]["cycle"], 0.28)
+            self.assertEqual(args.vis_augmentation_strength, 0.75)
+            self.assertEqual(args.ir_augmentation_strength, 0.40)
+            self.assertTrue(args.freeze_frozen_batch_norm_stats)
 
             path.write_text(
                 json.dumps({"雨天": {"dual_loss_weights": {"unknown": 0.1}}}),

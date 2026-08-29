@@ -24,6 +24,7 @@ from dual_d.training.trainer import (
     _balanced_snapshot_indices,
     _lr_scheduler_is_active,
     _module_c_scale,
+    _set_frozen_batch_norm_eval,
     _stable_monitor_score,
     validate_cuda_architecture,
 )
@@ -37,6 +38,23 @@ def _write_image(path: Path, value: int) -> None:
 
 
 class TrainingSafetyTests(unittest.TestCase):
+    def test_frozen_batch_norm_keeps_running_statistics_fixed(self) -> None:
+        frozen = torch.nn.BatchNorm1d(4)
+        trainable = torch.nn.BatchNorm1d(4)
+        for parameter in frozen.parameters():
+            parameter.requires_grad = False
+        module = torch.nn.Sequential(frozen, trainable)
+        module.train()
+
+        self.assertEqual(_set_frozen_batch_norm_eval(module), 1)
+        self.assertFalse(frozen.training)
+        self.assertTrue(trainable.training)
+
+        frozen_mean = frozen.running_mean.clone()
+        module(torch.randn(8, 4))
+        self.assertTrue(torch.equal(frozen.running_mean, frozen_mean))
+        self.assertFalse(torch.equal(trainable.running_mean, torch.zeros(4)))
+
     def test_lr_scheduler_can_be_gated_until_warmups_are_active(self) -> None:
         args = SimpleNamespace(lr_scheduler_start_epoch=24)
         self.assertFalse(_lr_scheduler_is_active(args, 23))
@@ -143,6 +161,28 @@ class TrainingSafetyTests(unittest.TestCase):
         vis_denormalized += torch.tensor([0.485, 0.456, 0.406])[:, None, None]
         ir_denormalized = ir * 0.5 + 0.5
         self.assertTrue(torch.allclose(vis_denormalized, ir_denormalized, atol=1e-6))
+
+    def test_paired_transform_supports_independent_modality_strengths(self) -> None:
+        transform = PairedImageTransform(
+            True,
+            image_size=10,
+            resize_size=16,
+            augmentation_strength=0.5,
+            vis_augmentation_strength=0.7,
+            ir_augmentation_strength=0.2,
+        )
+        self.assertEqual(transform.augmentation_strength, 0.5)
+        self.assertEqual(transform.vis_augmentation_strength, 0.7)
+        self.assertEqual(transform.ir_augmentation_strength, 0.2)
+
+        fallback = PairedImageTransform(
+            True,
+            image_size=10,
+            resize_size=16,
+            augmentation_strength=0.4,
+        )
+        self.assertEqual(fallback.vis_augmentation_strength, 0.4)
+        self.assertEqual(fallback.ir_augmentation_strength, 0.4)
 
     def test_content_audit_detects_cross_split_duplicate(self) -> None:
         with TemporaryDirectory() as directory:

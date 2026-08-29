@@ -28,6 +28,7 @@ import warnings
 import numpy as np
 import torch
 from torch import nn
+from torch.nn.modules.batchnorm import _BatchNorm
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Subset
@@ -155,6 +156,20 @@ def configure_visual_trainability(
             parameter.requires_grad = True
 
 
+def _set_frozen_batch_norm_eval(module: nn.Module) -> int:
+    """Keep BatchNorm state fixed when all of that layer's parameters are frozen."""
+
+    frozen_count = 0
+    for child in module.modules():
+        if not isinstance(child, _BatchNorm):
+            continue
+        parameters = list(child.parameters(recurse=False))
+        if parameters and not any(parameter.requires_grad for parameter in parameters):
+            child.eval()
+            frozen_count += 1
+    return frozen_count
+
+
 def _probe_data_parallel(
     device: torch.device,
     device_ids: list[int],
@@ -212,6 +227,8 @@ def build_datasets(args):
         image_size=args.image_size,
         resize_size=args.resize_size,
         augmentation_strength=getattr(args, "augmentation_strength", 0.0),
+        vis_augmentation_strength=getattr(args, "vis_augmentation_strength", None),
+        ir_augmentation_strength=getattr(args, "ir_augmentation_strength", None),
         synchronize_modalities=getattr(args, "synchronize_modalities", False),
     )
     label_map = source_train.get_label_map()
@@ -255,6 +272,8 @@ def build_datasets(args):
         image_size=args.image_size,
         resize_size=args.resize_size,
         augmentation_strength=getattr(args, "augmentation_strength", 0.0),
+        vis_augmentation_strength=getattr(args, "vis_augmentation_strength", None),
+        ir_augmentation_strength=getattr(args, "ir_augmentation_strength", None),
         synchronize_modalities=getattr(args, "synchronize_modalities", False),
     )
     target_val = MultiModalDomainDataset(
@@ -276,6 +295,8 @@ def build_datasets(args):
         resize_size=args.resize_size,
         val_augment=args.val_augment,
         augmentation_strength=getattr(args, "augmentation_strength", 0.0),
+        vis_augmentation_strength=getattr(args, "vis_augmentation_strength", None),
+        ir_augmentation_strength=getattr(args, "ir_augmentation_strength", None),
         synchronize_modalities=getattr(args, "synchronize_modalities", False),
     )
     target_train_eval = MultiModalDomainDataset(
@@ -613,6 +634,8 @@ def train_one_epoch(
     """Train all Dual_D components for one epoch."""
 
     models.net_vis.train()
+    if bool(getattr(args, "freeze_frozen_batch_norm_stats", False)):
+        _set_frozen_batch_norm_eval(models.net_vis)
     models.net_ir.train()
     if models.net_ais is not None:
         models.net_ais.train()
@@ -1299,6 +1322,17 @@ def run_training(args) -> Dict[str, object]:
         max(int(getattr(args, "lr_scheduler_start_epoch", 1)), 1),
         int(getattr(args, "early_stopping_patience", 0)),
         int(getattr(args, "early_stopping_min_epochs", 0)),
+    )
+    base_augmentation = float(getattr(args, "augmentation_strength", 0.0))
+    visible_augmentation = getattr(args, "vis_augmentation_strength", None)
+    infrared_augmentation = getattr(args, "ir_augmentation_strength", None)
+    logger.info(
+        "Augmentation profile: base=%.3f | visible=%.3f | infrared=%.3f | "
+        "freeze_frozen_batch_norm_stats=%s",
+        base_augmentation,
+        base_augmentation if visible_augmentation is None else float(visible_augmentation),
+        base_augmentation if infrared_augmentation is None else float(infrared_augmentation),
+        bool(getattr(args, "freeze_frozen_batch_norm_stats", False)),
     )
     logger.info(
         "VIS/IR pairing: %s | count-mismatch classes train/val: %d/%d | "

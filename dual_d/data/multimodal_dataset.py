@@ -103,21 +103,46 @@ class PairedImageTransform:
         image_size: int,
         resize_size: int,
         augmentation_strength: float = 0.0,
+        vis_augmentation_strength: float | None = None,
+        ir_augmentation_strength: float | None = None,
     ):
         self.train_like = bool(train_like)
         self.image_size = int(image_size)
         self.resize_size = int(resize_size)
         self.augmentation_strength = max(0.0, min(float(augmentation_strength), 1.0))
-        strength = self.augmentation_strength
+        self.vis_augmentation_strength = max(
+            0.0,
+            min(
+                float(
+                    self.augmentation_strength
+                    if vis_augmentation_strength is None
+                    else vis_augmentation_strength
+                ),
+                1.0,
+            ),
+        )
+        self.ir_augmentation_strength = max(
+            0.0,
+            min(
+                float(
+                    self.augmentation_strength
+                    if ir_augmentation_strength is None
+                    else ir_augmentation_strength
+                ),
+                1.0,
+            ),
+        )
+        vis_strength = self.vis_augmentation_strength
+        ir_strength = self.ir_augmentation_strength
         self.vis_jitter = transforms.ColorJitter(
-            brightness=0.25 * strength,
-            contrast=0.25 * strength,
-            saturation=0.15 * strength,
-            hue=0.05 * strength,
+            brightness=0.25 * vis_strength,
+            contrast=0.25 * vis_strength,
+            saturation=0.15 * vis_strength,
+            hue=0.05 * vis_strength,
         )
         self.ir_jitter = transforms.ColorJitter(
-            brightness=0.15 * strength,
-            contrast=0.15 * strength,
+            brightness=0.15 * ir_strength,
+            contrast=0.15 * ir_strength,
         )
 
     def __call__(self, vis_img: Image.Image, ir_img: Image.Image):
@@ -136,8 +161,9 @@ class PairedImageTransform:
             if bool(torch.rand(()) < 0.5):
                 vis_img = transform_functional.hflip(vis_img)
                 ir_img = transform_functional.hflip(ir_img)
-            if self.augmentation_strength > 0:
+            if self.vis_augmentation_strength > 0:
                 vis_img = self.vis_jitter(vis_img)
+            if self.ir_augmentation_strength > 0:
                 ir_img = self.ir_jitter(ir_img)
         else:
             output_size = [self.image_size, self.image_size]
@@ -188,8 +214,9 @@ class IndependentImageTransform(PairedImageTransform):
                 vis_img = transform_functional.hflip(vis_img)
             if bool(torch.rand(()) < 0.5):
                 ir_img = transform_functional.hflip(ir_img)
-            if self.augmentation_strength > 0:
+            if self.vis_augmentation_strength > 0:
                 vis_img = self.vis_jitter(vis_img)
+            if self.ir_augmentation_strength > 0:
                 ir_img = self.ir_jitter(ir_img)
         else:
             output_size = [self.image_size, self.image_size]
@@ -218,6 +245,8 @@ def build_transforms(
     val_augment: bool = False,
     train_augment: bool = True,
     augmentation_strength: float = 0.0,
+    vis_augmentation_strength: float | None = None,
+    ir_augmentation_strength: float | None = None,
     synchronize_modalities: bool = False,
 ):
     """Build visible and infrared transforms.
@@ -240,6 +269,8 @@ def build_transforms(
         image_size,
         resize_size,
         augmentation_strength=augmentation_strength,
+        vis_augmentation_strength=vis_augmentation_strength,
+        ir_augmentation_strength=ir_augmentation_strength,
     )
 
 
@@ -294,6 +325,8 @@ class MultiModalDomainDataset(Dataset):
         val_augment: bool = False,
         train_augment: bool = True,
         augmentation_strength: float = 0.0,
+        vis_augmentation_strength: float | None = None,
+        ir_augmentation_strength: float | None = None,
         synchronize_modalities: bool = False,
     ):
         super().__init__()
@@ -395,6 +428,8 @@ class MultiModalDomainDataset(Dataset):
             val_augment,
             train_augment,
             augmentation_strength,
+            vis_augmentation_strength,
+            ir_augmentation_strength,
             synchronize_modalities=synchronize_modalities,
         )
 

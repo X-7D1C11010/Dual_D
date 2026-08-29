@@ -322,10 +322,46 @@ def _summarize_run(
     metrics_path = metrics_path or run_dir / "metrics.csv"
     if not metrics_path.exists():
         return None
+    artifact_suffix = (
+        metrics_path.stem.removeprefix("metrics_")
+        if metrics_path.stem.startswith("metrics_")
+        else ""
+    )
+    result_path = run_dir / (
+        f"result_summary_{artifact_suffix}.json"
+        if artifact_suffix
+        else "result_summary.json"
+    )
+    if (
+        artifact_suffix
+        and not result_path.exists()
+        and any(run_dir.glob("result_summary_iter*.json"))
+    ):
+        # A grouped directory with other completed summaries but no matching
+        # summary is an interrupted iteration, not a result to aggregate.
+        return None
     rows = _read_rows(metrics_path)
     if not rows:
         return None
     best = _best_row(rows, monitor_metric)
+    if result_path.exists():
+        try:
+            result_payload = _json_load(result_path)
+            selected_epoch = _to_float(
+                result_payload.get("best_metrics", {}).get("epoch")
+            )
+            selected_rows = [
+                row
+                for row in rows
+                if selected_epoch is not None
+                and _to_float(row.get("epoch")) == selected_epoch
+            ]
+            if selected_rows:
+                # Respect the checkpoint selection made by the trainer,
+                # including stability windows and early_stopping_min_delta.
+                best = selected_rows[-1]
+        except (OSError, AttributeError, json.JSONDecodeError):
+            pass
     val_acc = _to_float(best.get("val_acc"))
     val_precision = _to_float(best.get("val_precision_macro_present"))
     val_recall = _to_float(best.get("val_recall_macro_present"))
@@ -339,8 +375,8 @@ def _summarize_run(
         "iteration": _infer_iteration(run_dir, metrics_path.name),
         "seed": _resolved_seed(
             run_dir,
-            run_dir / f"resolved_config_{metrics_path.stem.removeprefix('metrics_')}.json"
-            if metrics_path.stem.startswith("metrics_")
+            run_dir / f"resolved_config_{artifact_suffix}.json"
+            if artifact_suffix
             else None,
         ),
         "metrics_path": str(metrics_path),
@@ -357,28 +393,21 @@ def _summarize_run(
         "feature_embeddings": str(
             run_dir
             / (
-                f"feature_embeddings_{metrics_path.stem.removeprefix('metrics_')}.npz"
-                if metrics_path.stem.startswith("metrics_")
+                f"feature_embeddings_{artifact_suffix}.npz"
+                if artifact_suffix
                 else "feature_embeddings.npz"
             )
         )
         if (
             run_dir
             / (
-                f"feature_embeddings_{metrics_path.stem.removeprefix('metrics_')}.npz"
-                if metrics_path.stem.startswith("metrics_")
+                f"feature_embeddings_{artifact_suffix}.npz"
+                if artifact_suffix
                 else "feature_embeddings.npz"
             )
         ).exists()
         else None,
-        "result_path": str(
-            run_dir
-            / (
-                f"result_summary_{metrics_path.stem.removeprefix('metrics_')}.json"
-                if metrics_path.stem.startswith("metrics_")
-                else "result_summary.json"
-            )
-        ),
+        "result_path": str(result_path),
     }
     for metric in set(LOSS_METRIC.values()) | {
         "train_dual_d_adv_primary",
