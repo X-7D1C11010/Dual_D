@@ -22,6 +22,7 @@ from dual_d.training.trainer import (
     _apply_dual_loss_weight_overrides,
     _adversarial_scale,
     _balanced_snapshot_indices,
+    _lr_scheduler_is_active,
     _module_c_scale,
     _stable_monitor_score,
     validate_cuda_architecture,
@@ -36,6 +37,12 @@ def _write_image(path: Path, value: int) -> None:
 
 
 class TrainingSafetyTests(unittest.TestCase):
+    def test_lr_scheduler_can_be_gated_until_warmups_are_active(self) -> None:
+        args = SimpleNamespace(lr_scheduler_start_epoch=24)
+        self.assertFalse(_lr_scheduler_is_active(args, 23))
+        self.assertTrue(_lr_scheduler_is_active(args, 24))
+        self.assertTrue(_lr_scheduler_is_active(SimpleNamespace(), 1))
+
     def test_stable_monitor_uses_recent_worst_case(self) -> None:
         values = [0.80, 1.00, 0.96, 1.00, 0.92]
         self.assertEqual(_stable_monitor_score(values[:2], "max", 3), float("-inf"))

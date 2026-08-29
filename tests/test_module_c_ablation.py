@@ -22,6 +22,7 @@ from scripts.ablate_module_c import (
     _load_matplotlib,
     _plot_constraint_feature_evidence,
     _plot_feature_diagnostics,
+    _plot_constraint_feature_tsne,
     _plot_prototype_alignment_by_domain,
 )
 from scripts.run_all_experiments import (
@@ -53,7 +54,8 @@ class ModuleCAblationTests(unittest.TestCase):
         command = build_ablation_command(args)
         self.assertEqual(command.count("--run"), 1)
         self.assertIn("--no-pca-feature-view", command)
-        self.assertIn("--reference-runs-root", command)
+        self.assertIn("--no-tsne-feature-view", command)
+        self.assertNotIn("--reference-runs-root", command)
         variant_start = command.index("--variants") + 1
         variant_end = command.index("--iterations")
         self.assertEqual(command[variant_start:variant_end], EXPERIMENT_VARIANTS)
@@ -262,6 +264,57 @@ class ModuleCAblationTests(unittest.TestCase):
             self.assertTrue(all(row["paired_target_samples"] == 4 for row in evidence))
             self.assertTrue(all(row["f1_gain"] > 0.0 for row in evidence))
             self.assertTrue(all((root / image).is_file() for image in images))
+
+    def test_paired_tsne_feature_view_is_generated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw = np.asarray(
+                [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]],
+                dtype=np.float32,
+            )
+            translated = np.asarray(
+                [[0.95, 0.05], [0.9, 0.1], [0.05, 0.95], [0.1, 0.9]],
+                dtype=np.float32,
+            )
+            labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+            snapshots = {
+                "source_raw": raw,
+                "source_labels": labels,
+                "source_sample_ids": np.asarray(["a", "b", "c", "d"]),
+                "target_raw": raw,
+                "target_source_like": translated,
+                "source_reconstruction": translated,
+                "source_identity": translated,
+                "target_reconstruction": translated,
+                "target_identity": translated,
+                "target_labels": labels,
+                "target_sample_ids": np.asarray(["a", "b", "c", "d"]),
+            }
+            summaries = []
+            for variant in ("full", "no_cycle"):
+                run_dir = root / f"module_c_{variant}_雨天_iter01"
+                run_dir.mkdir()
+                np.savez_compressed(run_dir / "feature_embeddings.npz", **snapshots)
+                summary = {
+                    "run_dir": str(run_dir),
+                    "run": run_dir.name,
+                    "variant": variant,
+                    "domain": "雨天",
+                    "iteration": 1,
+                    "seed": 42,
+                    "feature_embeddings": str(run_dir / "feature_embeddings.npz"),
+                    "best_val_f1": 0.9,
+                }
+                summaries.append(summary)
+            images = _plot_constraint_feature_tsne(
+                summaries, root, _load_matplotlib()
+            )
+            self.assertEqual(len(images), 1)
+            self.assertEqual(
+                Path(images[0]).as_posix(),
+                "constraint_feature_evidence/tsne/constraint_tsne_cycle_rain.png",
+            )
+            self.assertTrue((root / images[0]).is_file())
 
     def test_grouped_iteration_artifacts_are_discovered(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

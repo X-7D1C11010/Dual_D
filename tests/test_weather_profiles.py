@@ -12,6 +12,30 @@ from scripts.train_dual_d import apply_weather_profile, load_weather_profiles
 
 
 class WeatherProfileTests(unittest.TestCase):
+    def test_separate_profile_files_are_loaded_relative_to_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "rain.json").write_text(
+                json.dumps(
+                    {
+                        "min_steps_per_epoch": 4,
+                        "lr_scheduler_start_epoch": 24,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            index = root / "profiles.json"
+            index.write_text(
+                json.dumps({"profile_files": {"雨天": "rain.json"}}),
+                encoding="utf-8",
+            )
+
+            profiles = load_weather_profiles(index)
+            self.assertEqual(profiles["profiles"]["雨天"]["min_steps_per_epoch"], 4)
+            self.assertEqual(
+                profiles["profiles"]["雨天"]["lr_scheduler_start_epoch"], 24
+            )
+
     def test_profile_overrides_are_applied_without_mutating_source_args(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "profiles.json"

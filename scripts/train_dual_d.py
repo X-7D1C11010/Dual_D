@@ -68,6 +68,7 @@ WEATHER_PROFILE_KEYS = frozenset(
         "lr_discriminator",
         "weight_decay",
         "lr_patience",
+        "lr_scheduler_start_epoch",
         "discriminator_update_interval",
         "adversarial_warmup_epochs",
         "adversarial_ramp_epochs",
@@ -99,7 +100,9 @@ def load_weather_profiles(path: str | Path | None) -> Dict[str, Dict[str, Any]]:
 
     The file may either contain a top-level ``profiles`` mapping plus an
     optional ``default`` mapping, or map weather names directly to mappings.
-    Values are applied to a per-run argument copy in ``run_experiment_matrix``.
+    A top-level ``profile_files`` mapping may point each weather at a separate
+    JSON override file. Values are applied to a per-run argument copy in
+    ``run_experiment_matrix``.
     """
 
     if not path:
@@ -111,14 +114,42 @@ def load_weather_profiles(path: str | Path | None) -> Dict[str, Dict[str, Any]]:
         payload = json.load(file_obj)
     if not isinstance(payload, dict):
         raise ValueError("Weather profile config must be a JSON object.")
-    if "profiles" in payload:
-        profiles = payload.get("profiles")
+    profile_files = payload.get("profile_files", {})
+    if "profiles" in payload or "profile_files" in payload:
+        profiles = payload.get("profiles", {})
         default = payload.get("default", {})
     else:
         default = payload.get("default", {})
         profiles = {key: value for key, value in payload.items() if key != "default"}
-    if not isinstance(default, dict) or not isinstance(profiles, dict):
-        raise ValueError("Weather profile 'default' and 'profiles' must be objects.")
+    if (
+        not isinstance(default, dict)
+        or not isinstance(profiles, dict)
+        or not isinstance(profile_files, dict)
+    ):
+        raise ValueError(
+            "Weather profile 'default', 'profiles', and 'profile_files' must be objects."
+        )
+
+    profiles = dict(profiles)
+    for name, referenced_path in profile_files.items():
+        if str(name) in profiles:
+            raise ValueError(
+                f"Weather profile '{name}' is defined both inline and in profile_files."
+            )
+        if not isinstance(referenced_path, str) or not referenced_path.strip():
+            raise ValueError(
+                f"Weather profile file for '{name}' must be a non-empty path string."
+            )
+        referenced_profile_path = Path(referenced_path)
+        if not referenced_profile_path.is_absolute():
+            referenced_profile_path = profile_path.parent / referenced_profile_path
+        if not referenced_profile_path.is_file():
+            raise FileNotFoundError(
+                f"Weather profile file for '{name}' does not exist: "
+                f"{referenced_profile_path}"
+            )
+        with referenced_profile_path.open("r", encoding="utf-8") as file_obj:
+            profiles[str(name)] = json.load(file_obj)
 
     def validate(name: str, values: Any) -> Dict[str, Any]:
         if not isinstance(values, dict):
@@ -187,6 +218,7 @@ def apply_weather_profile(
         "adversarial_ramp_epochs",
         "module_c_warmup_epochs",
         "module_c_ramp_epochs",
+        "lr_scheduler_start_epoch",
         "early_stopping_patience",
         "early_stopping_min_epochs",
     }
@@ -457,6 +489,16 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=default("weight_decay", 7.5e-4))
     parser.add_argument("--lr-factor", type=float, default=default("lr_factor", 0.5))
     parser.add_argument("--lr-patience", type=int, default=default("lr_patience", 6))
+    parser.add_argument(
+        "--lr-scheduler-start-epoch",
+        type=int,
+        default=default("lr_scheduler_start_epoch", 1),
+        help=(
+            "Do not feed validation metrics to ReduceLROnPlateau before this "
+            "epoch. Use this to keep learning rates fixed while warmup/ramp "
+            "schedules become active."
+        ),
+    )
     parser.add_argument("--min-lr", type=float, default=default("min_lr", 1e-6))
     parser.add_argument(
         "--min-lr-discriminator",
@@ -630,6 +672,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--early-stopping-patience must be non-negative.")
     if args.early_stopping_min_epochs < 0:
         parser.error("--early-stopping-min-epochs must be non-negative.")
+    if args.lr_scheduler_start_epoch < 0:
+        parser.error("--lr-scheduler-start-epoch must be non-negative.")
     if args.monitor_stability_window <= 0:
         parser.error("--monitor-stability-window must be positive.")
     if args.feature_visualization_samples <= 0:

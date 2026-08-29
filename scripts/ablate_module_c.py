@@ -892,6 +892,46 @@ def _posthoc_projection(features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return coordinates, ratios
 
 
+def _load_tsne():
+    """Load scikit-learn t-SNE lazily so training does not depend on sklearn."""
+
+    try:
+        from sklearn.manifold import TSNE
+    except ImportError:
+        return None
+    return TSNE
+
+
+def _fit_tsne(features: np.ndarray, random_state: int = 0) -> np.ndarray | None:
+    """Fit one deterministic joint t-SNE view in the original feature space."""
+
+    features = np.asarray(features, dtype=np.float32)
+    if features.ndim != 2 or len(features) < 6 or features.shape[1] < 1:
+        return None
+    if not np.isfinite(features).all():
+        return None
+    # Keep perplexity valid for small weather validation sets while retaining
+    # enough local neighborhoods for the larger source feature snapshot.
+    perplexity = min(30.0, max(2.0, (len(features) - 1) / 3.0))
+    TSNE = _load_tsne()
+    if TSNE is None:
+        return None
+    kwargs = {
+        "n_components": 2,
+        "perplexity": perplexity,
+        "init": "random",
+        "learning_rate": "auto",
+        "metric": "cosine",
+        "random_state": int(random_state),
+        "method": "barnes_hut",
+    }
+    try:
+        estimator = TSNE(max_iter=750, **kwargs)
+    except TypeError:  # scikit-learn < 1.5 uses n_iter.
+        estimator = TSNE(n_iter=750, **kwargs)
+    return np.asarray(estimator.fit_transform(features), dtype=np.float32)
+
+
 def _l2_normalize(features: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(features, axis=1, keepdims=True)
     return features / np.clip(norms, 1e-12, None)
@@ -1741,6 +1781,179 @@ def _plot_feature_diagnostics(
     return generated, metric_rows
 
 
+def _plot_constraint_feature_tsne(
+    summaries: Sequence[Mapping[str, Any]], output_dir: Path, plt
+) -> List[str]:
+    """Plot paired Full/ablation sample features with joint post-hoc t-SNE.
+
+    Each panel fits t-SNE once to the Full and ablated features together. This
+    makes the markers comparable within a panel while keeping t-SNE out of the
+    model, training objective, and quantitative feature metrics.
+    """
+
+    if _load_tsne() is None:
+        print(
+            "scikit-learn is unavailable; skipping paired t-SNE feature views.",
+            file=sys.stderr,
+        )
+        return []
+    feature_dir = output_dir / "constraint_feature_evidence" / "tsne"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    full_index = {
+        _summary_pair_key(summary): summary
+        for summary in summaries
+        if summary["variant"] == "full"
+    }
+    generated: List[str] = []
+    cmap = plt.get_cmap("tab20")
+    for constraint, description in CONSTRAINTS.items():
+        ablation_variant = f"no_{constraint}"
+        ablated_index = {
+            _summary_pair_key(summary): summary
+            for summary in summaries
+            if summary["variant"] == ablation_variant
+        }
+        grouped: Dict[str, List[tuple[Mapping[str, Any], Dict[str, Any]]]] = defaultdict(list)
+        for key in sorted(set(full_index) & set(ablated_index)):
+            full_summary = full_index[key]
+            ablated_summary = ablated_index[key]
+            full_snapshot = _load_feature_run(full_summary)
+            ablated_snapshot = _load_feature_run(ablated_summary)
+            if full_snapshot is None or ablated_snapshot is None:
+                continue
+            full_target, ablated_target = _matching_label_indices(
+                full_snapshot, ablated_snapshot, "target"
+            )
+            if len(full_target) < 4:
+                continue
+            target_labels = np.asarray(
+                full_snapshot["target_labels"], dtype=np.int64
+            )[full_target]
+            if constraint in {"cycle", "identity"}:
+                feature_name = "reconstruction" if constraint == "cycle" else "identity"
+                arrays = [
+                    np.asarray(full_snapshot["target_raw"], dtype=np.float32)[full_target],
+                    np.asarray(full_snapshot[f"target_{feature_name}"], dtype=np.float32)[full_target],
+                    np.asarray(ablated_snapshot[f"target_{feature_name}"], dtype=np.float32)[ablated_target],
+                ]
+                labels = [target_labels] * 3
+                groups = ["Target raw", "With constraint", "Without constraint"]
+            else:
+                source_labels = np.asarray(full_snapshot["source_labels"], dtype=np.int64)
+                source_indices = _balanced_source_indices(source_labels, target_labels)
+                if len(source_indices) < 2:
+                    continue
+                arrays = [
+                    np.asarray(full_snapshot["source_raw"], dtype=np.float32)[source_indices],
+                    np.asarray(full_snapshot["target_source_like"], dtype=np.float32)[full_target],
+                    np.asarray(ablated_snapshot["target_source_like"], dtype=np.float32)[ablated_target],
+                ]
+                labels = [source_labels[source_indices], target_labels, target_labels]
+                groups = ["Source raw", "With constraint", "Without constraint"]
+            try:
+                joint = np.concatenate(arrays, axis=0)
+                coordinates = _fit_tsne(
+                    joint,
+                    random_state=1000
+                    + int(full_summary.get("seed") or 0)
+                    + int(full_summary.get("iteration") or 0),
+                )
+            except (ValueError, RuntimeError):
+                coordinates = None
+            if coordinates is None:
+                continue
+            offsets = np.cumsum([0, *[len(array) for array in arrays]])
+            try:
+                evidence = _constraint_run_evidence(
+                    constraint, full_summary, ablated_summary
+                )
+            except (KeyError, ValueError, TypeError):
+                # A partial/legacy feature snapshot can still support a t-SNE
+                # view even when it lacks one of the mechanism-specific arrays.
+                evidence = None
+            mechanism_gain = None
+            f1_gain = None
+            if evidence is not None:
+                mechanism_gain = evidence[0]["mechanism_gain"]
+                f1_gain = evidence[0].get("f1_gain")
+            grouped[str(full_summary["domain"])].append(
+                (
+                    full_summary,
+                    {
+                        "coordinates": coordinates,
+                        "offsets": offsets,
+                        "labels": labels,
+                        "groups": groups,
+                        "mechanism_gain": mechanism_gain,
+                        "f1_gain": f1_gain,
+                    },
+                )
+            )
+
+        for domain, records in grouped.items():
+            records.sort(key=lambda item: int(item[0].get("iteration") or 0))
+            figure, axes = plt.subplots(
+                1, len(records), figsize=(6.2 * max(len(records), 1), 5.4), squeeze=False
+            )
+            for axis, (summary, data) in zip(axes.flat, records):
+                coordinates = data["coordinates"]
+                offsets = data["offsets"]
+                for group_index, (group, group_labels) in enumerate(
+                    zip(data["groups"], data["labels"])
+                ):
+                    start, end = int(offsets[group_index]), int(offsets[group_index + 1])
+                    group_coordinates = coordinates[start:end]
+                    marker = {
+                        "Target raw": "o",
+                        "Source raw": "o",
+                        "With constraint": "^",
+                        "Without constraint": "x",
+                    }[group]
+                    for class_index, class_id in enumerate(sorted(set(group_labels.tolist()))):
+                        mask = group_labels == class_id
+                        color = cmap(class_index % 20)
+                        scatter_kwargs = {
+                            "s": 38 if group in {"With constraint", "Without constraint"} else 30,
+                            "marker": marker,
+                            "alpha": 0.85,
+                            "label": f"{group}, class {class_id}",
+                        }
+                        if group in {"Target raw", "Source raw"}:
+                            scatter_kwargs.update({"facecolors": "none", "edgecolors": [color]})
+                        else:
+                            scatter_kwargs.update({"color": [color]})
+                        axis.scatter(
+                            group_coordinates[mask, 0],
+                            group_coordinates[mask, 1],
+                            **scatter_kwargs,
+                        )
+                subtitle = f"iteration {int(summary.get('iteration') or 0):02d}"
+                if data.get("mechanism_gain") is not None:
+                    subtitle += f" | mechanism gain {data['mechanism_gain']:+.3f}"
+                if data.get("f1_gain") is not None:
+                    subtitle += f" | F1 gain {data['f1_gain']:+.3f}"
+                axis.set_title(subtitle, fontsize=10)
+                axis.set_xlabel("t-SNE 1")
+                axis.set_ylabel("t-SNE 2")
+                axis.grid(alpha=0.2)
+                handles, labels = axis.get_legend_handles_labels()
+                if handles:
+                    unique = dict(zip(labels, handles))
+                    axis.legend(unique.values(), unique.keys(), fontsize=7, frameon=False, loc="best", ncol=2)
+            figure.suptitle(
+                f"{_domain_display(domain)} | {description} | paired t-SNE feature view\n"
+                "Joint post-hoc t-SNE of original features; not part of the model",
+                fontsize=13,
+            )
+            figure.tight_layout(rect=(0, 0, 1, 0.90))
+            filename = f"constraint_tsne_{constraint}_{_domain_display(domain).lower()}.png"
+            target_path = feature_dir / filename
+            figure.savefig(target_path, dpi=180, bbox_inches="tight")
+            plt.close(figure)
+            generated.append(str(target_path.relative_to(output_dir)))
+    return generated
+
+
 def _aggregate_feature_metrics(
     rows: Sequence[Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -2187,6 +2400,11 @@ def analyse(args: argparse.Namespace) -> Dict[str, Any]:
     constraint_feature_images, constraint_feature_evidence = (
         _plot_constraint_feature_evidence(summaries, output_dir, plt)
     )
+    constraint_tsne_images = (
+        _plot_constraint_feature_tsne(summaries, output_dir, plt)
+        if bool(getattr(args, "tsne_feature_view", False))
+        else []
+    )
     _write_csv(
         constraint_feature_evidence,
         output_dir / "constraint_feature_evidence.csv",
@@ -2194,6 +2412,7 @@ def analyse(args: argparse.Namespace) -> Dict[str, Any]:
     payload["feature_images"] = feature_images
     payload["prototype_alignment_images"] = prototype_alignment_images
     payload["constraint_feature_images"] = constraint_feature_images
+    payload["constraint_tsne_images"] = constraint_tsne_images
     payload["constraint_feature_evidence"] = constraint_feature_evidence
     payload["feature_metrics"] = feature_metrics
     payload["feature_metric_aggregate"] = feature_aggregate
@@ -2259,6 +2478,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Write optional per-run post-hoc PCA scatter plots. Original-space "
             "prototype and quantitative diagnostics are always produced."
+        ),
+    )
+    parser.add_argument(
+        "--tsne-feature-view",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Write paired Full-versus-ablation t-SNE feature views. The t-SNE "
+            "projection is post-hoc and never affects training or metrics."
         ),
     )
     return parser

@@ -18,8 +18,7 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "train_dual_d_default.json"
 DEFAULT_DUAL_CONFIG = PROJECT_ROOT / "configs" / "dual_d_default_config.json"
-DEFAULT_PROFILE_CONFIG = PROJECT_ROOT / "configs" / "module_c_weather_profiles.json"
-DEFAULT_FOG_REFERENCE = PROJECT_ROOT / "fog_v5_reference_20260827" / "runs"
+DEFAULT_PROFILE_CONFIG = PROJECT_ROOT / "configs" / "module_c_weather_profiles_v7.json"
 EXPERIMENT_VARIANTS = [
     "full",
     "no_cycle",
@@ -38,17 +37,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-train-config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--base-dual-config", default=str(DEFAULT_DUAL_CONFIG))
     parser.add_argument("--weather-profile-config", default=str(DEFAULT_PROFILE_CONFIG))
-    parser.add_argument("--reference-runs-root", default=str(DEFAULT_FOG_REFERENCE))
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--target-parent-root", required=True)
     parser.add_argument(
         "--target-domains",
         nargs="+",
         default=["黑天", "逆光", "雨天"],
-        help=(
-            "Target weather domains. Fog is excluded by default because the "
-            "validated v5 Fog result is frozen under configs/module_c_fog_v5_frozen.json."
-        ),
+        help="Target weather domains trained by the experiment matrix.",
     )
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=60)
@@ -86,8 +81,6 @@ def build_ablation_command(args: argparse.Namespace) -> list[str]:
         str(args.base_dual_config),
         "--weather-profile-config",
         str(args.weather_profile_config),
-        "--reference-runs-root",
-        str(args.reference_runs_root),
         "--source-root",
         str(args.source_root),
         "--target-parent-root",
@@ -104,6 +97,7 @@ def build_ablation_command(args: argparse.Namespace) -> list[str]:
         str(args.device),
         group_flag,
         "--no-pca-feature-view",
+        "--no-tsne-feature-view",
         "--output-dir",
         str(Path(args.output_dir)),
     ]

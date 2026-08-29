@@ -1,0 +1,8 @@
+{
+  "default": {},
+  "profile_files": {
+    "黑天": "module_c_weather_night.json",
+    "逆光": "module_c_weather_backlight.json",
+    "雨天": "module_c_weather_rain.json"
+  }
+}

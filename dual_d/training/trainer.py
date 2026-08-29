@@ -323,6 +323,13 @@ def _apply_dual_loss_weight_overrides(dual_config, overrides):
     return dual_config
 
 
+def _lr_scheduler_is_active(args, epoch: int) -> bool:
+    """Return whether plateau schedulers may consume this epoch's metric."""
+
+    start_epoch = max(int(getattr(args, "lr_scheduler_start_epoch", 1)), 1)
+    return int(epoch) >= start_epoch
+
+
 def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
     """Instantiate all standalone Dual_D model modules."""
 
@@ -1282,13 +1289,14 @@ def run_training(args) -> Dict[str, object]:
     logger.info(
         "Runtime profile: batch=%d | paired_steps=%d | workers=%d | "
         "train_eval_every=%d | raw_eval_every=%d | stability_window=%d | "
-        "early_stop=%d after min_epoch=%d",
+        "lr_scheduler_start=%d | early_stop=%d after min_epoch=%d",
         args.batch_size,
         len(paired_loader),
         args.num_workers,
         max(int(getattr(args, "train_eval_interval", 1)), 1),
         max(int(getattr(args, "raw_eval_interval", 5)), 1),
         max(int(getattr(args, "monitor_stability_window", 1)), 1),
+        max(int(getattr(args, "lr_scheduler_start_epoch", 1)), 1),
         int(getattr(args, "early_stopping_patience", 0)),
         int(getattr(args, "early_stopping_min_epochs", 0)),
     )
@@ -1478,8 +1486,10 @@ def run_training(args) -> Dict[str, object]:
         else:
             train_full_metrics = {}
 
-        scheduler_main.step(monitor_value)
-        scheduler_disc.step(monitor_value)
+        lr_scheduler_active = _lr_scheduler_is_active(args, epoch)
+        if lr_scheduler_active:
+            scheduler_main.step(monitor_value)
+            scheduler_disc.step(monitor_value)
 
         if args.eval_feature_mode == "raw":
             sampled_mode_acc = float(train_metrics["train_acc_target"])
@@ -1523,6 +1533,7 @@ def run_training(args) -> Dict[str, object]:
             "monitor_value": monitor_value,
             "monitor_selection_score": monitor_selection_score,
             "monitor_stability_window": monitor_stability_window,
+            "lr_scheduler_active": lr_scheduler_active,
             "lr_main": optimizer_main.param_groups[-1]["lr"],
             "lr_discriminator": optimizer_disc.param_groups[0]["lr"],
             "lr_discriminator_to_main_ratio": (

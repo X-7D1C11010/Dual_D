@@ -53,6 +53,7 @@
   "weight_decay": 0.0009,
   "lr_factor": 0.5,
   "lr_patience": 6,
+  "lr_scheduler_start_epoch": 1,
   "min_lr": 0.000001,
   "min_lr_discriminator": 0.000001,
   "discriminator_update_interval": 2,
