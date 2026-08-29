@@ -1,0 +1,40 @@
+{
+  "feature_dim": 256,
+  "contrastive_temperature": 0.2,
+  "include_reconstruction_fakes": false,
+  "detach_contrastive_positives": true,
+  "prototype_momentum": 0.9,
+  "freeze_classifier_during_feedback": true,
+  "loss_weights": {
+    "classification": 0.0,
+    "adv_primary": 0.03,
+    "adv_auxiliary": 0.03,
+    "cycle": 0.24,
+    "identity": 0.035,
+    "contrastive": 0.015,
+    "prototype_contrastive": 0.05
+  },
+  "primary_discriminator": {
+    "hidden_dims": [
+      128,
+      64
+    ],
+    "dropout": 0.5,
+    "use_spectral_norm": true
+  },
+  "auxiliary_discriminator": {
+    "hidden_dims": [
+      128,
+      64
+    ],
+    "dropout": 0.5,
+    "use_spectral_norm": true
+  },
+  "generator": {
+    "hidden_dim": 192,
+    "num_layers": 2,
+    "dropout": 0.1,
+    "residual_scale": 0.3,
+    "use_layer_norm": true
+  }
+}
