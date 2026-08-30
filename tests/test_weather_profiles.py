@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from argparse import Namespace
+from copy import deepcopy
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,6 +13,21 @@ from scripts.train_dual_d import apply_weather_profile, load_weather_profiles
 
 
 class WeatherProfileTests(unittest.TestCase):
+    def test_v10_profiles_change_only_the_preregistered_single_factors(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        v9 = load_weather_profiles(
+            project_root / "configs" / "module_c_weather_profiles_v9.json"
+        )
+        v10 = load_weather_profiles(
+            project_root / "configs" / "module_c_weather_profiles_v10.json"
+        )
+        expected = deepcopy(v9["profiles"])
+        expected["黑天"]["vis_augmentation_strength"] = 0.50
+        expected["黑天"]["ir_augmentation_strength"] = 0.50
+        expected["逆光"]["dual_loss_weights"]["contrastive"] = 0.020
+        expected["雨天"]["dual_loss_weights"]["prototype_contrastive"] = 0.015
+        self.assertEqual(v10["profiles"], expected)
+
     def test_v9_profiles_match_target_epoch_sizes(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         profiles = load_weather_profiles(

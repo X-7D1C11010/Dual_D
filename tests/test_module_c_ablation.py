@@ -24,6 +24,7 @@ from scripts.ablate_module_c import (
     _plot_feature_diagnostics,
     _plot_constraint_feature_tsne,
     _plot_prototype_alignment_by_domain,
+    _wilson_interval,
 )
 from scripts.run_all_experiments import (
     EXPERIMENT_VARIANTS,
@@ -206,6 +207,66 @@ class ModuleCAblationTests(unittest.TestCase):
             self.assertEqual(len(summaries), 1)
             self.assertEqual(summaries[0]["best_epoch"], 40)
             self.assertAlmostEqual(summaries[0]["best_val_f1"], 0.962567)
+
+    def test_summary_reports_validation_errors_and_wilson_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir = root / "module_c_full_雨天_iter01"
+            run_dir.mkdir()
+            with (run_dir / "metrics.csv").open(
+                "w", encoding="utf-8", newline=""
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "epoch",
+                        "val_acc",
+                        "val_precision_macro_present",
+                        "val_recall_macro_present",
+                        "val_f1_macro_present",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "epoch": 1,
+                        "val_acc": 1.0,
+                        "val_precision_macro_present": 1.0,
+                        "val_recall_macro_present": 1.0,
+                        "val_f1_macro_present": 1.0,
+                    }
+                )
+            (run_dir / "result_summary.json").write_text(
+                json.dumps(
+                    {
+                        "target_domain": "雨天",
+                        "best_metrics": {
+                            "epoch": 1,
+                            "val": {"correct": 26, "total": 26},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summaries = discover_summaries(
+                root, "module_c_*", "val_f1_macro_present"
+            )
+            self.assertEqual(summaries[0]["best_val_correct"], 26)
+            self.assertEqual(summaries[0]["best_val_total"], 26)
+            self.assertEqual(summaries[0]["best_val_errors"], 0)
+            low, high = _wilson_interval(26, 26)
+            self.assertAlmostEqual(summaries[0]["best_val_acc_wilson_low"], low)
+            self.assertAlmostEqual(summaries[0]["best_val_acc_wilson_high"], high)
+            self.assertAlmostEqual(low, 0.871267, places=5)
+            self.assertEqual(high, 1.0)
+
+            aggregate = aggregate_summaries(summaries)[0]
+            self.assertEqual(aggregate["best_val_errors_mean"], 0)
+            self.assertEqual(aggregate["best_val_total_mean"], 26)
+            self.assertAlmostEqual(
+                aggregate["best_val_acc_wilson_low_mean"], low
+            )
 
     def test_grouped_partial_iteration_is_not_aggregated(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

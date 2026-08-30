@@ -6,8 +6,9 @@ generator objective. The adversarial translation core remains active in that
 joint baseline, so it must not be described as removing the entire module.
 The script can launch the existing training entrypoint (``--run``), or analyse
 one manifest-backed experiment directory. Analysis reports accuracy, macro
-precision, macro recall and macro F1 at one shared selected epoch, plus
-run-isolated feature diagnostics; no metric is filtered or rewritten.
+precision, macro recall and macro F1 at one shared selected epoch, validation
+error counts and Wilson accuracy intervals, plus run-isolated feature
+diagnostics; no metric is filtered or rewritten.
 
 Examples
 --------
@@ -236,6 +237,42 @@ def _to_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _wilson_interval(
+    correct: float | None,
+    total: float | None,
+    z: float = 1.96,
+) -> tuple[float | None, float | None]:
+    """Return a Wilson score interval for one validation accuracy.
+
+    Seed-to-seed standard deviation can be zero even when every seed evaluates
+    the same tiny validation set.  The Wilson interval keeps the finite sample
+    uncertainty visible without pooling repeated predictions of the same
+    validation examples as independent observations.
+    """
+
+    if (
+        correct is None
+        or total is None
+        or total <= 0
+        or correct < 0
+        or correct > total
+    ):
+        return None, None
+    proportion = correct / total
+    z_squared = z * z
+    denominator = 1.0 + z_squared / total
+    center = (proportion + z_squared / (2.0 * total)) / denominator
+    margin = (
+        z
+        * math.sqrt(
+            (proportion * (1.0 - proportion) + z_squared / (4.0 * total))
+            / total
+        )
+        / denominator
+    )
+    return max(0.0, center - margin), min(1.0, center + margin)
+
+
 def _read_rows(path: Path) -> List[Dict[str, Any]]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         rows: List[Dict[str, Any]] = []
@@ -344,6 +381,7 @@ def _summarize_run(
     if not rows:
         return None
     best = _best_row(rows, monitor_metric)
+    result_payload: Mapping[str, Any] = {}
     if result_path.exists():
         try:
             result_payload = _json_load(result_path)
@@ -361,12 +399,30 @@ def _summarize_run(
                 # including stability windows and early_stopping_min_delta.
                 best = selected_rows[-1]
         except (OSError, AttributeError, json.JSONDecodeError):
-            pass
+            result_payload = {}
     val_acc = _to_float(best.get("val_acc"))
     val_precision = _to_float(best.get("val_precision_macro_present"))
     val_recall = _to_float(best.get("val_recall_macro_present"))
     val_f1 = _to_float(best.get("val_f1_macro_present"))
     train_full = _to_float(best.get("train_full_acc"))
+    best_metrics_payload = result_payload.get("best_metrics", {})
+    val_payload = (
+        best_metrics_payload.get("val", {})
+        if isinstance(best_metrics_payload, Mapping)
+        else {}
+    )
+    val_correct = _to_float(
+        val_payload.get("correct") if isinstance(val_payload, Mapping) else None
+    )
+    val_total = _to_float(
+        val_payload.get("total") if isinstance(val_payload, Mapping) else None
+    )
+    val_errors = (
+        val_total - val_correct
+        if val_correct is not None and val_total is not None
+        else None
+    )
+    wilson_low, wilson_high = _wilson_interval(val_correct, val_total)
     summary: Dict[str, Any] = {
         "run_dir": str(run_dir),
         "run": f"{run_dir.name}/{metrics_path.stem}",
@@ -386,6 +442,11 @@ def _summarize_run(
         "best_val_precision": val_precision,
         "best_val_recall": val_recall,
         "best_val_f1": val_f1,
+        "best_val_correct": val_correct,
+        "best_val_total": val_total,
+        "best_val_errors": val_errors,
+        "best_val_acc_wilson_low": wilson_low,
+        "best_val_acc_wilson_high": wilson_high,
         "best_train_full_acc": train_full,
         "generalization_gap": (
             train_full - val_acc if train_full is not None and val_acc is not None else None
@@ -453,6 +514,11 @@ def aggregate_summaries(summaries: Sequence[Mapping[str, Any]]) -> List[Dict[str
         "best_val_precision",
         "best_val_recall",
         "best_val_f1",
+        "best_val_correct",
+        "best_val_total",
+        "best_val_errors",
+        "best_val_acc_wilson_low",
+        "best_val_acc_wilson_high",
         "best_train_full_acc",
         "generalization_gap",
     ]
@@ -2301,6 +2367,20 @@ def _write_html_report(output_dir: Path, aggregates: Sequence[Mapping[str, Any]]
         display_row = dict(row)
         display_row["variant"] = _variant_display(str(row.get("variant", "")))
         display_row["domain"] = _domain_display(str(row.get("domain", "")))
+        errors = _to_float(row.get("best_val_errors_mean"))
+        total = _to_float(row.get("best_val_total_mean"))
+        wilson_low = _to_float(row.get("best_val_acc_wilson_low_mean"))
+        wilson_high = _to_float(row.get("best_val_acc_wilson_high_mean"))
+        display_row["validation_errors"] = (
+            f"{errors:.2f} / {total:.2f}"
+            if errors is not None and total is not None
+            else ""
+        )
+        display_row["accuracy_wilson_interval"] = (
+            f"[{wilson_low:.4f}, {wilson_high:.4f}]"
+            if wilson_low is not None and wilson_high is not None
+            else ""
+        )
         rows.append(
             "<tr>"
             + "".join(
@@ -2314,6 +2394,8 @@ def _write_html_report(output_dir: Path, aggregates: Sequence[Mapping[str, Any]]
                     "best_val_recall_mean",
                     "best_val_f1_mean",
                     "best_val_f1_ci95",
+                    "validation_errors",
+                    "accuracy_wilson_interval",
                 )
             )
             + "</tr>"
@@ -2342,7 +2424,7 @@ def _write_html_report(output_dir: Path, aggregates: Sequence[Mapping[str, Any]]
     image_tags = "\n".join(image_tags_parts)
     document = """<!doctype html><meta charset="utf-8"><title>Module C ablation report</title>
 <style>body{max-width:1200px;margin:2rem auto;padding:0 1rem;color:#17202a}img{max-width:100%;height:auto}table{border-collapse:collapse;width:100%;margin-bottom:2rem}th,td{border:1px solid #ccd;padding:.4rem;text-align:right}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}</style>
-<h1>Module C ablation report</h1><table><thead><tr><th>variant</th><th>domain</th><th>runs</th><th>accuracy</th><th>macro precision</th><th>macro recall</th><th>macro F1</th><th>F1 95% CI</th></tr></thead><tbody>""" + "".join(rows) + "</tbody></table>" + image_tags
+<h1>Module C ablation report</h1><table><thead><tr><th>variant</th><th>domain</th><th>runs</th><th>accuracy</th><th>macro precision</th><th>macro recall</th><th>macro F1</th><th>F1 95% CI</th><th>mean errors / validation size</th><th>mean per-run accuracy Wilson 95% CI</th></tr></thead><tbody>""" + "".join(rows) + "</tbody></table>" + image_tags
     (output_dir / "ablation_report.html").write_text(document, encoding="utf-8")
 
 
