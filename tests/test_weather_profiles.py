@@ -13,6 +13,20 @@ from scripts.train_dual_d import apply_weather_profile, load_weather_profiles
 
 
 class WeatherProfileTests(unittest.TestCase):
+    def test_v11_profiles_lower_only_target_classification_weight(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        v10 = load_weather_profiles(
+            project_root / "configs" / "module_c_weather_profiles_v10.json"
+        )
+        v11 = load_weather_profiles(
+            project_root / "configs" / "module_c_weather_profiles_v11.json"
+        )
+        expected = deepcopy(v10["profiles"])
+        expected["黑天"]["target_classification_weight"] = 0.80
+        expected["逆光"]["target_classification_weight"] = 0.70
+        expected["雨天"]["target_classification_weight"] = 0.85
+        self.assertEqual(v11["profiles"], expected)
+
     def test_v10_profiles_change_only_the_preregistered_single_factors(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         v9 = load_weather_profiles(
