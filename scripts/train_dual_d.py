@@ -78,6 +78,7 @@ WEATHER_PROFILE_KEYS = frozenset(
         "module_c_warmup_epochs",
         "module_c_ramp_epochs",
         "monitor_stability_window",
+        "checkpoint_selection_min_epoch",
         "dual_loss_weights",
         "early_stopping_patience",
         "early_stopping_min_epochs",
@@ -215,6 +216,7 @@ def apply_weather_profile(
         "lr_patience",
         "discriminator_update_interval",
         "monitor_stability_window",
+        "checkpoint_selection_min_epoch",
     }
     nonnegative_ints = {
         "adversarial_warmup_epochs",
@@ -275,6 +277,14 @@ def apply_weather_profile(
             raise ValueError(f"Weather profile value '{key}' must be boolean.")
     for key, value in overrides.items():
         setattr(args, key, value)
+    selection_min_epoch = int(
+        getattr(args, "checkpoint_selection_min_epoch", 1)
+    )
+    total_epochs = int(getattr(args, "epochs", 0))
+    if total_epochs > 0 and selection_min_epoch > total_epochs:
+        raise ValueError(
+            "Weather profile checkpoint_selection_min_epoch cannot exceed epochs."
+        )
     args.weather_profile_name = str(domain) if overrides else "default"
     args.weather_profile_overrides = dict(overrides)
     return overrides
@@ -596,6 +606,15 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--checkpoint-selection-min-epoch",
+        type=int,
+        default=default("checkpoint_selection_min_epoch", 1),
+        help=(
+            "Do not select best metrics or best checkpoints before this epoch. "
+            "Training and validation still run normally before the threshold."
+        ),
+    )
+    parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=default("early_stopping_patience", 10),
@@ -730,6 +749,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--lr-scheduler-start-epoch must be non-negative.")
     if args.monitor_stability_window <= 0:
         parser.error("--monitor-stability-window must be positive.")
+    if args.checkpoint_selection_min_epoch <= 0:
+        parser.error("--checkpoint-selection-min-epoch must be positive.")
+    if args.checkpoint_selection_min_epoch > args.epochs:
+        parser.error("--checkpoint-selection-min-epoch cannot exceed --epochs.")
     if args.feature_visualization_samples <= 0:
         parser.error("--feature-visualization-samples must be positive.")
     return args

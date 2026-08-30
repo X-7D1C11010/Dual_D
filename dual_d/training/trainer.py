@@ -351,6 +351,16 @@ def _lr_scheduler_is_active(args, epoch: int) -> bool:
     return int(epoch) >= start_epoch
 
 
+def _checkpoint_selection_is_eligible(args, epoch: int) -> bool:
+    """Return whether this epoch may update best metrics and checkpoints."""
+
+    start_epoch = max(
+        int(getattr(args, "checkpoint_selection_min_epoch", 1)),
+        1,
+    )
+    return int(epoch) >= start_epoch
+
+
 def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
     """Instantiate all standalone Dual_D model modules."""
 
@@ -1312,7 +1322,8 @@ def run_training(args) -> Dict[str, object]:
     logger.info(
         "Runtime profile: batch=%d | paired_steps=%d | workers=%d | "
         "train_eval_every=%d | raw_eval_every=%d | stability_window=%d | "
-        "lr_scheduler_start=%d | early_stop=%d after min_epoch=%d",
+        "lr_scheduler_start=%d | checkpoint_select_from=%d | "
+        "early_stop=%d after min_epoch=%d",
         args.batch_size,
         len(paired_loader),
         args.num_workers,
@@ -1320,6 +1331,7 @@ def run_training(args) -> Dict[str, object]:
         max(int(getattr(args, "raw_eval_interval", 5)), 1),
         max(int(getattr(args, "monitor_stability_window", 1)), 1),
         max(int(getattr(args, "lr_scheduler_start_epoch", 1)), 1),
+        max(int(getattr(args, "checkpoint_selection_min_epoch", 1)), 1),
         int(getattr(args, "early_stopping_patience", 0)),
         int(getattr(args, "early_stopping_min_epochs", 0)),
     )
@@ -1482,7 +1494,14 @@ def run_training(args) -> Dict[str, object]:
             monitor_stability_window,
         )
         min_delta = float(getattr(args, "early_stopping_min_delta", 0.0))
-        would_improve = monitor_selection_score > best_selection_score + min_delta
+        checkpoint_selection_eligible = _checkpoint_selection_is_eligible(
+            args,
+            epoch,
+        )
+        would_improve = (
+            checkpoint_selection_eligible
+            and monitor_selection_score > best_selection_score + min_delta
+        )
 
         raw_eval_seconds = 0.0
         if args.eval_feature_mode == "raw":
@@ -1567,6 +1586,11 @@ def run_training(args) -> Dict[str, object]:
             "monitor_value": monitor_value,
             "monitor_selection_score": monitor_selection_score,
             "monitor_stability_window": monitor_stability_window,
+            "checkpoint_selection_eligible": checkpoint_selection_eligible,
+            "checkpoint_selection_min_epoch": max(
+                int(getattr(args, "checkpoint_selection_min_epoch", 1)),
+                1,
+            ),
             "lr_scheduler_active": lr_scheduler_active,
             "lr_main": optimizer_main.param_groups[-1]["lr"],
             "lr_discriminator": optimizer_disc.param_groups[0]["lr"],
@@ -1634,7 +1658,7 @@ def run_training(args) -> Dict[str, object]:
 
         current_acc = float(val_metrics["accuracy"])
         current_f1 = float(val_metrics["f1_macro_present"])
-        if current_acc > best_acc:
+        if checkpoint_selection_eligible and current_acc > best_acc:
             best_acc = current_acc
             best_acc_epoch = epoch
             if save_checkpoints and last_state is not None:
@@ -1642,7 +1666,7 @@ def run_training(args) -> Dict[str, object]:
                     last_state,
                     _checkpoint_path(run_dir, "best_acc_model.pt", args),
                 )
-        if current_f1 > best_f1:
+        if checkpoint_selection_eligible and current_f1 > best_f1:
             best_f1 = current_f1
             best_f1_epoch = epoch
             if save_checkpoints and last_state is not None:
@@ -1663,6 +1687,10 @@ def run_training(args) -> Dict[str, object]:
                 "monitor_value": monitor_value,
                 "monitor_selection_score": monitor_selection_score,
                 "monitor_stability_window": monitor_stability_window,
+                "checkpoint_selection_min_epoch": max(
+                    int(getattr(args, "checkpoint_selection_min_epoch", 1)),
+                    1,
+                ),
                 "epoch": epoch,
             }
             if save_checkpoints and last_state is not None:
@@ -1684,7 +1712,7 @@ def run_training(args) -> Dict[str, object]:
                 monitor_selection_score,
                 epoch,
             )
-        else:
+        elif checkpoint_selection_eligible:
             epochs_without_improvement += 1
 
         epochs_completed = epoch
@@ -1713,6 +1741,10 @@ def run_training(args) -> Dict[str, object]:
         "best_monitor_metric": monitor_metric,
         "best_monitor_value": best_metrics.get("monitor_value"),
         "best_monitor_selection_score": best_selection_score,
+        "checkpoint_selection_min_epoch": max(
+            int(getattr(args, "checkpoint_selection_min_epoch", 1)),
+            1,
+        ),
         "best_metrics": best_metrics,
         "epochs_completed": epochs_completed,
         "early_stopped": early_stopped,

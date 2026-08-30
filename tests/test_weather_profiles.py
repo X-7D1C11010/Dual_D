@@ -13,6 +13,62 @@ from scripts.train_dual_d import apply_weather_profile, load_weather_profiles
 
 
 class WeatherProfileTests(unittest.TestCase):
+    def test_v12_profiles_strengthen_the_requested_training_controls(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        v11 = load_weather_profiles(
+            project_root / "configs" / "module_c_weather_profiles_v11.json"
+        )["profiles"]
+        fog_v5 = load_weather_profiles(
+            project_root / "configs" / "module_c_fog_v5_frozen.json"
+        )["profiles"]["雾天"]
+        v12 = load_weather_profiles(
+            project_root / "configs" / "module_c_weather_profiles_v12.json"
+        )["profiles"]
+
+        baselines = {
+            "黑天": v11["黑天"],
+            "逆光": v11["逆光"],
+            "雾天": fog_v5,
+            "雨天": v11["雨天"],
+        }
+        self.assertEqual(set(v12), set(baselines))
+        for domain, baseline in baselines.items():
+            candidate = v12[domain]
+            baseline_vis = baseline.get(
+                "vis_augmentation_strength",
+                baseline["augmentation_strength"],
+            )
+            baseline_ir = baseline.get(
+                "ir_augmentation_strength",
+                baseline["augmentation_strength"],
+            )
+            self.assertGreater(
+                candidate["augmentation_strength"],
+                baseline["augmentation_strength"],
+            )
+            self.assertGreater(candidate["vis_augmentation_strength"], baseline_vis)
+            self.assertGreater(candidate["ir_augmentation_strength"], baseline_ir)
+            for key in ("label_smoothing", "classifier_dropout", "weight_decay"):
+                self.assertGreater(candidate[key], baseline[key])
+            for key in ("lr_main", "lr_visual", "lr_discriminator"):
+                self.assertLess(candidate[key], baseline[key])
+            for key in (
+                "adversarial_warmup_epochs",
+                "adversarial_ramp_epochs",
+                "module_c_warmup_epochs",
+                "module_c_ramp_epochs",
+            ):
+                self.assertGreater(candidate[key], baseline[key])
+            self.assertGreater(candidate["checkpoint_selection_min_epoch"], 1)
+            self.assertGreaterEqual(
+                candidate["early_stopping_min_epochs"],
+                candidate["checkpoint_selection_min_epoch"],
+            )
+            self.assertEqual(
+                candidate["dual_loss_weights"],
+                baseline["dual_loss_weights"],
+            )
+
     def test_v11_profiles_lower_only_target_classification_weight(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         v10 = load_weather_profiles(

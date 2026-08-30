@@ -22,6 +22,7 @@ from dual_d.training.trainer import (
     _apply_dual_loss_weight_overrides,
     _adversarial_scale,
     _balanced_snapshot_indices,
+    _checkpoint_selection_is_eligible,
     _lr_scheduler_is_active,
     _module_c_scale,
     _set_frozen_batch_norm_eval,
@@ -60,6 +61,12 @@ class TrainingSafetyTests(unittest.TestCase):
         self.assertFalse(_lr_scheduler_is_active(args, 23))
         self.assertTrue(_lr_scheduler_is_active(args, 24))
         self.assertTrue(_lr_scheduler_is_active(SimpleNamespace(), 1))
+
+    def test_checkpoint_selection_can_be_delayed_without_disabling_training(self) -> None:
+        args = SimpleNamespace(checkpoint_selection_min_epoch=40)
+        self.assertFalse(_checkpoint_selection_is_eligible(args, 39))
+        self.assertTrue(_checkpoint_selection_is_eligible(args, 40))
+        self.assertTrue(_checkpoint_selection_is_eligible(SimpleNamespace(), 1))
 
     def test_stable_monitor_uses_recent_worst_case(self) -> None:
         values = [0.80, 1.00, 0.96, 1.00, 0.92]
