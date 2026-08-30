@@ -13,6 +13,45 @@ from scripts.train_dual_d import apply_weather_profile, load_weather_profiles
 
 
 class WeatherProfileTests(unittest.TestCase):
+    def test_v13_changes_only_backlight_and_strengthens_requested_controls(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        v12 = load_weather_profiles(
+            project_root / "configs" / "module_c_weather_profiles_v12.json"
+        )["profiles"]
+        v13 = load_weather_profiles(
+            project_root / "configs" / "module_c_weather_profiles_v13.json"
+        )["profiles"]
+
+        self.assertEqual(set(v13), set(v12))
+        for domain in ("黑天", "雾天", "雨天"):
+            self.assertEqual(v13[domain], v12[domain])
+
+        baseline = v12["逆光"]
+        candidate = v13["逆光"]
+        for key in (
+            "augmentation_strength",
+            "vis_augmentation_strength",
+            "ir_augmentation_strength",
+            "label_smoothing",
+            "classifier_dropout",
+            "weight_decay",
+            "adversarial_warmup_epochs",
+            "adversarial_ramp_epochs",
+            "module_c_warmup_epochs",
+            "module_c_ramp_epochs",
+            "monitor_stability_window",
+            "checkpoint_selection_min_epoch",
+            "early_stopping_min_epochs",
+        ):
+            self.assertGreater(candidate[key], baseline[key])
+        for key in ("lr_main", "lr_visual", "lr_discriminator"):
+            self.assertLess(candidate[key], baseline[key])
+        self.assertEqual(
+            candidate["target_classification_weight"],
+            baseline["target_classification_weight"],
+        )
+        self.assertEqual(candidate["dual_loss_weights"], baseline["dual_loss_weights"])
+
     def test_v12_profiles_strengthen_the_requested_training_controls(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         v11 = load_weather_profiles(
