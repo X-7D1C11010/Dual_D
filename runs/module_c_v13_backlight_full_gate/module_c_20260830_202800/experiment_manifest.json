@@ -1,0 +1,16 @@
+{
+  "experiment_id": "module_c_20260830_202800",
+  "variants": [
+    "full"
+  ],
+  "domains": [
+    "逆光"
+  ],
+  "iterations": 3,
+  "epochs": 60,
+  "group_iterations": true,
+  "expected_runs": 3,
+  "monitor_metric": "val_f1_macro_present",
+  "pca_feature_view": false,
+  "weather_profile_config": "configs/module_c_weather_profiles_v13.json"
+}

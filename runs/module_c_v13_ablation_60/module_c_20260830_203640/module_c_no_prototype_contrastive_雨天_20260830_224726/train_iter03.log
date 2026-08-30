@@ -1,0 +1,26 @@
+2026-08-30 23:19:25 | Starting Dual_D standalone training
+2026-08-30 23:19:25 | Run directory: runs/module_c_v13_ablation_60/module_c_20260830_203640/module_c_no_prototype_contrastive_雨天_20260830_224726
+2026-08-30 23:19:25 | Device: cuda
+2026-08-30 23:19:25 | Source train samples: 992
+2026-08-30 23:19:25 | Target train samples: 96
+2026-08-30 23:19:25 | Target val samples: 26
+2026-08-30 23:19:25 | Classes: 14
+2026-08-30 23:19:25 | Data audit: same_dir=False | path_overlap(vis/ir/ais)=0/0/0 | content_overlap(vis/ir/ais)=0/0/0 | ais_index_overlap=0 | stem_mismatch(vis-ir/vis-ais)=117/0
+2026-08-30 23:19:25 | source_train classes: present 14/14 | absent 0 | counts [0:120, 1:44, 2:69, 3:45, 4:40, 5:30, 6:64, 7:80, 8:116, 9:68, 10:57, 11:83, 12:48, 13:128]
+2026-08-30 23:19:25 | target_train classes: present 6/14 | absent 8 | counts [0:7, 2:19, 9:32, 10:12, 11:6, 13:20]
+2026-08-30 23:19:25 | target_val classes: present 6/14 | absent 8 | counts [0:2, 2:5, 9:8, 10:4, 11:2, 13:5]
+2026-08-30 23:19:25 | Paired training classes: 6/14 | class ids [0, 2, 9, 10, 11, 13]
+2026-08-30 23:19:25 | Runtime profile: batch=16 | paired_steps=6 | workers=16 | train_eval_every=5 | raw_eval_every=5 | stability_window=4 | lr_scheduler_start=28 | checkpoint_select_from=40 | early_stop=15 after min_epoch=50
+2026-08-30 23:19:25 | Augmentation profile: base=0.650 | visible=0.700 | infrared=0.500 | freeze_frozen_batch_norm_stats=True
+2026-08-30 23:19:25 | VIS/IR pairing: class-level-unpaired | count-mismatch classes train/val: 10/0 | AIS alignment: none | AIS rows train/val: 0/0
+2026-08-30 23:19:26 | Effective Dual-D loss weights: {"adv_auxiliary": 0.02, "adv_primary": 0.02, "classification": 0.6, "contrastive": 0.025, "cycle": 0.12, "identity": 0.025, "prototype_contrastive": 0.0}
+2026-08-30 23:19:26 | Model parameters: total=17277714 | trainable=17120210
+2026-08-30 23:19:28 | Epoch 001/060 | loss 5.5897 | cls 5.5679 | tal 0.0726 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.0625 | train_full 0.1667 | val_acc 0.1538 | val_f1 0.0921 | adv/moduleC 0.00/0.00 | disc_steps 0 | grad(main/disc) 32.388/0.000 | lr(main/disc) 7.00e-05/2.40e-05 | cuda_peak(alloc/resv) 4.09/29.15GB | phase(train/val/raw/train_eval) 1.0/0.4/0.4/0.4s | 2.2s
+2026-08-30 23:19:29 | Epoch 002/060 | loss 4.9464 | cls 4.9366 | tal 0.0328 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.1562 | train_full n/a | val_acc 0.2308 | val_f1 0.2145 | adv/moduleC 0.00/0.00 | disc_steps 0 | grad(main/disc) 29.268/0.000 | lr(main/disc) 7.00e-05/2.40e-05 | cuda_peak(alloc/resv) 4.08/29.15GB | phase(train/val/raw/train_eval) 1.0/0.4/0.0/0.0s | 1.4s
+2026-08-30 23:19:30 | Epoch 003/060 | loss 4.4853 | cls 4.4898 | tal -0.0148 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.2083 | train_full n/a | val_acc 0.2308 | val_f1 0.2333 | adv/moduleC 0.00/0.00 | disc_steps 0 | grad(main/disc) 25.803/0.000 | lr(main/disc) 7.00e-05/2.40e-05 | cuda_peak(alloc/resv) 4.08/29.15GB | phase(train/val/raw/train_eval) 0.7/0.4/0.0/0.0s | 1.1s
+2026-08-30 23:19:32 | Epoch 004/060 | loss 4.1604 | cls 4.1361 | tal 0.0811 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.3229 | train_full n/a | val_acc 0.3077 | val_f1 0.2343 | adv/moduleC 0.00/0.00 | disc_steps 0 | grad(main/disc) 24.179/0.000 | lr(main/disc) 7.00e-05/2.40e-05 | cuda_peak(alloc/resv) 4.08/29.15GB | phase(train/val/raw/train_eval) 0.8/0.4/0.0/0.0s | 1.2s
+2026-08-30 23:19:34 | Epoch 005/060 | loss 3.7917 | cls 3.8154 | tal -0.0792 | dual_g 0.0000 | dual_d 0.0000 | train_acc 0.3438 | train_full 0.3854 | val_acc 0.3462 | val_f1 0.2662 | adv/moduleC 0.00/0.00 | disc_steps 0 | grad(main/disc) 23.306/0.000 | lr(main/disc) 7.00e-05/2.40e-05 | cuda_peak(alloc/resv) 4.08/29.15GB | phase(train/val/raw/train_eval) 0.8/0.4/0.4/0.4s | 2.0s
+2026-08-30 23:19:35 | Epoch 006/060 | loss 4.0076 | cls 3.8163 | tal -0.0639 | dual_g 0.2104 | dual_d 0.0000 | train_acc 0.4896 | train_full n/a | val_acc 0.4615 | val_f1 0.3505 | adv/moduleC 0.00/0.08 | disc_steps 0 | grad(main/disc) 22.992/0.000 | lr(main/disc) 7.00e-05/2.40e-05 | cuda_peak(alloc/resv) 4.08/29.15GB | phase(train/val/raw/train_eval) 0.8/0.4/0.0/0.0s | 1.2s
+2026-08-30 23:19:36 | Epoch 007/060 | loss 3.9672 | cls 3.5816 | tal -0.0322 | dual_g 0.3952 | dual_d 0.0000 | train_acc 0.4583 | train_full n/a | val_acc 0.4231 | val_f1 0.3086 | adv/moduleC 0.00/0.17 | disc_steps 0 | grad(main/disc) 22.382/0.000 | lr(main/disc) 7.00e-05/2.40e-05 | cuda_peak(alloc/resv) 4.08/29.15GB | phase(train/val/raw/train_eval) 0.6/0.4/0.0/0.0s | 1.0s
+2026-08-30 23:19:37 | Epoch 008/060 | loss 3.8983 | cls 3.3429 | tal -0.0763 | dual_g 0.5784 | dual_d 0.0000 | train_acc 0.5417 | train_full n/a | val_acc 0.3846 | val_f1 0.2762 | adv/moduleC 0.00/0.25 | disc_steps 0 | grad(main/disc) 20.951/0.000 | lr(main/disc) 7.00e-05/2.40e-05 | cuda_peak(alloc/resv) 4.08/29.15GB | phase(train/val/raw/train_eval) 0.9/0.4/0.0/0.0s | 1.2s
+2026-08-30 23:19:38 | Epoch 009/060 | loss 3.9233 | cls 3.2093 | tal -0.1394 | dual_g 0.7558 | dual_d 0.9128 | train_acc 0.6042 | train_full n/a | val_acc 0.3462 | val_f1 0.2551 | adv/moduleC 0.05/0.33 | disc_steps 3 | grad(main/disc) 20.592/2.463 | lr(main/disc) 7.00e-05/2.40e-05 | cuda_peak(alloc/resv) 4.09/29.15GB | phase(train/val/raw/train_eval) 0.7/0.4/0.0/0.0s | 1.0s
