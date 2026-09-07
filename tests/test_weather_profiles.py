@@ -227,6 +227,7 @@ class WeatherProfileTests(unittest.TestCase):
                             "dual_loss_weights": {
                                 "classification": 0.65,
                                 "cycle": 0.28,
+                                "modality_drift": 0.02,
                             },
                         }
                     }
@@ -239,6 +240,7 @@ class WeatherProfileTests(unittest.TestCase):
             self.assertEqual(args.monitor_stability_window, 5)
             self.assertEqual(args.dual_loss_weights["classification"], 0.65)
             self.assertEqual(overrides["dual_loss_weights"]["cycle"], 0.28)
+            self.assertEqual(args.dual_loss_weights["modality_drift"], 0.02)
             self.assertEqual(args.vis_augmentation_strength, 0.75)
             self.assertEqual(args.ir_augmentation_strength, 0.40)
             self.assertTrue(args.freeze_frozen_batch_norm_stats)

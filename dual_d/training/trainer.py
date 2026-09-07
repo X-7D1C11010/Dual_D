@@ -373,6 +373,7 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
     fused_dim = args.proj_dim * num_modalities
     if dual_config.feature_dim != fused_dim:
         dual_config.feature_dim = fused_dim
+    dual_config.modality_dims = tuple(args.proj_dim for _ in range(num_modalities))
 
     net_vis = VisualFeatureExtractor(
         output_dim=args.feature_dim,
@@ -573,6 +574,24 @@ def _module_c_scale(args, epoch: int) -> float:
     return min((epoch - warmup_epochs) / float(ramp_epochs), 1.0)
 
 
+def _modality_drift_scale(args, epoch: int) -> float:
+    """Return the delayed ramp used by the modality-drift constraint."""
+
+    warmup_epochs = max(
+        int(getattr(args, "modality_drift_warmup_epochs", 0)),
+        0,
+    )
+    ramp_epochs = max(
+        int(getattr(args, "modality_drift_ramp_epochs", 0)),
+        0,
+    )
+    if epoch <= warmup_epochs:
+        return 0.0
+    if ramp_epochs == 0:
+        return 1.0
+    return min((epoch - warmup_epochs) / float(ramp_epochs), 1.0)
+
+
 def _gradient_norm(parameters) -> float:
     """Compute the global L2 norm of currently populated gradients."""
 
@@ -654,6 +673,7 @@ def train_one_epoch(
     models.classifier.train()
     adversarial_scale = _adversarial_scale(args, epoch)
     module_c_scale = _module_c_scale(args, epoch)
+    modality_drift_scale = _modality_drift_scale(args, epoch)
 
     totals = {
         "loss_total": 0.0,
@@ -742,6 +762,7 @@ def train_one_epoch(
             num_classes=num_classes,
             adversarial_scale=adversarial_scale,
             module_c_scale=module_c_scale,
+            modality_drift_scale=modality_drift_scale,
         )
         _accumulate_logs(totals, g_logs)
         loss_total = loss_cls + args.tal_weight * loss_tal + loss_dual_g
@@ -878,6 +899,41 @@ def train_one_epoch(
             "dual_d_classification_feedback",
             steps,
         ),
+        "train_dual_d_modality_drift": _average_logged_metric(
+            totals,
+            "dual_d_modality_drift",
+            steps,
+        ),
+        "train_dual_d_modality_alignment_source_before": _average_logged_metric(
+            totals,
+            "dual_d_modality_alignment_source_before",
+            steps,
+        ),
+        "train_dual_d_modality_alignment_target_like_after": _average_logged_metric(
+            totals,
+            "dual_d_modality_alignment_target_like_after",
+            steps,
+        ),
+        "train_dual_d_modality_drift_source_to_target_raw": _average_logged_metric(
+            totals,
+            "dual_d_modality_drift_source_to_target_raw",
+            steps,
+        ),
+        "train_dual_d_modality_alignment_target_before": _average_logged_metric(
+            totals,
+            "dual_d_modality_alignment_target_before",
+            steps,
+        ),
+        "train_dual_d_modality_alignment_source_like_after": _average_logged_metric(
+            totals,
+            "dual_d_modality_alignment_source_like_after",
+            steps,
+        ),
+        "train_dual_d_modality_drift_target_to_source_raw": _average_logged_metric(
+            totals,
+            "dual_d_modality_drift_target_to_source_raw",
+            steps,
+        ),
         "train_dual_d_weighted_cycle": _average_logged_metric(
             totals, "dual_d_weighted_cycle", steps
         ),
@@ -892,6 +948,10 @@ def train_one_epoch(
         ),
         "train_dual_d_weighted_classification_feedback": _average_logged_metric(
             totals, "dual_d_weighted_classification_feedback", steps
+        ),
+        "train_modality_drift_scale": modality_drift_scale,
+        "train_dual_d_weighted_modality_drift": _average_logged_metric(
+            totals, "dual_d_weighted_modality_drift", steps
         ),
     }
 
@@ -1395,6 +1455,13 @@ def run_training(args) -> Dict[str, object]:
         "Effective Dual-D loss weights: %s",
         json.dumps(args.effective_dual_config["loss_weights"], sort_keys=True),
     )
+    logger.info(
+        "Modality drift: dims=%s | margin=%.6f | warmup=%d | ramp=%d",
+        args.effective_dual_config.get("modality_dims", []),
+        float(args.effective_dual_config.get("modality_drift_margin", 0.0)),
+        max(int(getattr(args, "modality_drift_warmup_epochs", 0)), 0),
+        max(int(getattr(args, "modality_drift_ramp_epochs", 0)), 0),
+    )
     multi_gpu_active = isinstance(models.net_vis, nn.DataParallel)
     if bool(getattr(args, "multi_gpu", False)) and device.type == "cuda":
         logger.info(
@@ -1611,7 +1678,8 @@ def run_training(args) -> Dict[str, object]:
         logger.info(
             "Epoch %03d/%03d | loss %.4f | cls %.4f | tal %.4f | dual_g %.4f | "
             "dual_d %.4f | train_acc %.4f | train_full %s | val_acc %.4f | "
-            "val_f1 %.4f | adv/moduleC %.2f/%.2f | disc_steps %.0f | "
+            "val_f1 %.4f | adv/moduleC/drift %.2f/%.2f/%.2f | "
+            "drift(s2t/t2s) %.4f/%.4f | disc_steps %.0f | "
             "grad(main/disc) %.3f/%.3f | lr(main/disc) %.2e/%.2e | "
             "cuda_peak(alloc/resv) %.2f/%.2fGB | "
             "phase(train/val/raw/train_eval) %.1f/%.1f/%.1f/%.1fs | %.1fs",
@@ -1628,6 +1696,9 @@ def run_training(args) -> Dict[str, object]:
             row["val_f1_macro_present"],
             row["train_adversarial_scale"],
             row["train_module_c_scale"],
+            row["train_modality_drift_scale"],
+            row["train_dual_d_modality_drift_source_to_target_raw"],
+            row["train_dual_d_modality_drift_target_to_source_raw"],
             row["train_discriminator_steps"],
             row["train_grad_norm_main"],
             row["train_grad_norm_discriminator"],

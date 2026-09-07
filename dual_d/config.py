@@ -45,6 +45,8 @@ class LossWeights:
         identity: Weight for identity preservation.
         contrastive: Weight for paired/class-aware feature contrast.
         prototype_contrastive: Weight for class-prototype contrastive feedback.
+        modality_drift: Weight for preserving cross-modality relational
+            structure during bidirectional domain translation.
     """
 
     classification: float = 1.0
@@ -54,6 +56,7 @@ class LossWeights:
     identity: float = 0.05
     contrastive: float = 0.10
     prototype_contrastive: float = 0.10
+    modality_drift: float = 0.0
 
 
 @dataclass
@@ -94,6 +97,11 @@ class DualDConfig:
         freeze_classifier_during_feedback: Prevent generated-feature feedback
             from updating classifier weights.  Gradients still flow through the
             classifier into the feature translators.
+        modality_dims: Boundaries of the projected modality blocks in the
+            concatenated feature. The training builder resolves this from the
+            active number of modalities and projection dimension.
+        modality_drift_margin: Allowed increase in modality-relation
+            disagreement before the drift penalty becomes active.
     """
 
     feature_dim: int = 384
@@ -102,6 +110,8 @@ class DualDConfig:
     detach_contrastive_positives: bool = True
     prototype_momentum: float = 0.95
     freeze_classifier_during_feedback: bool = True
+    modality_dims: Tuple[int, ...] = ()
+    modality_drift_margin: float = 0.01
     loss_weights: LossWeights = field(default_factory=LossWeights)
     primary_discriminator: DiscriminatorConfig = field(default_factory=DiscriminatorConfig)
     auxiliary_discriminator: DiscriminatorConfig = field(default_factory=DiscriminatorConfig)
@@ -115,6 +125,7 @@ class DualDConfig:
         primary_data = data.get("primary_discriminator", {})
         auxiliary_data = data.get("auxiliary_discriminator", {})
         generator_data = data.get("generator", {})
+        modality_dims = _tuple_from(data.get("modality_dims", ()))
 
         if "hidden_dims" in primary_data:
             primary_data["hidden_dims"] = _tuple_from(primary_data["hidden_dims"])
@@ -130,6 +141,8 @@ class DualDConfig:
             freeze_classifier_during_feedback=bool(
                 data.get("freeze_classifier_during_feedback", True)
             ),
+            modality_dims=modality_dims,
+            modality_drift_margin=float(data.get("modality_drift_margin", 0.01)),
             loss_weights=LossWeights(**loss_data),
             primary_discriminator=DiscriminatorConfig(**primary_data),
             auxiliary_discriminator=DiscriminatorConfig(**auxiliary_data),

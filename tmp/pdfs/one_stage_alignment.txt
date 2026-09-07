@@ -1,0 +1,786 @@
+                         This CVPR paper is the Open Access version, provided by the Computer Vision Foundation.
+                                      Except for this watermark, it is identical to the accepted version;
+                                the final published version of the proceedings is available on IEEE Xplore.
+
+
+
+
+  OSAN: A One-Stage Alignment Network to Unify Multimodal Alignment and
+                    Unsupervised Domain Adaptation
+
+            Ye Liu, Lingfeng Qiao, Changchong Lu, Di Yin, Chen Lin, Haoyuan Peng, Bo Ren
+                                         Tencent Youtu Lab
+            {rafelliu, leafqiao, chonglu, endymecyyin, iwilliamlin, haoyuanpeng, timren}@tencent.com
+
+
+
+                         Abstract                                                   source domain
+                                                                                                                                                one-stage alignment
+                                                                            P
+                                                                                    P                   N               N
+                                                                        P                                       N
+                                                                                                                                        P   P    P    P    P
+   Extending from unimodal to multimodal is a critical                                  P       P           N       N
+                                                                                                                                                                P    P     P   P
+
+
+
+
+                                                                                                                                                                                   domain alignment
+                                                                            P                                               N
+                                                                                             P          N                               P   P    P    P    P    P    P     P   P                         source
+                                                                        P       P                               N       N
+challenge for unsupervised domain adaptation (UDA). Two                                                                                                                                                  target
+                                                                                                                                                modality       alignment
+major problems emerge in unsupervised multimodal domain                                         P
+                                                                                                                                                                                                         modality1
+                                                                        P           P                       N       N           N       N   N    N    N    N                                             modality2
+                                                                                                                                                                N    N     N   N
+adaptation: domain adaptation and modality alignment. An                        P
+                                                                                            P       P
+                                                                                                                N           N       N
+                                                                                                                                        N   N    N    N    N    N    N     N   N
+                                                                                                                                                                                                         modality3
+                                                                                                    P               N           N
+intuitive way to handle these two problems is to fulfill these                  P        P                  N
+                                                                                                                                                                                                      P positive
+                                                                                        target domain                                             shared space                                        N negative
+tasks in two separate stages: aligning modalities followed
+by domain adaptation, or vice versa. However, domains
+and modalities are not associated in most existing two-stage                                        Figure 1. Conception of our one-stage model.
+studies, and the relationship between them is not lever-
+aged which can provide complementary information to each           is raised to learn a model from a labeled dataset (source
+other. In this paper, we unify these two stages into one to        domain) that can be generalized to other related tasks with-
+align domains and modalities simultaneously. In our model,         out sufficient labeled data (target domain) [3]. Classical do-
+a tensor-based alignment module (TAL) is presented to ex-          main adaptation can be classified into different categories:
+plore the relationship between domains and modalities. By          unsupervised domain adaptation (UDA), fully supervised
+this means, domains and modalities can interact sufficiently       domain adaptation, and semi-supervised domain adaptation
+and guide them to utilize complementary information for            [31]. In this paper, we focus on UDA where no samples
+better results. Furthermore, to establish a bridge between         in target domain are annotated. With this technique, it is
+domains, a dynamic domain generator (DDG) module is                not necessary to prepare a customized training dataset for
+proposed to build transitional samples by mixing the shared        a specific task, but it can perform the task effectively and
+information of two domains in a self-supervised manner,            efficiently.
+which helps our model learn a domain-invariant common                  There are two challenges when applying domain adap-
+representation space. Extensive experiments prove that our         tation to multimodal scenarios [17]: (1) how to align the
+method can achieve superior performance in two real-world          source and target domains and remit domain discrepancy,
+applications. The code will be publicly available.                 and (2) how to align multiple modalities and leverage mul-
+                                                                   timodal information. Most existing works address these
+                                                                   two problems in two consecutive stages: multimodal align-
+1. Introduction                                                    ment followed by domain adaptation [34, 41], or vice versa
+                                                                   [14, 44]. However, they solve these two issues separately
+   With explosively emerging multimedia data on the In-            without considering their relationship: domain and modal-
+ternet, the field of multimodal analysis achieves more and         ity can be treated as two views to portray the intrinsic char-
+more attention [10, 13, 18, 19, 43]. Compared to extensive         acteristic of multimodal data [8], and the hidden underlying
+unimodal models in NLP and CV, learning adequate knowl-            relationship in these two views can provide complemen-
+edge from multimodal signals is still preliminary but very         tary information to each other. Unimodal domain adapta-
+important. Abundant data plays a key role in different sce-        tion methods can not work well in multimodal tasks due to
+narios of multimodal analysis, such as pre-training or down-       the inability to preserve the relations between modalities at
+stream multimedia tasks. However, it is prohibitively ex-          the same time. Through our experiments and analysis, we
+pensive and time-consuming to obtain large amounts of la-          observe that the two-stage model could not achieve ideal
+beled data. To eliminate this issue, domain adaptation (DA)        performance. Fig.2 shows the learning curve of two-stage
+
+
+
+                                                                 3551
+model during training phase by 800 iterations for the task                 1.0
+of multimodal sentiment analysis. It can be found that the                                                                ours
+                                                                                                                          two-stage
+learning curve of two-stage model is oscillating and con-                  0.8
+verges slowly, which indicates that two-stage model is prob-
+ably not a superior solution. To handle these challenges, the              0.6
+
+
+
+
+                                                                    Loss
+objective of multimodal domain adaptation can be defined
+as: (1) Exploring the relationship between domains and                     0.4
+
+modalities; (2) Finding a common domain-invariant cross-
+modal representation space to align domains and modalities                 0.2
+
+simultaneously.
+                                                                           0.0
+    Therefore, in this paper, we design a One-Stage
+                                                                                 0   100   200   300    400   500   600   700    800
+Alignment Network (OSAN) to unify multimodal align-
+                                                                                                  Iteration
+ment and domain adaptation in one stage. Fig.1 shows the
+conception of our one-stage model. Our method benefits             Figure 2. The learning curves of our one-stage method and tradi-
+from: (1) The modality and domain are associated and in-           tional two-stage method in multimodal sentiment analysis task.
+teracted to capture the relationship between domains and
+modalities, which can provide rich complementary infor-
+mation to each other. (2) Multimodal alignment and domain          form an end-to-end learning where a separate common pre-
+adaptation are unified in one stage, which allows our model        processing step was integrated, which is different from our
+to perform domain adaptation and leverage multimodal in-           motivation. However, these studies only focus on the elim-
+formation at the same time. In Fig.2, we observe that the          ination of domain shift in unimodal scenarios, which may
+learning curve of our method is relatively stable and con-         lose effect when applied in multimodal area.
+verges better, which indicates that exploring the relation be-
+tween modality and domain contributes to our task.                 Multimodal Domain Adaption Qi et al. [17] first an-
+    In summary, our contributions are as follows:                  alyzed the multimodal domain adaptation and raised two
+    (1) To capture the relationship between domain and             problems, i.e., domain adaptation and modality alignment.
+modality, we propose a one-stage alignment network, called         To alleviate them, hybrid domain constraints and attention-
+OSAN, to associate domain and modality. In this way,               based modality fusion module were introduced to learn
+a joint domain-invariant and cross-modal representation            domain-invariant fused features. More recently, some stud-
+space is learned in one stage.                                     ies [14, 34, 41, 42, 44] related to this area have tried to ad-
+    (2) We design a TAL module to bring sufficient interac-        dress the multimodal problem by extending the unimodal
+tions between domains and modalities and guide them to             domain adaptation methods. Xu et al. [34] proposed a su-
+utilize complementary information for each other.                  pervised multimodal domain adaptation method for VQA
+    (3) To effectively bridge distinct domains, a DDG mod-         to learn joint feature embeddings across different domains
+ule is developed to dynamically construct multiple new do-         and modalities. Munro et al. [14] exploited the correspon-
+mains by combining knowledge of source and target do-              dence of modalities as a self-supervised alignment approach
+mains and exploring intrinsic structure of data distribution.      for UDA in addition to adversarial alignment. Furthermore,
+    (4) Extensive experiments on two totally different tasks       Zhou et al. [44] proposed MDMN for early rumor detec-
+demonstrate the effectiveness of our method compared to            tion, which can combine textual and visual information with
+the supervised and strongly UDA methods.                           two heterogeneous feature extractors. However, all of these
+                                                                   studies solved the two problems separately in two stages.
+2. Related Work                                                    Moreover, the relationship between modality and domain is
+                                                                   missing, thus they cannot achieve ideal performance.
+Unimodal Domain Adaption The main approaches for
+domain adaptation or domain alignment can be catego-               3. Proposed Method
+rized as discrepancy-based and adversarial-based methods
+[1, 23, 30]. Discrepancy-based methods design statistics,             Fig.3 presents an overview of our method that con-
+such as maximum mean discrepancy (MMD) [16], correla-              tains four parts: multimodal feature extraction, tensor-based
+tion alignment (CORAL) [45] and etc., to measure the dif-          alignment, dynamic domain generator and task-specific
+ference between two domain distributions. For adversarial-         heads. First, encoders, as multimodal feature extractor, map
+based methods, Ganin et al. [4] used the concept of genera-        source and target multimodal data to different latent spaces.
+tive adversarial networks (GAN) to obtain domain-invariant         Then, by means of an effective and efficient way of tensor
+characteristics. Wu et al. [32] proposed a one-stage adapta-       representation, we propose a TAL module to acquire rela-
+tion framework for nighttime semantic segmentation to per-         tion information through consecutive interactions between
+
+
+
+                                                                 3552
+           Encoder                Tensor-based Alignment (TAL)                               Dynamic Domain Generator (DDG)
+
+                                                                                                                          Target
+        Nice
+                                                              𝑼𝟐
+                                                              ×
+                                                                       𝒔                                                Embedding
+
+                     …
+        movie
+                                                                                                                            .            Correlation
+                                𝑼𝟏 ×
+                                                                   ⊛                                        Source                                         Generated
+                                                                                                                                             +              Source
+                                                                                                          Embedding
+                     …
+
+
+
+
+                                    Text
+                                    Vision          ×
+                                                                                                               Gating
+                                                    𝑼𝟑
+                     …
+
+
+
+
+                                    Audio
+
+        Source                                                                               Source                                                                    s′
+                                                                                           Embedding
+                                           One-Stage Alignment
+                                                                                                                                    Cross-sample
+                                                                                             Target                                  Attention
+       I love this                                                                         Embedding
+                                                              𝑽𝟐       𝒕                                                                                               t′
+                     …
+
+
+
+
+          story                                               ×
+                                                                                                               Gating
+
+                                𝑽𝟏 ×
+                                                                   ⊛
+                     …
+
+
+
+
+                                                                                                           Target                           +              Generated
+                                                                                                         Embedding                                           Target
+
+                                    Text
+                                                                                                                            .           Correlation
+                                                     ×
+                     …
+
+
+
+
+                                    Vision
+                                                                                                                          Source
+                                    Audio            𝑽𝟑
+                                                                                                                        Embedding
+        Target
+
+                                                          (s, t)                                                           (s′, t′ )
+
+          Tasks           Classification            𝑳𝒐𝒔𝒔𝒄𝒍𝒔        Discriminator            𝑳𝒐𝒔𝒔𝒂𝒅𝒗              Discrepancy                       𝑳𝒐𝒔𝒔𝒅𝒊𝒔
+
+
+
+
+Figure 3. Overview of our method OSAN. We use circle, square and triangle to represent three modalities of text, vision and audio. In the
+figure, × means mode–d product of a tensor and a matrix, ⊙ represents element-wise product, and ⊛ means tensor factorization.
+
+modalities and domains. Thus, the modality and domain are                    To perform multimodal alignment, TAL aims to find pairs
+aligned simultaneously in one stage. After that, we develop                  of linear transformations U(n) |N
+                                                                                                             n=1 and V
+                                                                                                                         (n) N
+                                                                                                                             |n=1 for each
+a DDG module to mix information from different domains                       modality of source and target domains to project samples
+to create new transitional domains. Finally, our network                     of two sets into low dimensional subspaces. During this
+is split into three branches: category classification, domain                process, we establish an interaction between domain and
+adversarial learning and discrepancy elimination.                            modality by maximizing a statistical measurement of co-
+                                                                             variance given a normalized standard deviation. As reported
+3.1. Tensor-based Alignment                                                  in [45], we choose covariance instead of the first-order mean
+                                                                             statistics used in MK-MMD [5, 21], as it is more powerful
+    We develop a TAL module to simultaneously address the                    and achieves better performance. By this means, domains
+challenges of multimodal alignment and domain adaptation.                    and modalities can be aligned simultaneously in one stage.
+We first resort to tensor representation, an effective and nat-              Thus the objective function is defined as follows:
+ural representation of multimodal data, to develop models
+                                                                                   n                      o
+capturing inter-modality dynamics [11, 37]. Then, we uti-                           U(n) |N
+                                                                                          n=1 , V
+                                                                                                  (n) N
+                                                                                                     |n=1
+lize statistical measurements to establish an interaction be-
+                                                                                                  N                               N
+tween domains and modalities to explore the relation infor-                                       Y                 T             Y                    T
+                                                                                   = max[[(X            ×n U(n) ) ⊗ (Y                  ×n V(n) ); ]]
+mation. In this way, we associate domains and modalities                                          n=1                            n=1
+so that they can communicate and align together. Specif-                                   N                                    N                                           (1)
+                                                                                           Y               T                    Y                  T
+ically, we perform tensor factorization to fuse multimodal                     s.t. (X           ×n U(n) )T(N +1) (X                  ×n U(n) )(N +1) = I
+information and maximize statistical measurements to si-                                   n=1                                  n=1
+
+multaneously eliminate domain gaps.                                                        N
+                                                                                           Y               T
+                                                                                                                                N
+                                                                                                                                Y                  T
+    Specifically, we use XI1 ×···×IN ×M and YJ1 ×···×JN ×M                            (Y         ×n V(n) )T(N +1) (Y                   ×n V(n) )(N +1) = I
+                                                                                           n=1                                  n=1
+to represent source and target dataset with N modalities and
+M samples. For example, a video can be represented by a                         The objective function above does not have a closed-
+third-order tensor using a differentiable outer product be-                  form solution, so instead we derive a suboptimal solution
+tween visual, textual, and acoustic representations [37]. For                following the principle of the alternating projection method
+simplicity, we first make the training samples zero mean.                    [24], where the complicated optimization problem is re-
+
+
+
+                                                                           3553
+duced into smaller conditional subproblems that can be              domain gap. Specifically, s′ represents a variety of s which
+solved by simple established methods. Therefore, the ob-            maintains information of s and mix source-relevant com-
+jective function is decomposed into N different subprob-            monality from t′ . Similarly, t′ is a variety of t. As shown
+lems:                                                               in Fig.3, we capture the commonality between s and t with
+       n           o        n    T
+                                           o                        the help of the popular and effective self-attention mecha-
+                                   (n) (n)
+        U(n) , V(n) = max tr U(n) Cxy V                             nism used in Transformers [29]. We construct a sequence
+                                                           (2)
+                 T                       T                          in which the length is 2 by stacking s and t. Denote query
+       s.t. U(n) C(n)
+                  xx U
+                       (n)            (n) (n)
+                           = I, V(n) Cyy V    =I
+                                                                    Qs and key Ks is projected from the source embedding s
+                                          (n)    (n)                respectively, while query Qt and key Kt are from the tar-
+where, for simplification, we define Cxy , Cxx as
+                                                                    get embedding t, respectively. With dot-product between
+                                                                  queries and keys, the source-target attention matrix Mst is
+            C(n)
+             xy = [[(X
+                      (n̄)
+                           ) ⊗ (Y(n̄) ); (n̄)(n̄)]]
+                                                         (3)      obtained, which represents the relations between source and
+            C(n)
+             xx = [[(X
+                      (n̄)
+                           ) ⊗ (X(n̄) ); (n̄)(n̄)]]                 target. Afterwards, we design a gating to highlight the com-
+                                                                    monality between s and t, and fuse the commonality to gen-
+where ([[· ⊗ ·; (n̄)(n̄)]]) means tensor contraction on all in-     erate s′ and t′ respectively. In detail, to generate s′ , we cal-
+dices except the n-th index on the tensor product [25]. Sim-        culate the feature-relevant distribution p by summing Mst
+         (n)        (n)              (n)       (n)
+ilarly, Cyy and Cyx is same as Cxx and Cxy in form. By              along the dimension of the query. Larger value in p means
+Eq.2, an interaction between source and target domains for          related element in t is more-relevant to s, which should be
+the n-th modality is established.                                   chosen for commonality. As a result, the commonality c is
+                                                                    obtained by c = t ⊙ N orm(p), where N orm(·) means the
+3.2. Dynamic Domain Generator                                       normalized operator and ⊙ is the element-wise multiplica-
+                                                                    tion. Finally, s′ is obtained by fusing commonality c and
+   In domain adaptation, adversarial learning is often used         information from s.
+to align domains by developing a domain discriminator to
+judge samples from the source or target domains [27, 33].                                s′ = λs + (1 − λ)c                      (4)
+By this means, it brings a two-class classification task with
+                                                                    Finally, we use multi-head attention to generate various new
+hard assignments of 1 or 0. They try to confuse the do-
+                                                                    domains to enrich the sample space. Samples from new do-
+main discriminator to learn a shared common representation
+                                                                    mains and raw source and target domains are fed to domain
+space between the source and target domains. However, it
+                                                                    discriminator, by which the domain discriminator is guided
+usually achieves worse performance due to a huge variance
+                                                                    by the hard label information and well-designed soft do-
+between the two domains.
+                                                                    mains. Each sample from these soft domains explores the
+   To overcome this problem, several works have been
+                                                                    intrinsic structure of data distribution from raw domains and
+proposed to produce some transitional domains based on
+                                                                    enriches feature patterns by the interaction of two domains.
+Mixup [35, 40]. They mixed images from the source and
+target domains to generate more soft and mixed samples              3.3. Tasks
+[26, 33]. Suppose there are one sample s from source do-
+                                                                       Our model consists of three tasks: category classifica-
+main and another sample t from target domain, s and t are
+                                                                    tion, domain adversarial learning, and domain discrepancy
+linearly interpolated [40] to generate a new sample. This
+                                                                    elimination. First, we perform K-way object classification
+strategy can fully utilize the inter-domain information and
+                                                                    on the source domain. Second, a domain discriminator is in-
+improve the generalization ability of models. However, it
+                                                                    troduced to judge samples from source, target or the created
+has an obvious shortcoming: the generated sample fuses
+                                                                    soft domains. Finally, we try to learn transferable features
+full information of two domains, which contains redundant
+                                                                    by minimizing domain discrepancy. In summary, we have:
+information and speciality of domains that may induce un-
+desirable oscillations on training the domain discriminator.                         L = Lcls + αLadv + βLdis                    (5)
+   To solve this issue, we propose a DDG module to es-
+                                                                    where Lcls is the category classification loss, Ladv is the
+tablish a bridge between domains. Specifically, DDG ex-
+                                                                    adversarial loss, and Ldis is the discrepancy loss. α and
+plicitly captures commonality and abandons the specialty
+                                                                    β are weights to balance these three losses. Cross entropy
+of domains. By highlighting this commonality, we make
+                                                                    loss is used as classification and adversarial loss, while MK-
+the domain discriminator focus on commonality rather than
+                                                                    MMD [5] is employed as discrepancy loss.
+full information, which helps our model learn a domain-
+invariant common representation space.
+                                                                    4. Experiments
+   Given one sample s from source domain and another
+sample t from target domain, DDG is proposed to dynami-               We conduct experiments on two totally different tasks to
+cally generate soft samples s′ and t′ to smoothly bridge the        demonstrate the efficacy of our model. One task is popu-
+
+
+
+                                                                  3554
+Table 1. Multimodal sentiment analysis results on CMU-MOSI and CMU-MOSEI. †: results come from [7]; ‡: results come from [36]; ♢:
+results come from [6]; ↓: the lower the better.
+
+ Methods                        CMU-MOSEI −→ CMU-MOSI                              CMU-MOSI −→ CMU-MOSEI
+                          MAE ↓ Corr Acc-7 Acc-2     F1                      MAE ↓ Corr Acc-7 Acc-2       F1
+ Direct Transfer          0.794 0.764 39.5 79.7/81.5 79.5/81.4               0.621 0.685 51.3 79.54/82.14 80.84/81.33
+ Supervised
+ TFN [37] †        0.901           0.698 34.9    -/80.8      -/80.7      0.593        0.700 50.2     -/82.5      -/82.1
+ ICCN [22] †       0.862           0.714 39.0    -/83.0      -/83.0      0.565        0.713 51.6     -/84.2      -/84.2
+ MISA [7] ‡        0.804           0.764 -       80.79/82.10 80.77/82.03 0.568        0.724 -        82.59/84.23 82.67/83.97
+ MAG-BERT [20] ‡   0.731           0.789 -       82.50/84.30 82.60/84.30 0.539        0.753 -        83.80/85.20 83.70/85.10
+ Self-MM [36] ‡    0.713           0.798 -       84.00/85.98 84.42/85.95 0.530        0.765 -        82.81/85.17 82.53/85.30
+ MMIM [6] ♢        0.700           0.800 46.65   84.14/86.06 84.00/85.98 0.526        0.772 54.24    82.24/85.97 82.66/85.94
+ UDA
+ DAN [12]          0.777           0.774 39.79   80.03/81.71 79.74/81.49 0.614        0.693 51.6     80.24/81.32 81.36/82.47
+ ADDA [27]         0.784           0.773 40.14   80.12/82.26 80.13/82.32 0.636        0.707 51.4     80.47/81.59 81.53/82.76
+ MM-SADA [15]      0.787           0.769 40.52   80.9/82.77 80.68/82.63 0.667         0.684 52.1     80.32/81.44 81.26/81.95
+ MDMN [44]         0.778           0.774 39.65   81.92/82.01 81.97/82.11 0.602        0.712 52.8     82.24/82.38 82.95/83.26
+ OSAN(TAL + Mixup) 0.753           0.782 42.64   82.44/83.32 82.14/83.21 0.542        0.757 53.14    82.76/82.88 83.13/83.96
+ OSAN(TAL + DDG) 0.713             0.801 46.38   83.12/84.58 83.02/84.51 0.532        0.768 53.84    83.41/84.36 83.31/84.47
+
+
+lar multimodal sentiment analysis, the other is a new task         methods. Direct transfer means that we train a model us-
+called video text classification.                                  ing source dataset and then predict test samples in target
+                                                                   dataset. For UDA, we use model structures of discrepancy-
+4.1. Multimodal Sentiment Analysis                                 based model DAN [12], adversarial-based model ADDA
+   Multimodal sentiment analysis is a new dimension of             [27], and some typical studies focused on multimodal area
+traditional text-based sentiment analysis, which goes be-          such as MM-SADA [14] and MDMN [44] where multi-
+yond the analysis of texts, and includes other modalities          modal alignment and domain adaptation are performed in
+data. This task processes data from multiple sources, such         two separate stages. Besides direct transfer and UDA meth-
+as acoustic, visual, and textual information to understand         ods, we also bring supervised methods for evaluation. For
+various human emotions.                                            supervised methods, we consider the pure learning-based
+                                                                   model TFN [37], feature space manipulation like ICCN
+                                                                   [22], MISA [7], more recent and competitive baselines in-
+4.1.1   Experimental Setup
+                                                                   cluding MAG-BERT [20], Self-MM [36] and MMIM [6].
+Datasets and Model Structure We use two classical
+datasets, called CMU-MOSEI [39] and CMU-MOSI [38],                 4.1.2   Experimental Results
+for the multimodal sentiment analysis task.
+                                                                   Overall The overall results are shown in Table 1. In de-
+Metrics We use the metrics that have been presented                tail, we find that OSAN achieves the best results among all
+in [6]: mean absolute error (MAE), which is the average            UDA methods on all metrics with large margin. Surpris-
+mean absolute difference value between predicted values            ingly, OSAN even achieves better performance than many
+and truth values. Pearson correlation (Corr) that measures         supervised methods, such as TFN, MISA and MAG-BERT.
+the degree of prediction skew, seven-class classification ac-
+curacy (Acc-7) indicating the proportion of predictions that       Ablation Study To verify the contributions of each com-
+correctly fall into the same interval of seven intervals be-       ponent of OSAN, we design a series of ablation experi-
+tween -3 and +3 as the corresponding truths, binary classi-        ments. First, we evaluate the effectiveness of the two pro-
+fication accuracy (Acc-2) and F1 score for positive/negative       posed modules TAL and DDG by eliminating one or both
+and non-negative/negative classification results.                  of them from our model, as illustrated in Table 2. We notice
+                                                                   a manifest performance degradation after removing TAL or
+Baselines To inspect the relative performance of our               DDG, and the results are even worse when both modules are
+model, we compare our model with various baselines in              removed. Furthermore, we conduct additional experiments
+three aspects: Direct Transfer, UDA and Supervised                 to explore the contributions of the three losses. In Table 3,
+
+
+
+                                                                3555
+we find that only using classification loss Lcls , our model         Table 5. Ablation study of TAL hyperparameters on CMU-MOSI.
+can achieve competitive performance compared to tradi-
+tional multimodal DA methods such as MDMN, demon-                                     t : 384        t : 192        t : 192
+                                                                          TAL
+strating that both modality and domain are well aligned us-                           v : 2, a : 2   v : 4, a : 2   v : 2, a : 4
+ing TAL and DDG. Finally, we adjust some important hy-                    MAE ↓       0.000          +0.007         +0.006
+perparameters of DDG and TAL to evaluate their impor-                     Corr        0.00           -0.009         -0.006
+tance. In terms of DDG, we adjust the number of created                   Acc-7       0.00           -1.17          -0.91
+soft domains by changing multi-head H. Furthermore, we                    Acc-2       0.00/0.00      -0.77/-1.16    -0.30/-0.91
+adjust the fusion coefficient λ to control the fusion ratio be-           F1          0.00/0.00      -0.59/-2.02    -0.13/-0.79
+tween the source and target samples. In Table 4, we observe
+that the performance improves significantly as the number
+                                                                     have no good effect or even side effects on downstream
+of domains increases. We also find that the fusion coeffi-
+                                                                     tasks. To control and filter video content, we propose a
+cient set to 0.85 can achieve the best result. In terms of TAL,
+                                                                     new video text classification task to classify video texts into
+we reduce multimodal features to different combinations of
+                                                                     valuable categories.
+dimensions. We find that the combination of 384 ∗ 2 ∗ 2
+achieves the best performance, as shown in Table 5.
+                                                                     4.2.1      Experimental Setup
+Table 2. Ablation study of the proposed modules on CMU-MOSI.
+                                                                     Datasets and Model Structure We construct a well-
+  Module       w/o DDG         w/o TAL          w/o Both             defined industrial-grade dataset, called Text-news, which
+  MAE ↓        +0.039          +0.051           +0.074               is dedicated to promote video text extraction research for
+  Corr         -0.023          -0.021           -0.032               news applications. The extraction of text in videos usually
+  Acc-7        -3.55           -4.65            -5.86                involves two steps: (1) text recognition and (2) text clas-
+  Acc-2        -1.03/-1.30     -1.89/-1.72      -2.22/-1.81          sification. We prepare various videos from news programs
+  F1           -1.15/-1.52     -1.85/-1.61      -2.34/-1.88          for annotation and use a general Optical Character Recog-
+                                                                     nition (OCR) engine to locate and recognize all the texts in
+                                                                     the videos. Then, an annotation system is designed for the
+    Table 3. Ablation study of three losses on CMU-MOSI.
+                                                                     video text classification task to tag video texts. Three rep-
+                                                                     resentative categories are defined which are Caption, Sub-
+  Loss        Lcls             Lcls + Ladv      Lcls + Ldis
+                                                                     title and Others. To verify the effectiveness and generality
+  MAE ↓       +0.018           +0.009           +0.016
+                                                                     of our method, we use Text-news as source domain dataset
+  Corr        -0.016           -0.012           -0.014
+                                                                     and construct a dataset named Text-show with a few anno-
+  Acc-7       -1.07            -0.82            -0.67
+                                                                     tated samples as the target domain dataset. The difference
+  Acc-2       -0.65/-0.95      -0.32/-0.28      -0.67/-0.74
+                                                                     between the source and target datasets is that the video pro-
+  F1          -0.48/-0.69      -0.7/-0.49       -0.31/-0.58
+                                                                     gram is totally different. The source dataset is constructed
+                                                                     from news videos, while the target dataset is constructed
+Table 4. Ablation study of DDG hyperparameters on CMU-MOSI.          from videos of variety shows. We use the standard Preci-
+                                                                     sion, Recall, and F1 score for evaluation.
+      λ = 0.85 λ = 0.9       λ = 0.85 λ = 0.9
+DDG
+      H = 64 H = 64          H = 32      H = 32
+                                                                     Baselines To inspect the relative performance of our
+MAE ↓ 0.00      +0.004       0.001       +0.006
+                                                                     model OSAN, we compare it with various baselines in two
+Corr  0.00      -0.01        -0.003      -0.016
+                                                                     aspects: Direct Transfer and UDA methods. Unlike multi-
+Acc-7 0.00      -0.590       -0.27       -0.75
+                                                                     modal sentiment analysis, we do not use Supervised meth-
+Acc-2 0.00/0.00 -0.27/-1.14 -0.16/-1.07 -0.39/-1.29
+                                                                     ods for comparison because the target dataset does not have
+F1    0.00/0.00 -0.259/-0.15 -0.14/-0.04 -0.39/-0.30
+                                                                     annotated training data.
+
+4.2. Video Text Classification
+                                                                     4.2.2      Experimental Results
+   Video text classification is a real industrial task for video
+understanding [9]. With massive videos generated every-              Overall The results are shown in Table 6. All the metrics
+day, video textual information extraction is an essential            of OSAN achieve the best results when compared to other
+work in many applications. However, numerous useless                 UDA methods and direct transfer, leading to a splendid per-
+texts, such as rolling texts and blurred background texts,           formance of video text classification task.
+
+
+
+                                                                   3556
+     Table 6. Video text classification results on Text-show.        DA related losses such as adversarial loss and discrepancy
+                                                                     loss, it performs slightly worse than keeping all three losses,
+  Methods                        Text-news −→ Text-show              but still better than traditional multimodal DA methods such
+                                Precision Recall F1                  as MM-SADA and MDMN. This observation indicates that
+  Direct Transfer               80.2       77.98   79.08             different domains are well aligned by TAL and DDG. Fi-
+  UDA                                                                nally, we tuned some hyperparameters of TAL and DDG to
+  DAN [12]                      87.44         80.58     83.87        explore their impact. For the DDG hyperparameters, in Ta-
+  ADDA [27]                     91.66         83.66     87.48        ble 9, we observe that a smaller fusion coefficient λ and a
+  MM-SADA [15]                  94.07         83.49     88.46        larger multi-head H can achieve better results. For the TAL
+  MDMN [44]                     93.54         83.69     88.34        hyperparameters, we reduce multimodal features to differ-
+  OSAN(TAL + Mixup)             94.42         84.79     89.35        ent dimensions. In Table 10, the combination 56 ∗ 14 for
+  OSAN(TAL + DDG)               95.03         86.44     90.53        textual and visual features achieves the best result.
+
+ Table 7. Ablation study of the proposed modules on Text-show.
+
+   Module          w/o DDG          w/o TAL         w/o Both
+   Precision       -0.90            -0.51           -0.96
+   Recall          -1.24            -2.37           -2.95
+   F1              -1.09            -1.55           -2.07                    (a) Directly transfer    (b) Our method w/o TAL&DDG   (c) Our method
+
+
+
+
+                                                                     Figure 4. Visualization of the feature distribution of the target do-
+     Table 8. Ablation study of three losses on Text-show.           main for multimodal sentiment analysis.
+
+   Loss           Lcls          Lcls + Ladv       Lcls + Ldis
+   Precision      -0.35         -0.17             -0.45
+   Recall         -0.42         -0.24             -0.14
+   F1             -0.39         -0.21             -0.28
+
+Table 9. Ablation study of DDG hyperparameters on Text-show.               (a) Directly transfer     (b) Our method w/o TAL&DDG    (c) Our method
+
+
+
+
+            λ = 0.9         λ = 0.95     λ = 0.9      λ = 0.95       Figure 5. Visualization of the feature distribution of the target do-
+  DDG                                                                main for video text classification.
+            H = 128         H = 128      H = 64       H = 64
+  Precision 0.00            -0.16        -0.75        -0.67
+  Recall    0.00            -0.32        -1.21        -1.33          5. Discussion
+  F1        0.00            -0.25        -1.01        -1.03          5.1. Visual Analysis of Feature Distribution
+Table 10. Ablation study of TAL hyperparameters on Text-show.            We use t-SNE [28] to visualize the feature distribution of
+                                                                     test data in target domain. Fig.5 illustrates the t-SNE visu-
+  TAL          t : 56, v : 14    t : 14, v : 56   t : 28, v : 28     alization of the feature distribution in the video text classifi-
+  Precision    0.000             -0.96            +0.24              cation task. We find that the features of different classes
+  Recall       0.000             +0.05            -0.59              are separated more clearly, and the features in the same
+  F1           0.000             -0.41            -0.22              class are more centralized. A similar phenomenon is ob-
+                                                                     served in Fig.4 of the feature distribution for the multimodal
+Ablation Study Similar to multimodal sentiment analy-                sentiment analysis task. This makes sense because TAL
+sis, in order to show the benefits of TAL and DDG modules,           can explore the relationship between domains and modal-
+we perform a series of ablation experiments. First, we elim-         ities and guide them to utilize complementary information.
+inate one or both modules from our model. In Table 7, the            Moreover, DDG can construct new domains that guarantee
+overall F1 score decreases after removing single module,             domain-invariance in a more continuous latent space.
+and the results are even worse when removing both mod-
+                                                                     5.2. Distribution Discrepancy
+ules, which demonstrates the efficacy of these two modules.
+Furthermore, we study the impact of three losses of cat-                To quantify the distribution discrepancy of source and
+egory classification loss, adversarial loss, and discrepancy         target domains, we use the classical metric of symmetric
+loss, as shown in Table 8. The results show that all three           Jensen-Shannon divergence (JSD) [2]. Fig.7 shows the fea-
+losses contribute to performance. Moreover, by removing              ture distribution discrepancy based on two baselines and
+
+
+
+                                                                   3557
+                                                                               MDMN                                                                       OSAN(ours)
+      Domain      Image                      Text                                                  Image                       Text
+                                                                               Result                                                                       Result
+
+      Source                   Beyond that, I actually excelled                  gt: 0                         Thank you for that Godelieve, we all           gt: 2
+                           academically from some of my decisions             prediction: --                       enjoyed your comments!                  prediction: --
+
+                                                                                gt: 2.0                                                                      gt: 2.0
+      Target                um i say go see it coz i i enjoyed it now       prediction:-0.37                  um i say go see it coz i i enjoyed it now   prediction:1.85
+
+                            hey were all randomly chosen ad we're
+      Source                 going to have my lovely assistant here              gt: 0                        This story demonstrates how ridiculous          gt: -2
+                            choose from among these three people              prediction: --                         and petty fighting, or war…           prediction: --
+
+                              and um i liked you know catherine                                                 and um i liked you know catherine
+      Target                                                                    gt: -0.6                                                                     gt: -0.6
+                              hardwicke is like you know kind of                                                hardwicke is like you know kind of
+                                           ridiculous                        prediction:0.42                                 ridiculous                   prediction:-0.56
+
+
+      Source                well if they had kept their mouth shut,              gt: -1                      Learn a language if you can, because that       gt: 2.0
+                            that movie would have been fabulous.              prediction: --                    will make your life more interesting       prediction: --
+
+                                                                                gt: 1.2                                                                      gt: 1.2
+      Target                     and it was kind of interesting             prediction:-1.94                       and it was kind of interesting         prediction:1.53
+
+
+
+
+Figure 6. Some samples analysis of one baseline MDMN and our model OSAN for UDA task CMU-MOSEI → CMU-MOSI. Columns
+show information of one representative frame extracted from video clip, text message and the prediction result. Rows give information of
+target samples and closest source samples.
+
+our model on two tasks. Two baselines are Direct Trans-                                        more relevant to the target samples. Specifically, take the
+fer and our model without the two proposed modules TAL                                         target sample and source sample in the first row for exam-
+and DDG. We observe that JSD of our model is smaller than                                      ple, with our model, speakers in both the source frame and
+JSD of both baselines. This phenomenon implies that our                                        target frame are very happy. Moreover, there is one com-
+model can reduce the domain gap more effectively than the                                      mon keyword in what the speakers said: enjoyed. Com-
+baselines.                                                                                     bining these two modalities of image and text, our model
+                                                                                               correctly classifies this target sample as positive sentiment
+                                                                  Direct transfer
+                                                                                               with a score of 1.85, which is very close to the ground
+2.5
+                                                                  Our model
+                                                                                               truth score of 2. In contrast, source sample found by the
+                                                                  w/o TAL&DDG                  MDMN is not relevant to the target sample. There is no
+2.0
+                                                                  Our model
+                                                                                               similar semantic information in what they said. The ex-
+1.5                                                                                            pressions in the frames are dissimilar. The phenomenon in
+                                                                                               these cases implies that our model can learn a common la-
+1.0
+                                                                                               tent space in which the source domain and target domain
+                                                                                               are well aligned.
+0.5
+
+
+0.0                                                                                            6. Conclusion
+      CMU-MOSEI      CMU-MOSI              Text-news           Text-show
+                                                                                                  To address the problems of domain adaptation and
+Figure 7. Distribution discrepancy of different methods on two                                 modality alignment in multimodal domain adaptation, we
+different tasks CMU-MOSEI → CMU-MOSI and Text-news →                                           propose a novel one-stage alignment network to unify these
+Text-show.                                                                                     two problems in one stage. In our model, the TAL mod-
+                                                                                               ule is proposed to explore the relationship between domains
+5.3. Case Studies                                                                              and modalities, which can provide complementary informa-
+   To deeply explore the advantages of our model over other                                    tion to each other. Moreover, the DDG module is designed
+baselines, we give some predictions of a two-stage base-                                       to generate new soft samples that mix information from
+line MDMN and our model OSAN for the UDA task CMU-                                             both the source and target domains, guiding our model in a
+MOSEI → CMU-MOSI, as shown in Fig.6. We select some                                            more continuous space. Extensive experiments on two mul-
+typical samples from the target domain to explore how our                                      timodal tasks with different extents of domain shift demon-
+model works. For each target sample, we find the closest                                       strate the excellent performance of our model.
+sample from source domain by calculating cosine similarity
+between target sample and source sample. We observe that
+the closest source samples picked by our model OSAN are
+
+
+
+                                                                                       3558
+References                                                                  tations for vision-and-language tasks.         arXiv preprint
+                                                                            arXiv:1908.02265, 2019. 1
+ [1] Shai Ben-David, John Blitzer, Koby Crammer, Alex                  [14] Jonathan Munro and Dima Damen. Multi-modal domain
+     Kulesza, Fernando Pereira, and Jennifer Wortman Vaughan.               adaptation for fine-grained action recognition. In Proceed-
+     A theory of learning from different domains. Machine learn-            ings of the IEEE/CVF conference on computer vision and
+     ing, 79(1):151–175, 2010. 2                                            pattern recognition, pages 122–132, 2020. 1, 2, 5
+ [2] Bent Fuglede and Flemming Topsoe. Jensen-shannon diver-           [15] Jonathan Munro and Dima Damen. Multi-modal domain
+     gence and hilbert space embedding. In International Sympo-             adaptation for fine-grained action recognition. In Proceed-
+     sium onInformation Theory, 2004. ISIT 2004. Proceedings.,              ings of the IEEE/CVF Conference on Computer Vision and
+     page 31. IEEE, 2004. 7                                                 Pattern Recognition (CVPR), June 2020. 5, 7
+ [3] Yaroslav Ganin and Victor Lempitsky. Unsupervised domain          [16] Sinno Jialin Pan, Ivor W Tsang, James T Kwok, and Qiang
+     adaptation by backpropagation. In International conference             Yang. Domain adaptation via transfer component analy-
+     on machine learning, pages 1180–1189. PMLR, 2015. 1                    sis. IEEE transactions on neural networks, 22(2):199–210,
+ [4] Yaroslav Ganin, Evgeniya Ustinova, Hana Ajakan, Pas-                   2010. 2
+     cal Germain, Hugo Larochelle, François Laviolette, Mario         [17] Fan Qi, Xiaoshan Yang, and Changsheng Xu. A unified
+     Marchand, and Victor Lempitsky. Domain-adversarial train-              framework for multimodal domain adaptation. In Proceed-
+     ing of neural networks. The journal of machine learning                ings of the 26th ACM International Conference on Multime-
+     research, 17(1):2096–2030, 2016. 2                                     dia, MM ’18, page 429–437, New York, NY, USA, 2018.
+ [5] Arthur Gretton, Dino Sejdinovic, Heiko Strathmann, Sivara-             Association for Computing Machinery. 1, 2
+     man Balakrishnan, Massimiliano Pontil, Kenji Fukumizu,            [18] Lingfeng Qiao, Chen Wu, Ye Liu, Haoyuan Peng, Di Yin,
+     and Bharath K Sriperumbudur. Optimal kernel choice for                 and Bo Ren. Grafting pre-trained models for multimodal
+     large-scale two-sample tests. In Advances in neural informa-           headline generation. arXiv preprint arXiv:2211.07210,
+     tion processing systems, pages 1205–1213. Citeseer, 2012. 3,           2022. 1
+     4                                                                 [19] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya
+ [6] Wei Han, Hui Chen, and Soujanya Poria. Improving mul-                  Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry,
+     timodal fusion with hierarchical mutual information maxi-              Amanda Askell, Pamela Mishkin, Jack Clark, et al. Learn-
+     mization for multimodal sentiment analysis, 2021. 5                    ing transferable visual models from natural language super-
+ [7] Devamanyu Hazarika, Roger Zimmermann, and Soujanya                     vision. In International Conference on Machine Learning,
+     Poria. Misa: Modality-invariant and-specific representations           pages 8748–8763. PMLR, 2021. 1
+     for multimodal sentiment analysis. In Proceedings of the          [20] Wasifur Rahman, Md Kamrul Hasan, Sangwu Lee, Amir
+     28th ACM International Conference on Multimedia, pages                 Zadeh, Chengfeng Mao, Louis-Philippe Morency, and Ehsan
+     1122–1131, 2020. 5                                                     Hoque. Integrating multimodal information in large pre-
+                                                                            trained transformers. In Proceedings of the conference. As-
+ [8] Donghyun Kim, Yi-Hsuan Tsai, Bingbing Zhuang, Xiang
+                                                                            sociation for Computational Linguistics. Meeting, volume
+     Yu, Stan Sclaroff, Kate Saenko, and Manmohan Chandraker.
+                                                                            2020, page 2359. NIH Public Access, 2020. 5
+     Learning cross-modal contrastive features for video domain
+                                                                       [21] Baochen Sun and Kate Saenko. Deep coral: Correlation
+     adaptation. In Proceedings of the IEEE/CVF International
+                                                                            alignment for deep domain adaptation. In European con-
+     Conference on Computer Vision, pages 13618–13627, 2021.
+                                                                            ference on computer vision, pages 443–450. Springer, 2016.
+     1
+                                                                            3
+ [9] Ye Liu, Changchong Lu, Chen Lin, Di Yin, and Bo Ren.
+                                                                       [22] Zhongkai Sun, Prathusha Sarma, William Sethares, and
+     Contrastive graph multimodal model for text classification
+                                                                            Yingyu Liang. Learning relationships between text, audio,
+     in videos. arXiv preprint arXiv:2206.02343, 2022. 6
+                                                                            and video via deep canonical correlation for multimodal lan-
+[10] Ye Liu, Lingfeng Qiao, Di Yin, Zhuoxuan Jiang, Xinghua                 guage analysis. In Proceedings of the AAAI Conference on
+     Jiang, Deqiang Jiang, and Bo Ren. Os-msl: One stage multi-             Artificial Intelligence, volume 34, pages 8992–8999, 2020. 5
+     modal sequential link framework for scene segmentation and        [23] Hui Tang and Kui Jia. Discriminative adversarial domain
+     classification. In Proceedings of the 30th ACM International           adaptation. In Proceedings of the AAAI Conference on Arti-
+     Conference on Multimedia, pages 6269–6277, 2022. 1                     ficial Intelligence, volume 34, pages 5940–5947, 2020. 2
+[11] Zhun Liu, Ying Shen, Varun Bharadhwaj Lakshmi-                    [24] Dacheng Tao, Xuelong Li, Xindong Wu, and Steve May-
+     narasimhan, Paul Pu Liang, Amir Zadeh, and Louis-Philippe              bank. Tensor rank one discriminant analysis-a convergent
+     Morency.       Efficient low-rank multimodal fusion with               method for discriminative multilinear subspace selection.
+     modality-specific factors. arXiv preprint arXiv:1806.00064,            Neurocomputing, 71(10):1866–1882, 2008. 3
+     2018. 3                                                           [25] Dacheng Tao, Xuelong Li, Xindong Wu, and Stephen J May-
+[12] Mingsheng Long, Yue Cao, Jianmin Wang, and Michael Jor-                bank. General tensor discriminant analysis and gabor fea-
+     dan. Learning transferable features with deep adaptation net-          tures for gait recognition. IEEE transactions on pattern anal-
+     works. In International conference on machine learning,                ysis and machine intelligence, 29(10):1700–1715, 2007. 4
+     pages 97–105. PMLR, 2015. 5, 7                                    [26] Wilhelm Tranheden, Viktor Olsson, Juliano Pinto, and
+[13] Jiasen Lu, Dhruv Batra, Devi Parikh, and Stefan Lee.                   Lennart Svensson. Dacs: Domain adaptation via cross-
+     Vilbert: Pretraining task-agnostic visiolinguistic represen-           domain mixed sampling. In Proceedings of the IEEE/CVF
+
+
+
+
+                                                                     3559
+     Winter Conference on Applications of Computer Vision,            [40] Hongyi Zhang, Moustapha Cisse, Yann N Dauphin, and
+     pages 1379–1389, 2021. 4                                              David Lopez-Paz. mixup: Beyond empirical risk minimiza-
+[27] Eric Tzeng, Judy Hoffman, Kate Saenko, and Trevor Darrell.            tion. arXiv preprint arXiv:1710.09412, 2017. 4
+     Adversarial discriminative domain adaptation. In Proceed-        [41] Tong Zhang, Di Wang, Huanhuan Chen, Zhiwei Zeng, Wei
+     ings of the IEEE conference on computer vision and pattern            Guo, Chunyan Miao, and Lizhen Cui. Bdann: Bert-based
+     recognition, pages 7167–7176, 2017. 4, 5, 7                           domain adaptation neural network for multi-modal fake news
+[28] Laurens Van der Maaten and Geoffrey Hinton. Visualiz-                 detection. In 2020 International Joint Conference on Neural
+     ing data using t-sne. Journal of machine learning research,           Networks (IJCNN), pages 1–8, 2020. 1, 2
+     9(11), 2008. 7                                                   [42] Weichen Zhang, Dong Xu, Jing Zhang, and Wanli Ouyang.
+[29] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszko-               Progressive modality cooperation for multi-modality do-
+     reit, Llion Jones, Aidan N Gomez, Lukasz Kaiser, and Il-              main adaptation. IEEE Transactions on Image Processing,
+     lia Polosukhin. Attention is all you need. arXiv preprint             30:3293–3306, 2021. 2
+     arXiv:1706.03762, 2017. 4                                        [43] Yiyi Zhang, Li Niu, Ziqi Pan, Meichao Luo, Jianfu Zhang,
+[30] Wei Wang, Haojie Li, Zhengming Ding, Feiping Nie, Jun-                Dawei Cheng, and Liqing Zhang. Exploiting motion infor-
+     yang Chen, Xiao Dong, and Zhihui Wang. Rethinking maxi-               mation from unlabeled videos for static image action recog-
+     mum mean discrepancy for visual domain adaptation. IEEE               nition. In Proceedings of the AAAI Conference on Artificial
+     Transactions on Neural Networks and Learning Systems,                 Intelligence, volume 34, pages 12918–12925, 2020. 1
+     2021. 2                                                          [44] Honghao Zhou, Tinghuai Ma, Huan Rong, Yurong Qian,
+[31] Garrett Wilson and Diane J Cook. A survey of unsupervised             Yuan Tian, and Najla Al-Nabhan. Mdmn: Multi-task and do-
+     deep domain adaptation. ACM Transactions on Intelligent               main adaptation based multi-modal network for early rumor
+     Systems and Technology (TIST), 11(5):1–46, 2020. 1                    detection. Expert Systems with Applications, 195:116517,
+[32] Xinyi Wu, Zhenyao Wu, Hao Guo, Lili Ju, and Song Wang.                2022. 1, 2, 5, 7
+     Dannet: A one-stage domain adaptation network for unsu-          [45] Junbao Zhuo, Shuhui Wang, Weigang Zhang, and Qingming
+     pervised nighttime semantic segmentation. In Proceedings              Huang. Deep unsupervised convolutional domain adapta-
+     of the IEEE/CVF Conference on Computer Vision and Pat-                tion. In Proceedings of the 25th ACM international confer-
+     tern Recognition, pages 15769–15778, 2021. 2                          ence on Multimedia, pages 261–269, 2017. 2, 3
+[33] Minghao Xu, Jian Zhang, Bingbing Ni, Teng Li, Chengjie
+     Wang, Qi Tian, and Wenjun Zhang. Adversarial domain
+     adaptation with domain mixup. In Proceedings of the
+     AAAI Conference on Artificial Intelligence, volume 34, pages
+     6502–6509, 2020. 4
+[34] Yiming Xu, Lin Chen, Zhongwei Cheng, Lixin Duan, and
+     Jiebo Luo. Open-ended visual question answering by multi-
+     modal domain adaptation. arXiv preprint arXiv:1911.04058,
+     2019. 1, 2
+[35] Shen Yan, Huan Song, Nanxiang Li, Lincan Zou, and Liu
+     Ren. Improve unsupervised domain adaptation with mixup
+     training. arXiv preprint arXiv:2001.00677, 2020. 4
+[36] Wenmeng Yu, Hua Xu, Ziqi Yuan, and Jiele Wu. Learn-
+     ing modality-specific representations with self-supervised
+     multi-task learning for multimodal sentiment analysis. arXiv
+     preprint arXiv:2102.04830, 2021. 5
+[37] Amir Zadeh, Minghai Chen, Soujanya Poria, Erik Cam-
+     bria, and Louis-Philippe Morency. Tensor fusion net-
+     work for multimodal sentiment analysis. arXiv preprint
+     arXiv:1707.07250, 2017. 3, 5
+[38] Amir Zadeh, Rowan Zellers, Eli Pincus, and Louis-Philippe
+     Morency. Mosi: multimodal corpus of sentiment intensity
+     and subjectivity analysis in online opinion videos. arXiv
+     preprint arXiv:1606.06259, 2016. 5
+[39] AmirAli Bagher Zadeh, Paul Pu Liang, Soujanya Poria, Erik
+     Cambria, and Louis-Philippe Morency. Multimodal lan-
+     guage analysis in the wild: Cmu-mosei dataset and inter-
+     pretable dynamic fusion graph. In Proceedings of the 56th
+     Annual Meeting of the Association for Computational Lin-
+     guistics (Volume 1: Long Papers), pages 2236–2246, 2018.
+     5
+
+
+
+
+                                                                    3560
+

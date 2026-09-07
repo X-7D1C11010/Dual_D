@@ -17,7 +17,12 @@ from dual_d.config import DualDConfig, LossWeights
 from dual_d.data.audit import audit_dataset_splits, data_audit_errors
 from dual_d.data.multimodal_dataset import PairedImageTransform, SampleRecord
 from dual_d.data.paired_sampler import PairedClassSampler
-from dual_d.losses import class_prototype_contrastive_loss, paired_contrastive_loss
+from dual_d.losses import (
+    class_prototype_contrastive_loss,
+    modality_relation_alignment_score,
+    modality_relation_drift_loss,
+    paired_contrastive_loss,
+)
 from dual_d.training.trainer import (
     _apply_dual_loss_weight_overrides,
     _adversarial_scale,
@@ -25,6 +30,7 @@ from dual_d.training.trainer import (
     _checkpoint_selection_is_eligible,
     _lr_scheduler_is_active,
     _module_c_scale,
+    _modality_drift_scale,
     _set_frozen_batch_norm_eval,
     _stable_monitor_score,
     validate_cuda_architecture,
@@ -226,6 +232,42 @@ class TrainingSafetyTests(unittest.TestCase):
         self.assertEqual(_module_c_scale(args, 5), 0.0)
         self.assertEqual(_module_c_scale(args, 10), 0.5)
         self.assertEqual(_module_c_scale(args, 15), 1.0)
+
+    def test_modality_drift_has_an_independent_delayed_ramp(self) -> None:
+        args = SimpleNamespace(
+            modality_drift_warmup_epochs=12,
+            modality_drift_ramp_epochs=12,
+        )
+        self.assertEqual(_modality_drift_scale(args, 12), 0.0)
+        self.assertEqual(_modality_drift_scale(args, 18), 0.5)
+        self.assertEqual(_modality_drift_scale(args, 24), 1.0)
+
+    def test_modality_relation_drift_detects_relational_damage(self) -> None:
+        modality = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
+        )
+        original = torch.cat([modality, modality, modality], dim=1)
+        damaged = torch.cat(
+            [modality, modality[[0, 2, 1, 3]], modality],
+            dim=1,
+        ).requires_grad_(True)
+
+        self.assertAlmostEqual(
+            float(modality_relation_alignment_score(original, (2, 2, 2))),
+            0.0,
+            places=7,
+        )
+        penalty, before, after, raw_drift = modality_relation_drift_loss(
+            original,
+            damaged,
+            (2, 2, 2),
+            margin=0.0,
+        )
+        self.assertGreater(float(after), float(before))
+        self.assertGreater(float(raw_drift), 0.0)
+        self.assertGreater(float(penalty), 0.0)
+        penalty.backward()
+        self.assertIsNotNone(damaged.grad)
 
     def test_multi_positive_contrast_is_not_penalized_by_positive_count(self) -> None:
         anchors = torch.tensor([[1.0, 0.0], [0.0, 1.0]])

@@ -29,6 +29,7 @@ from .losses import (
     discriminator_real_fake_loss,
     generator_fooling_loss,
     identity_preservation_loss,
+    modality_relation_drift_loss,
     paired_contrastive_loss,
     safe_item,
 )
@@ -216,6 +217,7 @@ class DualDiscriminatorCoordinator(nn.Module):
         num_classes: Optional[int] = None,
         adversarial_scale: float = 1.0,
         module_c_scale: float = 1.0,
+        modality_drift_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute generator-side cooperative loss.
 
@@ -227,6 +229,7 @@ class DualDiscriminatorCoordinator(nn.Module):
         weights = self.config.loss_weights
         adversarial_scale = max(0.0, min(float(adversarial_scale), 1.0))
         module_c_scale = max(0.0, min(float(module_c_scale), 1.0))
+        modality_drift_scale = max(0.0, min(float(modality_drift_scale), 1.0))
 
         primary_adv = generator_fooling_loss(
             self.primary_discriminator(outputs.source_like)
@@ -340,6 +343,89 @@ class DualDiscriminatorCoordinator(nn.Module):
                     ):
                         parameter.requires_grad_(requires_grad)
 
+        drift_loss = outputs.source_features.new_tensor(0.0)
+        drift_source_before = outputs.source_features.new_tensor(0.0)
+        drift_target_like_after = outputs.source_features.new_tensor(0.0)
+        drift_source_to_target_raw = outputs.source_features.new_tensor(0.0)
+        drift_target_before = outputs.source_features.new_tensor(0.0)
+        drift_source_like_after = outputs.source_features.new_tensor(0.0)
+        drift_target_to_source_raw = outputs.source_features.new_tensor(0.0)
+        modality_dims = tuple(int(value) for value in self.config.modality_dims)
+        drift_layout_is_valid = (
+            len(modality_dims) >= 2
+            and all(value > 0 for value in modality_dims)
+            and sum(modality_dims) == outputs.source_features.size(1)
+        )
+        if drift_layout_is_valid:
+            drift_is_trainable = (
+                modality_drift_scale > 0.0
+                and float(weights.modality_drift) > 0.0
+            )
+            if drift_is_trainable:
+                # This dedicated branch receives detached TAL features so the
+                # drift term protects the established relation structure by
+                # updating the translators rather than moving TAL to chase them.
+                drift_target_like = self.translator.source_to_target(
+                    outputs.source_features.detach()
+                )
+                drift_source_like = self.translator.target_to_source(
+                    outputs.target_features.detach()
+                )
+                (
+                    drift_source_to_target,
+                    drift_source_before,
+                    drift_target_like_after,
+                    drift_source_to_target_raw,
+                ) = modality_relation_drift_loss(
+                    outputs.source_features.detach(),
+                    drift_target_like,
+                    modality_dims,
+                    margin=self.config.modality_drift_margin,
+                )
+                (
+                    drift_target_to_source,
+                    drift_target_before,
+                    drift_source_like_after,
+                    drift_target_to_source_raw,
+                ) = modality_relation_drift_loss(
+                    outputs.target_features.detach(),
+                    drift_source_like,
+                    modality_dims,
+                    margin=self.config.modality_drift_margin,
+                )
+                drift_loss = 0.5 * (
+                    drift_source_to_target + drift_target_to_source
+                )
+            else:
+                # Even before the delayed constraint starts, keep the metric
+                # visible so training logs show when drift begins to emerge.
+                with torch.no_grad():
+                    (
+                        drift_source_to_target,
+                        drift_source_before,
+                        drift_target_like_after,
+                        drift_source_to_target_raw,
+                    ) = modality_relation_drift_loss(
+                        outputs.source_features,
+                        outputs.target_like,
+                        modality_dims,
+                        margin=self.config.modality_drift_margin,
+                    )
+                    (
+                        drift_target_to_source,
+                        drift_target_before,
+                        drift_source_like_after,
+                        drift_target_to_source_raw,
+                    ) = modality_relation_drift_loss(
+                        outputs.target_features,
+                        outputs.source_like,
+                        modality_dims,
+                        margin=self.config.modality_drift_margin,
+                    )
+                    drift_loss = 0.5 * (
+                        drift_source_to_target + drift_target_to_source
+                    )
+
         weighted_cycle = module_c_scale * weights.cycle * cycle_loss
         weighted_identity = module_c_scale * weights.identity * identity_loss
         weighted_contrast = module_c_scale * weights.contrastive * contrast_loss
@@ -348,6 +434,9 @@ class DualDiscriminatorCoordinator(nn.Module):
         )
         weighted_classification = (
             module_c_scale * weights.classification * classification_loss
+        )
+        weighted_modality_drift = (
+            modality_drift_scale * weights.modality_drift * drift_loss
         )
 
         total_loss = (
@@ -358,6 +447,7 @@ class DualDiscriminatorCoordinator(nn.Module):
             + weighted_contrast
             + weighted_prototype
             + weighted_classification
+            + weighted_modality_drift
         )
         logs = {
             "dual_d/generator_total": safe_item(total_loss),
@@ -368,13 +458,30 @@ class DualDiscriminatorCoordinator(nn.Module):
             "dual_d/contrastive": safe_item(contrast_loss),
             "dual_d/prototype_contrastive": safe_item(prototype_contrastive_loss),
             "dual_d/classification_feedback": safe_item(classification_loss),
+            "dual_d/modality_drift": safe_item(drift_loss),
+            "dual_d/modality_alignment_source_before": safe_item(drift_source_before),
+            "dual_d/modality_alignment_target_like_after": safe_item(
+                drift_target_like_after
+            ),
+            "dual_d/modality_drift_source_to_target_raw": safe_item(
+                drift_source_to_target_raw
+            ),
+            "dual_d/modality_alignment_target_before": safe_item(drift_target_before),
+            "dual_d/modality_alignment_source_like_after": safe_item(
+                drift_source_like_after
+            ),
+            "dual_d/modality_drift_target_to_source_raw": safe_item(
+                drift_target_to_source_raw
+            ),
             "dual_d/adversarial_scale": adversarial_scale,
             "dual_d/module_c_scale": module_c_scale,
+            "dual_d/modality_drift_scale": modality_drift_scale,
             "dual_d/weighted_cycle": safe_item(weighted_cycle),
             "dual_d/weighted_identity": safe_item(weighted_identity),
             "dual_d/weighted_contrastive": safe_item(weighted_contrast),
             "dual_d/weighted_prototype_contrastive": safe_item(weighted_prototype),
             "dual_d/weighted_classification_feedback": safe_item(weighted_classification),
+            "dual_d/weighted_modality_drift": safe_item(weighted_modality_drift),
         }
         return total_loss, logs
 

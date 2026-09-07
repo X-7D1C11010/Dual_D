@@ -77,6 +77,8 @@ WEATHER_PROFILE_KEYS = frozenset(
         "adversarial_ramp_epochs",
         "module_c_warmup_epochs",
         "module_c_ramp_epochs",
+        "modality_drift_warmup_epochs",
+        "modality_drift_ramp_epochs",
         "monitor_stability_window",
         "checkpoint_selection_min_epoch",
         "dual_loss_weights",
@@ -178,6 +180,7 @@ def load_weather_profiles(path: str | Path | None) -> Dict[str, Dict[str, Any]]:
                 "identity",
                 "contrastive",
                 "prototype_contrastive",
+                "modality_drift",
             }
             unknown_losses = sorted(set(dual_loss_weights) - valid_loss_names)
             if unknown_losses:
@@ -223,6 +226,8 @@ def apply_weather_profile(
         "adversarial_ramp_epochs",
         "module_c_warmup_epochs",
         "module_c_ramp_epochs",
+        "modality_drift_warmup_epochs",
+        "modality_drift_ramp_epochs",
         "lr_scheduler_start_epoch",
         "early_stopping_patience",
         "early_stopping_min_epochs",
@@ -588,6 +593,21 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         type=int,
         default=default("module_c_ramp_epochs", 10),
         help="Epochs used to linearly ramp all Module-C constraint weights to 1.",
+    )
+    parser.add_argument(
+        "--modality-drift-warmup-epochs",
+        type=int,
+        default=default("modality_drift_warmup_epochs", 12),
+        help=(
+            "Epochs before modality-drift regularization begins. The drift "
+            "diagnostics are still logged during this warmup."
+        ),
+    )
+    parser.add_argument(
+        "--modality-drift-ramp-epochs",
+        type=int,
+        default=default("modality_drift_ramp_epochs", 12),
+        help="Epochs used to linearly ramp modality-drift regularization to 1.",
     )
     parser.add_argument(
         "--monitor-metric",

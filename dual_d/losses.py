@@ -3,7 +3,8 @@
 Module purpose:
     Centralize reusable loss functions for discriminator updates, generator
     updates, cycle consistency, identity preservation, and paired contrastive
-    learning.
+    learning. It also measures whether domain translation degrades the
+    relationship structure established between modality-specific blocks.
 
 Public interfaces:
     - discriminator_real_fake_loss(real_logits, fake_logits)
@@ -13,12 +14,14 @@ Public interfaces:
     - paired_contrastive_loss(...)
     - batch_class_prototypes(...)
     - class_prototype_contrastive_loss(...)
+    - modality_relation_alignment_score(...)
+    - modality_relation_drift_loss(...)
     - safe_item(tensor)
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -201,6 +204,81 @@ def class_prototype_contrastive_loss(
     logits = torch.matmul(anchor_norm, prototype_norm.t()) / float(temperature)
     logits = logits.masked_fill(~prototype_mask.view(1, -1).bool(), -1e4)
     return F.cross_entropy(logits, labels[valid])
+
+
+def split_modality_features(
+    fused_features: torch.Tensor,
+    modality_dims: Sequence[int],
+) -> Tuple[torch.Tensor, ...]:
+    """Split a concatenated feature tensor into its modality-specific blocks."""
+
+    dims = tuple(int(value) for value in modality_dims)
+    if len(dims) < 2 or any(value <= 0 for value in dims):
+        raise ValueError("modality_dims must contain at least two positive dimensions.")
+    if fused_features.dim() != 2:
+        raise ValueError("Fused modality features must have shape [batch, feature_dim].")
+    if sum(dims) != fused_features.size(1):
+        raise ValueError(
+            "modality_dims do not match the fused feature dimension: "
+            f"sum={sum(dims)}, feature_dim={fused_features.size(1)}."
+        )
+    return tuple(torch.split(fused_features, dims, dim=1))
+
+
+def modality_relation_alignment_score(
+    fused_features: torch.Tensor,
+    modality_dims: Sequence[int],
+) -> torch.Tensor:
+    """Measure disagreement between modality-wise sample relation matrices.
+
+    Each modality block produces a cosine-similarity matrix over the samples
+    in the current batch. Comparing these matrices avoids assuming that equal
+    projected dimensions have identical coordinate meanings. Lower values
+    indicate that the modalities describe the batch with more similar
+    relational structure.
+    """
+
+    modality_features = split_modality_features(fused_features, modality_dims)
+    relation_matrices = [
+        torch.matmul(
+            F.normalize(features, p=2, dim=1),
+            F.normalize(features, p=2, dim=1).t(),
+        )
+        for features in modality_features
+    ]
+    pairwise_disagreement = [
+        F.mse_loss(relation_matrices[left], relation_matrices[right])
+        for left in range(len(relation_matrices))
+        for right in range(left + 1, len(relation_matrices))
+    ]
+    return torch.stack(pairwise_disagreement).mean()
+
+
+def modality_relation_drift_loss(
+    original_features: torch.Tensor,
+    translated_features: torch.Tensor,
+    modality_dims: Sequence[int],
+    margin: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Penalize translation only when it worsens cross-modality relations.
+
+    The original alignment score is detached and acts as a fixed reference.
+    A non-negative margin permits small, necessary changes during domain
+    translation. The returned tuple contains the penalty, before score, after
+    score, and signed raw drift respectively.
+    """
+
+    if original_features.shape != translated_features.shape:
+        raise ValueError("Original and translated fused features must have equal shapes.")
+    margin = float(margin)
+    if margin < 0.0:
+        raise ValueError("Modality drift margin must be non-negative.")
+
+    before = modality_relation_alignment_score(original_features, modality_dims).detach()
+    after = modality_relation_alignment_score(translated_features, modality_dims)
+    raw_drift = after - before
+    penalty = torch.relu(raw_drift - margin)
+    return penalty, before, after, raw_drift
 
 
 def safe_item(value: torch.Tensor | float | int) -> float:

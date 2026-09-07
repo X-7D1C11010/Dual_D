@@ -5,6 +5,7 @@
   "detach_contrastive_positives": true,
   "prototype_momentum": 0.90,
   "freeze_classifier_during_feedback": true,
+  "modality_drift_margin": 0.01,
   "loss_weights": {
     "classification": 0.5,
     "adv_primary": 0.035,
@@ -12,7 +13,8 @@
     "cycle": 0.32,
     "identity": 0.05,
     "contrastive": 0.04,
-    "prototype_contrastive": 0.06
+    "prototype_contrastive": 0.06,
+    "modality_drift": 0.02
   },
   "primary_discriminator": {
     "hidden_dims": [128, 64],
