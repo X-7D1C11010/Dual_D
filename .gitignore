@@ -10,6 +10,8 @@ nohup.out
 fog_v5_reference_20260827/
 output/
 docs/
+runs/
+tmp/
 
 # 忽略 Python 缓存
 __pycache__/

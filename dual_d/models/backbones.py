@@ -12,6 +12,8 @@ Public interfaces:
     - ComplexAISFeatureExtractor
     - AISMlpFeatureExtractor
     - AISFeatureExtractor
+    - SARResNet20Encoder
+    - OpticalResNet20Encoder
     - Classifier
     - LabelSmoothingCrossEntropy
     - set_requires_grad
@@ -23,6 +25,131 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torchvision.models as tv_models
+
+
+class _SmallResidualBlock(nn.Module):
+    """CIFAR/So2Sat-style residual block for 32x32 patches."""
+
+    expansion = 1
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        residual = self.shortcut(inputs)
+        outputs = F.relu(self.bn1(self.conv1(inputs)), inplace=True)
+        outputs = self.bn2(self.conv2(outputs))
+        return F.relu(outputs + residual, inplace=True)
+
+
+class SmallResNet20Encoder(nn.Module):
+    """Small-stem ResNet-20-style encoder that preserves 32x32 patch detail."""
+
+    def __init__(self, input_channels: int, output_dim: int = 256):
+        super().__init__()
+        self.input_channels = int(input_channels)
+        self.output_dim = int(output_dim)
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                self.input_channels,
+                16,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+        )
+        self.stage1 = self._make_stage(16, 16, blocks=3, stride=1)
+        self.stage2 = self._make_stage(16, 32, blocks=3, stride=2)
+        self.stage3 = self._make_stage(32, 64, blocks=3, stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.proj = nn.Linear(64, self.output_dim)
+        self._initialize_weights()
+
+    @staticmethod
+    def _make_stage(
+        in_channels: int,
+        out_channels: int,
+        blocks: int,
+        stride: int,
+    ) -> nn.Sequential:
+        layers = [_SmallResidualBlock(in_channels, out_channels, stride=stride)]
+        layers.extend(
+            _SmallResidualBlock(out_channels, out_channels, stride=1)
+            for _ in range(int(blocks) - 1)
+        )
+        return nn.Sequential(*layers)
+
+    def _initialize_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if images.dim() != 4 or images.size(1) != self.input_channels:
+            raise ValueError(
+                f"Expected [batch,{self.input_channels},height,width], "
+                f"got {tuple(images.shape)}."
+            )
+        features = self.stem(images)
+        features = self.stage1(features)
+        features = self.stage2(features)
+        features = self.stage3(features)
+        features = torch.flatten(self.avgpool(features), 1)
+        return self.proj(features)
+
+
+class SARResNet20Encoder(SmallResNet20Encoder):
+    """Independent 8-channel Sentinel-1 encoder."""
+
+    def __init__(self, input_channels: int = 8, output_dim: int = 256):
+        super().__init__(input_channels=input_channels, output_dim=output_dim)
+
+
+class OpticalResNet20Encoder(SmallResNet20Encoder):
+    """Independent 10-channel Sentinel-2 encoder."""
+
+    def __init__(self, input_channels: int = 10, output_dim: int = 256):
+        super().__init__(input_channels=input_channels, output_dim=output_dim)
 
 
 class VisualFeatureExtractor(nn.Module):

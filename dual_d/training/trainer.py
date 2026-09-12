@@ -37,8 +37,10 @@ from dual_d.config import load_config
 from dual_d.data import (
     MultiModalDomainDataset,
     PairedClassSampler,
+    So2SatLCZ42Dataset,
     audit_dataset_splits,
     data_audit_errors,
+    stratified_split_indices,
 )
 from dual_d.integration_adapter import DualDTrainingAdapter
 from dual_d.models import (
@@ -46,6 +48,8 @@ from dual_d.models import (
     Classifier,
     IRFeatureExtractor,
     LabelSmoothingCrossEntropy,
+    OpticalResNet20Encoder,
+    SARResNet20Encoder,
     TensorBasedAlignmentStable,
     VisualFeatureExtractor,
     set_requires_grad,
@@ -59,8 +63,10 @@ from dual_d.training.metrics import classification_metrics
 class ModelBundle:
     """Container for trainable model modules."""
 
-    net_vis: VisualFeatureExtractor
-    net_ir: IRFeatureExtractor
+    # Legacy names are retained in checkpoints.  For So2Sat, net_vis owns the
+    # Optical/S2 encoder and net_ir owns the SAR/S1 encoder.
+    net_vis: nn.Module
+    net_ir: nn.Module
     net_ais: Optional[nn.Module]
     tal: TensorBasedAlignmentStable
     dual_adapter: DualDTrainingAdapter
@@ -210,6 +216,9 @@ def _probe_data_parallel(
 def build_datasets(args):
     """Build source train, target train, and target validation datasets."""
 
+    if getattr(args, "dataset_type", "directory") == "so2sat_lcz42":
+        return _build_so2sat_datasets(args)
+
     source_train = MultiModalDomainDataset(
         root_dir=args.source_root,
         domain_type="source",
@@ -327,8 +336,145 @@ def build_datasets(args):
         target_train,
         target_train_eval,
         target_val,
+        None,
         label_map,
     )
+
+
+def _build_so2sat_datasets(args):
+    """Build leakage-safe So2Sat source/adaptation/test datasets."""
+
+    dataset_root = Path(args.dataset_root)
+
+    def path(name: str) -> Path:
+        return dataset_root / str(getattr(args, name))
+
+    common = {
+        "sar_clip_after_normalize": getattr(
+            args, "sar_clip_after_normalize", None
+        )
+    }
+    source_data = path("so2sat_source_data")
+    source_geo = path("so2sat_source_geo")
+    target_adapt_data = path("so2sat_target_adapt_data")
+    target_adapt_geo = path("so2sat_target_adapt_geo")
+    target_test_data = path("so2sat_target_test_data")
+    target_test_geo = path("so2sat_target_test_geo")
+
+    target_index_dataset = So2SatLCZ42Dataset(
+        target_adapt_data,
+        target_adapt_geo,
+        domain_role="target_adapt",
+        augment=False,
+        **common,
+    )
+    target_train_indices, target_val_indices = stratified_split_indices(
+        target_index_dataset.labels,
+        validation_fraction=float(args.target_adapt_val_fraction),
+        seed=int(args.target_adapt_split_seed),
+    )
+    del target_index_dataset
+
+    source_train = So2SatLCZ42Dataset(
+        source_data,
+        source_geo,
+        domain_role="source",
+        augment=bool(getattr(args, "satellite_augment", True)),
+        **common,
+    )
+    source_train_eval = So2SatLCZ42Dataset(
+        source_data,
+        source_geo,
+        domain_role="source",
+        augment=False,
+        **common,
+    )
+    target_train = So2SatLCZ42Dataset(
+        target_adapt_data,
+        target_adapt_geo,
+        domain_role="target_adapt",
+        indices=target_train_indices,
+        augment=bool(getattr(args, "satellite_augment", True)),
+        **common,
+    )
+    target_train_eval = So2SatLCZ42Dataset(
+        target_adapt_data,
+        target_adapt_geo,
+        domain_role="target_adapt",
+        indices=target_train_indices,
+        augment=False,
+        **common,
+    )
+    target_val = So2SatLCZ42Dataset(
+        target_adapt_data,
+        target_adapt_geo,
+        domain_role="target_adapt",
+        indices=target_val_indices,
+        augment=False,
+        **common,
+    )
+    target_test = So2SatLCZ42Dataset(
+        target_test_data,
+        target_test_geo,
+        domain_role="target_test",
+        augment=False,
+        **common,
+    )
+    return (
+        source_train,
+        source_train_eval,
+        target_train,
+        target_train_eval,
+        target_val,
+        target_test,
+        source_train.get_label_map(),
+    )
+
+
+def _audit_so2sat_protocol(
+    source_train,
+    target_train,
+    target_val,
+    target_test,
+) -> Dict[str, object]:
+    """Audit row-level separation and closed-set labels for So2Sat."""
+
+    target_train_rows = set(int(value) for value in target_train.indices)
+    target_val_rows = set(int(value) for value in target_val.indices)
+    adapt_overlap = sorted(target_train_rows & target_val_rows)
+    source_classes = sorted(set(int(value) for value in source_train.labels))
+    target_train_classes = sorted(set(int(value) for value in target_train.labels))
+    target_val_classes = sorted(set(int(value) for value in target_val.labels))
+    target_test_classes = sorted(set(int(value) for value in target_test.labels))
+    closed_set = (
+        source_classes
+        == target_train_classes
+        == target_val_classes
+        == target_test_classes
+    )
+    separate_test_file = (
+        Path(target_test.data_path).resolve()
+        != Path(target_train.data_path).resolve()
+    )
+    return {
+        "dataset_type": "so2sat_lcz42",
+        "source_data": str(Path(source_train.data_path).resolve()),
+        "target_adapt_data": str(Path(target_train.data_path).resolve()),
+        "target_test_data": str(Path(target_test.data_path).resolve()),
+        "source_sample_count": len(source_train),
+        "target_adapt_train_count": len(target_train),
+        "target_adapt_val_count": len(target_val),
+        "target_test_count": len(target_test),
+        "target_adapt_row_overlap_count": len(adapt_overlap),
+        "target_adapt_row_overlap_examples": adapt_overlap[:10],
+        "target_test_is_separate_file": separate_test_file,
+        "closed_set_17_classes": closed_set and len(source_classes) == 17,
+        "source_classes": source_classes,
+        "target_adapt_train_classes": target_train_classes,
+        "target_adapt_val_classes": target_val_classes,
+        "target_test_classes": target_test_classes,
+        "leakage_detected": bool(adapt_overlap or not separate_test_file),
+    }
 
 
 def _apply_dual_loss_weight_overrides(dual_config, overrides):
@@ -368,24 +514,38 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
         load_config(args.dual_config),
         getattr(args, "dual_loss_weights", {}),
     )
+    dataset_type = getattr(args, "dataset_type", "directory")
     use_ais = bool(getattr(args, "use_ais", False))
+    if dataset_type == "so2sat_lcz42" and use_ais:
+        raise ValueError("AIS is not part of the So2Sat Optical-SAR pipeline.")
     num_modalities = 3 if use_ais else 2
     fused_dim = args.proj_dim * num_modalities
     if dual_config.feature_dim != fused_dim:
         dual_config.feature_dim = fused_dim
     dual_config.modality_dims = tuple(args.proj_dim for _ in range(num_modalities))
 
-    net_vis = VisualFeatureExtractor(
-        output_dim=args.feature_dim,
-        pretrained=args.pretrained_visual,
-    ).to(device)
-    configure_visual_trainability(
-        net_vis,
-        args.freeze_visual_backbone,
-        args.pretrained_visual,
-    )
-
-    net_ir = IRFeatureExtractor(output_dim=args.feature_dim).to(device)
+    if dataset_type == "so2sat_lcz42":
+        # Preserve legacy field/checkpoint names while assigning clear satellite
+        # roles: net_vis=S2 Optical, net_ir=S1 SAR. Parameters are independent.
+        net_vis = OpticalResNet20Encoder(
+            input_channels=int(getattr(args, "s2_channels", 10)),
+            output_dim=args.feature_dim,
+        ).to(device)
+        net_ir = SARResNet20Encoder(
+            input_channels=int(getattr(args, "s1_channels", 8)),
+            output_dim=args.feature_dim,
+        ).to(device)
+    else:
+        net_vis = VisualFeatureExtractor(
+            output_dim=args.feature_dim,
+            pretrained=args.pretrained_visual,
+        ).to(device)
+        configure_visual_trainability(
+            net_vis,
+            args.freeze_visual_backbone,
+            args.pretrained_visual,
+        )
+        net_ir = IRFeatureExtractor(output_dim=args.feature_dim).to(device)
     net_ais = None
     if use_ais:
         ais_sequence_length = int(
@@ -463,14 +623,18 @@ def _stable_monitor_score(
 def build_optimizers(args, models: ModelBundle):
     """Build main and discriminator optimizers."""
 
+    is_so2sat = getattr(args, "dataset_type", "directory") == "so2sat_lcz42"
     visual_params = [parameter for parameter in models.net_vis.parameters() if parameter.requires_grad]
+    infrared_params = [
+        parameter for parameter in models.net_ir.parameters() if parameter.requires_grad
+    ]
     ais_params = (
         [parameter for parameter in models.net_ais.parameters() if parameter.requires_grad]
         if models.net_ais is not None
         else []
     )
     main_params = [
-        *[parameter for parameter in models.net_ir.parameters() if parameter.requires_grad],
+        *([] if is_so2sat else infrared_params),
         *ais_params,
         *list(models.tal.parameters()),
         *list(models.dual_adapter.generator_parameters()),
@@ -478,7 +642,16 @@ def build_optimizers(args, models: ModelBundle):
     ]
 
     param_groups = []
-    if visual_params:
+    if is_so2sat:
+        encoder_params = [*visual_params, *infrared_params]
+        if encoder_params:
+            param_groups.append(
+                {
+                    "params": encoder_params,
+                    "lr": float(getattr(args, "lr_encoder", args.lr_main)),
+                }
+            )
+    elif visual_params:
         param_groups.append({"params": visual_params, "lr": args.lr_visual})
     param_groups.append({"params": main_params, "lr": args.lr_main})
 
@@ -497,32 +670,10 @@ def extract_fused_features(
     target_batch: Dict[str, torch.Tensor],
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Extract TAL-aligned features in explicit VIS/IR or VIS/IR/AIS mode."""
+    """Extract TAL-aligned features without changing TAL's mathematics."""
 
-    source_vis = source_batch["vis"].to(device, non_blocking=True)
-    source_ir = source_batch["ir"].to(device, non_blocking=True)
-    target_vis = target_batch["vis"].to(device, non_blocking=True)
-    target_ir = target_batch["ir"].to(device, non_blocking=True)
-
-    source_vis_feat = models.net_vis(source_vis)
-    source_ir_feat = models.net_ir(source_ir)
-    target_vis_feat = models.net_vis(target_vis)
-    target_ir_feat = models.net_ir(target_ir)
-
-    source_modalities = [source_vis_feat, source_ir_feat]
-    target_modalities = [target_vis_feat, target_ir_feat]
-    if models.net_ais is not None:
-        if "ais" not in source_batch or "ais" not in target_batch:
-            raise RuntimeError(
-                "AIS is enabled but the batch has no AIS tensor. Check AIS roots."
-            )
-        source_modalities.append(
-            models.net_ais(source_batch["ais"].to(device, non_blocking=True))
-        )
-        target_modalities.append(
-            models.net_ais(target_batch["ais"].to(device, non_blocking=True))
-        )
-
+    source_modalities = _encode_batch_modalities(models, source_batch, device)
+    target_modalities = _encode_batch_modalities(models, target_batch, device)
     projected_source, projected_target, loss_tal = models.tal(
         source_modalities,
         target_modalities,
@@ -530,6 +681,33 @@ def extract_fused_features(
     feat_src = torch.cat(projected_source, dim=1)
     feat_tgt = torch.cat(projected_target, dim=1)
     return feat_src, feat_tgt, loss_tal
+
+
+def _encode_batch_modalities(
+    models: ModelBundle,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+) -> List[torch.Tensor]:
+    """Encode one legacy or So2Sat batch in a stable modality order."""
+
+    if "sar" in batch and "optical" in batch:
+        # Satellite order is S1 SAR first, S2 Optical second. This order defines
+        # TAL projection blocks and therefore the Relation Drift split.
+        sar = batch["sar"].to(device, non_blocking=True)
+        optical = batch["optical"].to(device, non_blocking=True)
+        modalities = [models.net_ir(sar), models.net_vis(optical)]
+    else:
+        vis = batch["vis"].to(device, non_blocking=True)
+        infrared = batch["ir"].to(device, non_blocking=True)
+        modalities = [models.net_vis(vis), models.net_ir(infrared)]
+
+    if models.net_ais is not None:
+        if "ais" not in batch:
+            raise RuntimeError(
+                "AIS is enabled but the batch has no AIS tensor. Check AIS roots."
+            )
+        modalities.append(models.net_ais(batch["ais"].to(device, non_blocking=True)))
+    return modalities
 
 
 def _accumulate_logs(totals: Dict[str, float], logs: Dict[str, float]) -> None:
@@ -982,21 +1160,8 @@ def evaluate(
     steps = 0
 
     for batch in dataloader:
-        vis = batch["vis"].to(device, non_blocking=True)
-        ir = batch["ir"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
-
-        vis_feat = models.net_vis(vis)
-        ir_feat = models.net_ir(ir)
-        modalities = [vis_feat, ir_feat]
-        if models.net_ais is not None:
-            if "ais" not in batch:
-                raise RuntimeError(
-                    "AIS is enabled but the validation batch has no AIS tensor."
-                )
-            modalities.append(
-                models.net_ais(batch["ais"].to(device, non_blocking=True))
-            )
+        modalities = _encode_batch_modalities(models, batch, device)
         projected_target = models.tal.project_target(modalities)
         features = torch.cat(projected_target, dim=1)
         selected_mode = feature_mode or args.eval_feature_mode
@@ -1094,17 +1259,7 @@ def save_feature_embeddings(
         sample_ids = []
         sample_count = 0
         for batch in dataloader:
-            vis_feat = models.net_vis(batch["vis"].to(device, non_blocking=True))
-            ir_feat = models.net_ir(batch["ir"].to(device, non_blocking=True))
-            modalities = [vis_feat, ir_feat]
-            if models.net_ais is not None:
-                if "ais" not in batch:
-                    raise RuntimeError(
-                        "AIS is enabled but feature snapshot has no AIS tensor."
-                    )
-                modalities.append(
-                    models.net_ais(batch["ais"].to(device, non_blocking=True))
-                )
+            modalities = _encode_batch_modalities(models, batch, device)
             projected = (
                 models.tal.project_source(modalities)
                 if domain == "source"
@@ -1137,12 +1292,15 @@ def save_feature_embeddings(
                     features[:remaining].cpu().numpy()
                 )
             label_parts.append(batch["label"][:remaining].cpu().numpy())
-            vis_paths = list(batch.get("vis_path", []))[:remaining]
-            ir_paths = list(batch.get("ir_path", []))[:remaining]
-            sample_ids.extend(
-                f"{vis_path}|{ir_path}"
-                for vis_path, ir_path in zip(vis_paths, ir_paths)
-            )
+            if "sample_id" in batch:
+                sample_ids.extend(list(batch["sample_id"])[:remaining])
+            else:
+                vis_paths = list(batch.get("vis_path", []))[:remaining]
+                ir_paths = list(batch.get("ir_path", []))[:remaining]
+                sample_ids.extend(
+                    f"{vis_path}|{ir_path}"
+                    for vis_path, ir_path in zip(vis_paths, ir_paths)
+                )
             sample_count += min(int(raw.size(0)), remaining)
             if sample_count >= max_samples:
                 break
@@ -1223,6 +1381,30 @@ def checkpoint_state(
     }
 
 
+def _capture_model_weights(models: ModelBundle) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Clone model-only state to CPU for leakage-free final test evaluation."""
+
+    return {
+        name: {
+            key: value.detach().cpu().clone()
+            for key, value in module.state_dict().items()
+        }
+        for name, module in models.__dict__.items()
+        if module is not None
+    }
+
+
+def _restore_model_weights(
+    models: ModelBundle,
+    weights: Dict[str, Dict[str, torch.Tensor]],
+) -> None:
+    """Restore a model-only snapshot captured by ``_capture_model_weights``."""
+
+    for name, state in weights.items():
+        module = getattr(models, name)
+        module.load_state_dict(state)
+
+
 def _artifact_path(run_dir: Path, filename: str, args) -> Path:
     """Return an iteration-safe artifact path.
 
@@ -1273,6 +1455,7 @@ def run_training(args) -> Dict[str, object]:
         target_train,
         target_train_eval,
         target_val,
+        target_test,
         label_map,
     ) = build_datasets(args)
     if bool(getattr(args, "use_ais", False)):
@@ -1284,6 +1467,7 @@ def run_training(args) -> Dict[str, object]:
                 target_train,
                 target_train_eval,
                 target_val,
+                *([target_test] if target_test is not None else []),
             )
         }
         if len(ais_lengths) != 1:
@@ -1310,31 +1494,59 @@ def run_training(args) -> Dict[str, object]:
 
     logger.info(f"Source train samples: {len(source_train)}")
     logger.info(f"Target train samples: {len(target_train)}")
-    logger.info(f"Target val samples: {len(target_val)}")
+    logger.info(f"Target adaptation val samples: {len(target_val)}")
+    if target_test is not None:
+        logger.info(f"Target final test samples: {len(target_test)}")
     logger.info(f"Classes: {num_classes}")
 
-    data_audit = audit_dataset_splits(
-        target_train,
-        target_val,
-        hash_contents=bool(getattr(args, "data_audit_hashes", False)),
-    )
+    is_so2sat = getattr(args, "dataset_type", "directory") == "so2sat_lcz42"
+    if is_so2sat:
+        if target_test is None:
+            raise RuntimeError("So2Sat requires an independent target-test split.")
+        data_audit = _audit_so2sat_protocol(
+            source_train,
+            target_train,
+            target_val,
+            target_test,
+        )
+        audit_errors = []
+        if data_audit["leakage_detected"]:
+            audit_errors.append("So2Sat target adaptation/test split leakage detected")
+        if not data_audit["closed_set_17_classes"]:
+            audit_errors.append("So2Sat splits do not share the complete 17-class set")
+        logger.info(
+            "So2Sat audit: target-adapt train/val=%d/%d | test=%d | "
+            "adapt_row_overlap=%d | separate_test=%s | closed_set_17=%s",
+            len(target_train),
+            len(target_val),
+            len(target_test),
+            data_audit["target_adapt_row_overlap_count"],
+            data_audit["target_test_is_separate_file"],
+            data_audit["closed_set_17_classes"],
+        )
+    else:
+        data_audit = audit_dataset_splits(
+            target_train,
+            target_val,
+            hash_contents=bool(getattr(args, "data_audit_hashes", False)),
+        )
+        audit_errors = data_audit_errors(data_audit)
+        logger.info(
+            "Data audit: same_dir=%s | path_overlap(vis/ir/ais)=%d/%d/%d | "
+            "content_overlap(vis/ir/ais)=%d/%d/%d | ais_index_overlap=%d | "
+            "stem_mismatch(vis-ir/vis-ais)=%d/%d",
+            data_audit["same_base_dir"],
+            data_audit["path_overlap_vis_count"],
+            data_audit["path_overlap_ir_count"],
+            data_audit["path_overlap_ais_count"],
+            data_audit["content_overlap_vis_count"],
+            data_audit["content_overlap_ir_count"],
+            data_audit["content_overlap_ais_count"],
+            data_audit.get("ais_index_overlap_count", 0),
+            data_audit["vis_ir_stem_mismatch_count"],
+            data_audit["vis_ais_stem_mismatch_count"],
+        )
     save_json(data_audit, _artifact_path(run_dir, "data_audit.json", args))
-    audit_errors = data_audit_errors(data_audit)
-    logger.info(
-        "Data audit: same_dir=%s | path_overlap(vis/ir/ais)=%d/%d/%d | "
-        "content_overlap(vis/ir/ais)=%d/%d/%d | ais_index_overlap=%d | "
-        "stem_mismatch(vis-ir/vis-ais)=%d/%d",
-        data_audit["same_base_dir"],
-        data_audit["path_overlap_vis_count"],
-        data_audit["path_overlap_ir_count"],
-        data_audit["path_overlap_ais_count"],
-        data_audit["content_overlap_vis_count"],
-        data_audit["content_overlap_ir_count"],
-        data_audit["content_overlap_ais_count"],
-        data_audit.get("ais_index_overlap_count", 0),
-        data_audit["vis_ir_stem_mismatch_count"],
-        data_audit["vis_ais_stem_mismatch_count"],
-    )
     if audit_errors:
         message = "Data audit failed: " + "; ".join(audit_errors)
         if bool(getattr(args, "strict_data_audit", True)):
@@ -1344,8 +1556,12 @@ def run_training(args) -> Dict[str, object]:
     class_summaries = {
         "source_train": summarize_label_distribution(source_train, num_classes, label_map),
         "target_train": summarize_label_distribution(target_train, num_classes, label_map),
-        "target_val": summarize_label_distribution(target_val, num_classes, label_map),
+        "target_adapt_val": summarize_label_distribution(target_val, num_classes, label_map),
     }
+    if target_test is not None:
+        class_summaries["target_test"] = summarize_label_distribution(
+            target_test, num_classes, label_map
+        )
     for split_name, split_summary in class_summaries.items():
         logger.info(
             "%s classes: present %d/%d | absent %d | counts [%s]",
@@ -1398,24 +1614,36 @@ def run_training(args) -> Dict[str, object]:
     base_augmentation = float(getattr(args, "augmentation_strength", 0.0))
     visible_augmentation = getattr(args, "vis_augmentation_strength", None)
     infrared_augmentation = getattr(args, "ir_augmentation_strength", None)
-    logger.info(
-        "Augmentation profile: base=%.3f | visible=%.3f | infrared=%.3f | "
-        "freeze_frozen_batch_norm_stats=%s",
-        base_augmentation,
-        base_augmentation if visible_augmentation is None else float(visible_augmentation),
-        base_augmentation if infrared_augmentation is None else float(infrared_augmentation),
-        bool(getattr(args, "freeze_frozen_batch_norm_stats", False)),
-    )
-    logger.info(
-        "VIS/IR pairing: %s | count-mismatch classes train/val: %d/%d | "
-        "AIS alignment: %s | AIS rows train/val: %s/%s",
-        "synchronized" if getattr(args, "synchronize_modalities", False) else "class-level-unpaired",
-        getattr(source_train, "vis_ir_count_mismatch_count", 0),
-        getattr(target_val, "vis_ir_count_mismatch_count", 0),
-        getattr(source_train, "ais_alignment_mode", "none"),
-        getattr(source_train, "reference_ais_pool_indices", np.empty(0)).size,
-        getattr(target_val, "reference_ais_pool_indices", np.empty(0)).size,
-    )
+    if is_so2sat:
+        logger.info(
+            "Satellite augmentation: synchronized S1/S2 geometry=%s | "
+            "SAR clip after Z-score=%s",
+            bool(getattr(args, "satellite_augment", True)),
+            getattr(args, "sar_clip_after_normalize", None),
+        )
+        logger.info(
+            "Satellite modalities: registered S1 SAR (8ch) + S2 Optical (10ch) | "
+            "TAL block order=SAR,Optical"
+        )
+    else:
+        logger.info(
+            "Augmentation profile: base=%.3f | visible=%.3f | infrared=%.3f | "
+            "freeze_frozen_batch_norm_stats=%s",
+            base_augmentation,
+            base_augmentation if visible_augmentation is None else float(visible_augmentation),
+            base_augmentation if infrared_augmentation is None else float(infrared_augmentation),
+            bool(getattr(args, "freeze_frozen_batch_norm_stats", False)),
+        )
+        logger.info(
+            "VIS/IR pairing: %s | count-mismatch classes train/val: %d/%d | "
+            "AIS alignment: %s | AIS rows train/val: %s/%s",
+            "synchronized" if getattr(args, "synchronize_modalities", False) else "class-level-unpaired",
+            getattr(source_train, "vis_ir_count_mismatch_count", 0),
+            getattr(target_val, "vis_ir_count_mismatch_count", 0),
+            getattr(source_train, "ais_alignment_mode", "none"),
+            getattr(source_train, "reference_ais_pool_indices", np.empty(0)).size,
+            getattr(target_val, "reference_ais_pool_indices", np.empty(0)).size,
+        )
     val_loader = DataLoader(
         target_val,
         batch_size=args.batch_size,
@@ -1423,6 +1651,18 @@ def run_training(args) -> Dict[str, object]:
         num_workers=args.num_workers,
         drop_last=False,
         pin_memory=device.type == "cuda",
+    )
+    test_loader = (
+        DataLoader(
+            target_test,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            drop_last=False,
+            pin_memory=device.type == "cuda",
+        )
+        if target_test is not None
+        else None
     )
     source_eval_loader = DataLoader(
         source_train_eval,
@@ -1514,6 +1754,7 @@ def run_training(args) -> Dict[str, object]:
     epochs_without_improvement = 0
     epochs_completed = 0
     early_stopped = False
+    best_model_weights = None
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
@@ -1764,6 +2005,8 @@ def run_training(args) -> Dict[str, object]:
                 ),
                 "epoch": epoch,
             }
+            if test_loader is not None:
+                best_model_weights = _capture_model_weights(models)
             if save_checkpoints and last_state is not None:
                 save_checkpoint(last_state, _checkpoint_path(run_dir, "best_model.pt", args))
             save_json(best_metrics, _artifact_path(run_dir, "best_metrics.json", args))
@@ -1803,6 +2046,32 @@ def run_training(args) -> Dict[str, object]:
             )
             break
 
+    target_test_metrics = None
+    if test_loader is not None:
+        if best_model_weights is None:
+            raise RuntimeError(
+                "No eligible checkpoint was selected; final So2Sat test was not run."
+            )
+        _restore_model_weights(models, best_model_weights)
+        target_test_metrics = evaluate(
+            args=args,
+            models=models,
+            dataloader=test_loader,
+            criterion_cls=criterion_cls,
+            device=device,
+            num_classes=num_classes,
+        )
+        save_json(
+            target_test_metrics,
+            _artifact_path(run_dir, "target_test_metrics.json", args),
+        )
+        logger.info(
+            "Independent target test at selected epoch %d | ACC %.4f | F1 %.4f",
+            int(best_metrics["epoch"]),
+            float(target_test_metrics["accuracy"]),
+            float(target_test_metrics["f1_macro_present"]),
+        )
+
     summary = {
         "run_dir": str(run_dir),
         "best_acc": best_acc,
@@ -1819,6 +2088,7 @@ def run_training(args) -> Dict[str, object]:
         "best_metrics": best_metrics,
         "epochs_completed": epochs_completed,
         "early_stopped": early_stopped,
+        "target_test": target_test_metrics,
         "total_seconds": time.time() - start_time,
     }
     result_path = _artifact_path(run_dir, "result_summary.json", args)

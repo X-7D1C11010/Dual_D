@@ -322,6 +322,66 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         ),
         help="Dual_D module config JSON.",
     )
+    parser.add_argument(
+        "--dataset-type",
+        choices=["directory", "so2sat_lcz42"],
+        default=default("dataset_type", "directory"),
+        help="Select the legacy directory dataset or the So2Sat HDF5 pipeline.",
+    )
+    parser.add_argument(
+        "--dataset-root",
+        default=default("dataset_root", ""),
+        help="Root containing So2Sat LCZ42 v4 HDF5 files.",
+    )
+    parser.add_argument(
+        "--so2sat-source-data",
+        default=default("so2sat_source_data", "training.h5"),
+    )
+    parser.add_argument(
+        "--so2sat-source-geo",
+        default=default("so2sat_source_geo", "training_geo.h5"),
+    )
+    parser.add_argument(
+        "--so2sat-target-adapt-data",
+        default=default("so2sat_target_adapt_data", "validation.h5"),
+    )
+    parser.add_argument(
+        "--so2sat-target-adapt-geo",
+        default=default("so2sat_target_adapt_geo", "validation_geo.h5"),
+    )
+    parser.add_argument(
+        "--so2sat-target-test-data",
+        default=default("so2sat_target_test_data", "testing.h5"),
+    )
+    parser.add_argument(
+        "--so2sat-target-test-geo",
+        default=default("so2sat_target_test_geo", "testing_geo.h5"),
+    )
+    parser.add_argument(
+        "--target-adapt-val-fraction",
+        type=float,
+        default=default("target_adapt_val_fraction", 0.10),
+        help="Class-stratified checkpoint-selection holdout from validation.h5.",
+    )
+    parser.add_argument(
+        "--target-adapt-split-seed",
+        type=int,
+        default=default("target_adapt_split_seed", 2026),
+    )
+    parser.add_argument(
+        "--satellite-augment",
+        action=argparse.BooleanOptionalAction,
+        default=default("satellite_augment", True),
+        help="Apply synchronized flips and 90-degree rotations to S1/S2 patches.",
+    )
+    parser.add_argument(
+        "--sar-clip-after-normalize",
+        type=float,
+        default=default("sar_clip_after_normalize", None),
+        help="Optional symmetric SAR Z-score clipping; omitted in the v1 baseline.",
+    )
+    parser.add_argument("--s1-channels", type=int, default=default("s1_channels", 8))
+    parser.add_argument("--s2-channels", type=int, default=default("s2_channels", 10))
 
     parser.add_argument("--source-root", default=default("source_root", ""))
     parser.add_argument("--target-root", default=default("target_root", ""))
@@ -539,6 +599,12 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     )
     parser.add_argument("--tal-weight", type=float, default=default("tal_weight", 0.3))
     parser.add_argument("--lr-main", type=float, default=default("lr_main", 7.5e-5))
+    parser.add_argument(
+        "--lr-encoder",
+        type=float,
+        default=default("lr_encoder", default("lr_main", 7.5e-5)),
+        help="Shared learning rate for the independent So2Sat S1/S2 encoders.",
+    )
     parser.add_argument("--lr-visual", type=float, default=default("lr_visual", 7.5e-6))
     parser.add_argument(
         "--lr-discriminator",
@@ -715,10 +781,22 @@ def parse_args() -> argparse.Namespace:
     parser = build_parser(defaults)
     args = parser.parse_args(["--config", known_args.config] + remaining if known_args.config else remaining)
 
-    if not args.source_root:
-        parser.error("--source-root is required, or provide it in --config.")
-    if bool(args.target_root) == bool(args.target_parent_root):
-        parser.error("Provide exactly one of --target-root or --target-parent-root.")
+    if args.dataset_type == "so2sat_lcz42":
+        if not args.dataset_root:
+            parser.error("--dataset-root is required for So2Sat.")
+        if args.use_ais:
+            parser.error("--use-ais is incompatible with So2Sat Optical-SAR mode.")
+        if not 0.0 < args.target_adapt_val_fraction < 1.0:
+            parser.error("--target-adapt-val-fraction must be between 0 and 1.")
+        if args.s1_channels != 8 or args.s2_channels != 10:
+            parser.error("So2Sat v1 requires all 8 S1 and all 10 S2 channels.")
+        if args.sar_clip_after_normalize is not None and args.sar_clip_after_normalize <= 0:
+            parser.error("--sar-clip-after-normalize must be positive.")
+    else:
+        if not args.source_root:
+            parser.error("--source-root is required, or provide it in --config.")
+        if bool(args.target_root) == bool(args.target_parent_root):
+            parser.error("Provide exactly one of --target-root or --target-parent-root.")
     if args.use_ais and args.target_parent_root and args.target_ais_root:
         parser.error("Use --target-ais-parent-root for multi-domain experiments.")
     if args.use_ais and args.target_root and args.target_ais_parent_root:
@@ -781,6 +859,9 @@ def parse_args() -> argparse.Namespace:
 def resolve_experiments(args: argparse.Namespace) -> List[Tuple[str, Path, str]]:
     """Resolve one or four target domains and their optional AIS roots."""
 
+    if getattr(args, "dataset_type", "directory") == "so2sat_lcz42":
+        return [("so2sat_target", Path(args.dataset_root), "")]
+
     if args.target_root:
         target_root = Path(args.target_root)
         return [(target_root.name, target_root, str(args.target_ais_root or ""))]
@@ -806,10 +887,16 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
     """Run every target domain for the requested number of independent trials."""
 
     experiments = resolve_experiments(args)
-    weather_profiles = load_weather_profiles(
-        getattr(args, "weather_profile_config", "")
+    is_so2sat = getattr(args, "dataset_type", "directory") == "so2sat_lcz42"
+    weather_profiles = (
+        {}
+        if is_so2sat
+        else load_weather_profiles(getattr(args, "weather_profile_config", ""))
     )
-    if not Path(args.source_root).exists():
+    if is_so2sat:
+        if not Path(args.dataset_root).is_dir():
+            raise FileNotFoundError(f"So2Sat root does not exist: {args.dataset_root}")
+    elif not Path(args.source_root).exists():
         raise FileNotFoundError(f"Source domain does not exist: {args.source_root}")
     if args.use_ais and args.source_ais_root and not Path(args.source_ais_root).exists():
         raise FileNotFoundError(f"Source AIS root does not exist: {args.source_ais_root}")
@@ -844,6 +931,11 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
             run_index += 1
             run_args = deepcopy(args)
             run_args.target_root = str(target_root)
+            if is_so2sat:
+                # Keep legacy run naming/checkpoint metadata valid. Dataset
+                # construction uses dataset_root and does not interpret this as
+                # a directory-layout target domain.
+                run_args.source_root = str(Path(args.dataset_root))
             if (
                 target_ais_root
                 and not Path(target_ais_root).exists()
@@ -936,6 +1028,19 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
                 "best_acc_max": max(best_accuracies),
             }
         )
+        if is_so2sat:
+            test_metrics = [item.get("target_test") or {} for item in domain_runs]
+            for name, metric_name in (
+                ("acc", "accuracy"),
+                ("precision_macro_present", "precision_macro_present"),
+                ("recall_macro_present", "recall_macro_present"),
+                ("f1_macro_present", "f1_macro_present"),
+            ):
+                values = [float(metrics[metric_name]) for metrics in test_metrics]
+                statistics[f"test_{name}_mean"] = mean(values)
+                statistics[f"test_{name}_std"] = (
+                    pstdev(values) if len(values) > 1 else 0.0
+                )
         domain_statistics[domain] = statistics
 
     batch_summary = {
