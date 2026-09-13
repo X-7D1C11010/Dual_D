@@ -1661,9 +1661,14 @@ def run_training(args) -> Dict[str, object]:
             drop_last=False,
             pin_memory=device.type == "cuda",
         )
-        if target_test is not None
+        if target_test is not None and bool(getattr(args, "evaluate_target_test", True))
         else None
     )
+    if target_test is not None and test_loader is None:
+        logger.info(
+            "Final target-test evaluation is disabled for this run; testing.h5 samples "
+            "will not be loaded."
+        )
     source_eval_loader = DataLoader(
         source_train_eval,
         batch_size=args.batch_size,

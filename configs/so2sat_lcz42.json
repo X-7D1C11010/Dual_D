@@ -7,6 +7,7 @@
   "so2sat_target_adapt_geo": "validation_geo.h5",
   "so2sat_target_test_data": "testing.h5",
   "so2sat_target_test_geo": "testing_geo.h5",
+  "evaluate_target_test": true,
   "target_adapt_val_fraction": 0.1,
   "target_adapt_split_seed": 2026,
   "satellite_augment": true,

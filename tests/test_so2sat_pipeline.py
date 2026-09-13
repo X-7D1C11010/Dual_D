@@ -30,6 +30,7 @@ from dual_d.models import (
 )
 from dual_d.training.trainer import run_training
 from scripts.train_dual_d import build_parser, load_json_defaults
+from scripts.preflight_so2sat import run_preflight
 
 
 def _write_fixture(root: Path, name: str, samples: int = 34) -> tuple[Path, Path]:
@@ -223,6 +224,59 @@ class So2SatModelTests(unittest.TestCase):
             self.assertTrue(audit_path.is_file())
             self.assertTrue(
                 (root / "runs" / "so2sat_smoke" / "target_test_metrics.json").is_file()
+            )
+
+    def test_real_batch_preflight_contract_on_fixture(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        defaults = load_json_defaults(project_root / "configs" / "so2sat_lcz42.json")
+        args = build_parser(defaults).parse_args([])
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_fixture(root, "training")
+            _write_fixture(root, "validation")
+            _write_fixture(root, "testing")
+            args.dataset_root = str(root)
+            args.dual_config = str(project_root / "configs" / "dual_d_so2sat.json")
+            args.batch_size = 17
+            args.num_workers = 0
+            args.device = "cpu"
+            args.feature_dim = 32
+            args.proj_dim = 8
+            args.target_adapt_val_fraction = 0.5
+            report = run_preflight(args)
+            self.assertEqual(report["status"], "passed")
+            self.assertEqual(report["shape_trace"]["source_sar"], [17, 8, 32, 32])
+            self.assertEqual(report["shape_trace"]["source_optical"], [17, 10, 32, 32])
+            self.assertEqual(report["shape_trace"]["source_fused"], [17, 16])
+            self.assertIn("dual_d/modality_drift", report["generator_logs"])
+
+    def test_so2sat_smoke_can_skip_official_target_test(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        defaults = load_json_defaults(project_root / "configs" / "so2sat_lcz42.json")
+        args = build_parser(defaults).parse_args([])
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_fixture(root, "training")
+            _write_fixture(root, "validation")
+            _write_fixture(root, "testing")
+            args.dataset_root = str(root)
+            args.dual_config = str(project_root / "configs" / "dual_d_so2sat.json")
+            args.output_dir = str(root / "runs")
+            args.run_name = "so2sat_no_test_smoke"
+            args.device = "cpu"
+            args.epochs = 1
+            args.batch_size = 17
+            args.num_workers = 0
+            args.feature_dim = 32
+            args.proj_dim = 8
+            args.target_adapt_val_fraction = 0.5
+            args.checkpoint_selection_min_epoch = 1
+            args.monitor_stability_window = 1
+            args.evaluate_target_test = False
+            summary = run_training(args)
+            self.assertIsNone(summary["target_test"])
+            self.assertFalse(
+                (root / "runs" / "so2sat_no_test_smoke" / "target_test_metrics.json").exists()
             )
 
 

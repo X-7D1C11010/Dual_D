@@ -358,6 +358,15 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         default=default("so2sat_target_test_geo", "testing_geo.h5"),
     )
     parser.add_argument(
+        "--evaluate-target-test",
+        action=argparse.BooleanOptionalAction,
+        default=default("evaluate_target_test", True),
+        help=(
+            "Evaluate testing.h5 once after restoring the selected checkpoint. "
+            "Disable this for preflight and smoke runs to avoid test-set peeking."
+        ),
+    )
+    parser.add_argument(
         "--target-adapt-val-fraction",
         type=float,
         default=default("target_adapt_val_fraction", 0.10),
