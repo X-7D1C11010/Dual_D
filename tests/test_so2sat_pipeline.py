@@ -29,7 +29,7 @@ from dual_d.models import (
     TensorBasedAlignmentStable,
 )
 from dual_d.training.trainer import run_training
-from scripts.train_dual_d import build_parser, load_json_defaults
+from scripts.train_dual_d import build_parser, load_json_defaults, run_experiment_matrix
 from scripts.preflight_so2sat import run_preflight
 
 
@@ -273,8 +273,12 @@ class So2SatModelTests(unittest.TestCase):
             args.checkpoint_selection_min_epoch = 1
             args.monitor_stability_window = 1
             args.evaluate_target_test = False
-            summary = run_training(args)
+            batch_summary = run_experiment_matrix(args)
+            summary = batch_summary["runs"][0]
             self.assertIsNone(summary["target_test"])
+            self.assertEqual(
+                batch_summary["domain_statistics"]["so2sat_target"]["test_runs"], 0
+            )
             self.assertFalse(
                 (root / "runs" / "so2sat_no_test_smoke" / "target_test_metrics.json").exists()
             )

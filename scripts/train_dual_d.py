@@ -1038,18 +1038,24 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
             }
         )
         if is_so2sat:
-            test_metrics = [item.get("target_test") or {} for item in domain_runs]
-            for name, metric_name in (
-                ("acc", "accuracy"),
-                ("precision_macro_present", "precision_macro_present"),
-                ("recall_macro_present", "recall_macro_present"),
-                ("f1_macro_present", "f1_macro_present"),
-            ):
-                values = [float(metrics[metric_name]) for metrics in test_metrics]
-                statistics[f"test_{name}_mean"] = mean(values)
-                statistics[f"test_{name}_std"] = (
-                    pstdev(values) if len(values) > 1 else 0.0
-                )
+            test_metrics = [
+                item["target_test"]
+                for item in domain_runs
+                if item.get("target_test") is not None
+            ]
+            statistics["test_runs"] = len(test_metrics)
+            if test_metrics:
+                for name, metric_name in (
+                    ("acc", "accuracy"),
+                    ("precision_macro_present", "precision_macro_present"),
+                    ("recall_macro_present", "recall_macro_present"),
+                    ("f1_macro_present", "f1_macro_present"),
+                ):
+                    values = [float(metrics[metric_name]) for metrics in test_metrics]
+                    statistics[f"test_{name}_mean"] = mean(values)
+                    statistics[f"test_{name}_std"] = (
+                        pstdev(values) if len(values) > 1 else 0.0
+                    )
         domain_statistics[domain] = statistics
 
     batch_summary = {
