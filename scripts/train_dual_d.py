@@ -46,7 +46,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dual_d.training.trainer import run_training  # noqa: E402
+from dual_d.training.trainer import parse_adaptive_batch_plan, run_training  # noqa: E402
 from dual_d.training.checkpointing import save_json  # noqa: E402
 from dual_d.data.ais_signal import resolve_reference_ais_file  # noqa: E402
 
@@ -547,6 +547,28 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
 
     parser.add_argument("--epochs", type=int, default=default("epochs", 60))
     parser.add_argument("--batch-size", type=int, default=default("batch_size", 32))
+    parser.add_argument(
+        "--adaptive-batch-size",
+        action=argparse.BooleanOptionalAction,
+        default=default("adaptive_batch_size", False),
+        help="Adjust the M4-SAR physical batch size at epoch boundaries.",
+    )
+    parser.add_argument(
+        "--adaptive-batch-plan",
+        default=default("adaptive_batch_plan", "10:32,18:64,26:128"),
+        help="Comma-separated reusable_free_GiB:batch_size thresholds.",
+    )
+    parser.add_argument(
+        "--adaptive-min-free-gb",
+        type=float,
+        default=default("adaptive_min_free_gb", 10.0),
+        help="Pause at an epoch boundary when reusable CUDA memory is below this gate.",
+    )
+    parser.add_argument(
+        "--adaptive-memory-poll-seconds",
+        type=float,
+        default=default("adaptive_memory_poll_seconds", 60.0),
+    )
     parser.add_argument("--num-workers", type=int, default=default("num_workers", 4))
     parser.add_argument(
         "--persistent-workers",
@@ -883,6 +905,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--epochs must be positive.")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive.")
+    try:
+        parse_adaptive_batch_plan(args.adaptive_batch_plan)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.adaptive_min_free_gb <= 0:
+        parser.error("--adaptive-min-free-gb must be positive.")
+    if args.adaptive_memory_poll_seconds <= 0:
+        parser.error("--adaptive-memory-poll-seconds must be positive.")
+    if args.adaptive_batch_size and args.dataset_type != "m4sar_classification":
+        parser.error("--adaptive-batch-size is currently supported only for M4-SAR.")
     if args.prefetch_factor <= 0:
         parser.error("--prefetch-factor must be positive.")
     if args.min_steps_per_epoch <= 0:

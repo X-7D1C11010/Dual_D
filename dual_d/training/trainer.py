@@ -84,7 +84,13 @@ class IndependentDomainLoaders:
     step number.
     """
 
-    def __init__(self, source_dataset, target_dataset, args) -> None:
+    def __init__(
+        self,
+        source_dataset,
+        target_dataset,
+        args,
+        seed: int | None = None,
+    ) -> None:
         loader_kwargs = {
             "batch_size": int(args.batch_size),
             "num_workers": int(args.num_workers),
@@ -98,8 +104,9 @@ class IndependentDomainLoaders:
             loader_kwargs["prefetch_factor"] = int(
                 getattr(args, "prefetch_factor", 2)
             )
-        source_generator = torch.Generator().manual_seed(int(args.seed))
-        target_generator = torch.Generator().manual_seed(int(args.seed) + 1_000_003)
+        resolved_seed = int(args.seed if seed is None else seed)
+        source_generator = torch.Generator().manual_seed(resolved_seed)
+        target_generator = torch.Generator().manual_seed(resolved_seed + 1_000_003)
         self.source_loader = DataLoader(
             source_dataset,
             shuffle=True,
@@ -118,6 +125,64 @@ class IndependentDomainLoaders:
 
     def __len__(self) -> int:
         return min(len(self.source_loader), len(self.target_loader))
+
+
+def parse_adaptive_batch_plan(value: str) -> tuple[tuple[float, int], ...]:
+    """Parse ``free_gb:batch_size`` entries into an ordered batch plan."""
+
+    entries = []
+    for raw_entry in str(value).split(","):
+        raw_entry = raw_entry.strip()
+        if not raw_entry:
+            continue
+        try:
+            raw_memory, raw_batch = raw_entry.split(":", maxsplit=1)
+            memory_gb = float(raw_memory)
+            batch_size = int(raw_batch)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "Adaptive batch plan must use comma-separated free_gb:batch_size "
+                f"entries, got {raw_entry!r}."
+            ) from error
+        if memory_gb <= 0 or batch_size <= 0:
+            raise ValueError("Adaptive memory thresholds and batch sizes must be positive.")
+        entries.append((memory_gb, batch_size))
+    if not entries:
+        raise ValueError("Adaptive batch plan must contain at least one entry.")
+    entries.sort(key=lambda item: item[0])
+    if len({memory for memory, _ in entries}) != len(entries):
+        raise ValueError("Adaptive batch plan memory thresholds must be unique.")
+    if any(
+        entries[index][1] >= entries[index + 1][1]
+        for index in range(len(entries) - 1)
+    ):
+        raise ValueError("Adaptive batch sizes must increase with available memory.")
+    return tuple(entries)
+
+
+def select_adaptive_batch_size(
+    plan: tuple[tuple[float, int], ...],
+    available_gb: float,
+) -> int:
+    """Choose the largest batch whose memory threshold is currently satisfied."""
+
+    selected = plan[0][1]
+    for threshold_gb, batch_size in plan:
+        if float(available_gb) >= threshold_gb:
+            selected = batch_size
+        else:
+            break
+    return int(selected)
+
+
+def reusable_cuda_memory_gb(device: torch.device) -> float:
+    """Estimate memory usable by this process, including its CUDA reservation."""
+
+    if device.type != "cuda":
+        return float("inf")
+    free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    reusable_bytes = int(free_bytes) + int(torch.cuda.memory_reserved(device))
+    return reusable_bytes / float(1024**3)
 
 
 def set_seed(seed: int, deterministic: bool = False) -> None:
@@ -1992,6 +2057,34 @@ def run_training(args) -> Dict[str, object]:
             _compact_distribution(split_summary),
         )
 
+    adaptive_batch_enabled = bool(
+        is_m4sar and getattr(args, "adaptive_batch_size", False)
+    )
+    adaptive_batch_plan = None
+    adaptive_memory_gb = None
+    configured_batch_size = int(args.batch_size)
+    args.configured_batch_size = configured_batch_size
+    if adaptive_batch_enabled:
+        if device.type != "cuda":
+            raise ValueError("Adaptive batch sizing requires a CUDA device.")
+        adaptive_batch_plan = parse_adaptive_batch_plan(
+            getattr(args, "adaptive_batch_plan", "10:32,18:64,26:128")
+        )
+        adaptive_memory_gb = reusable_cuda_memory_gb(device)
+        args.batch_size = select_adaptive_batch_size(
+            adaptive_batch_plan,
+            adaptive_memory_gb,
+        )
+        args.effective_initial_batch_size = int(args.batch_size)
+        logger.info(
+            "Adaptive batch sizing enabled: reusable_memory=%.2f GiB | "
+            "configured_batch=%d | selected_batch=%d | plan=%s",
+            adaptive_memory_gb,
+            configured_batch_size,
+            args.batch_size,
+            getattr(args, "adaptive_batch_plan", ""),
+        )
+
     if is_m4sar:
         args.pin_memory = device.type == "cuda"
         paired_loader = IndependentDomainLoaders(source_train, target_train, args)
@@ -2087,9 +2180,14 @@ def run_training(args) -> Dict[str, object]:
             getattr(source_train, "reference_ais_pool_indices", np.empty(0)).size,
             getattr(target_val, "reference_ais_pool_indices", np.empty(0)).size,
         )
+    eval_batch_size = (
+        min(batch_size for _threshold, batch_size in adaptive_batch_plan)
+        if adaptive_batch_plan is not None
+        else args.batch_size
+    )
     val_loader = DataLoader(
         target_val,
-        batch_size=args.batch_size,
+        batch_size=eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         drop_last=False,
@@ -2098,7 +2196,7 @@ def run_training(args) -> Dict[str, object]:
     test_loader = (
         DataLoader(
             target_test,
-            batch_size=args.batch_size,
+            batch_size=eval_batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             drop_last=False,
@@ -2114,7 +2212,7 @@ def run_training(args) -> Dict[str, object]:
         )
     source_eval_loader = DataLoader(
         source_train_eval,
-        batch_size=args.batch_size,
+        batch_size=eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         drop_last=False,
@@ -2122,7 +2220,7 @@ def run_training(args) -> Dict[str, object]:
     )
     train_eval_loader = DataLoader(
         target_train_eval,
-        batch_size=args.batch_size,
+        batch_size=eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         drop_last=False,
@@ -2205,6 +2303,49 @@ def run_training(args) -> Dict[str, object]:
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
+        if adaptive_batch_enabled:
+            minimum_memory_gb = max(
+                float(getattr(args, "adaptive_min_free_gb", 10.0)),
+                float(adaptive_batch_plan[0][0]),
+            )
+            adaptive_memory_gb = reusable_cuda_memory_gb(device)
+            poll_seconds = max(
+                float(getattr(args, "adaptive_memory_poll_seconds", 60.0)),
+                1.0,
+            )
+            while adaptive_memory_gb < minimum_memory_gb:
+                logger.info(
+                    "Epoch %d paused: reusable CUDA memory %.2f GiB is below "
+                    "the %.2f GiB safety gate; rechecking in %.0fs.",
+                    epoch,
+                    adaptive_memory_gb,
+                    minimum_memory_gb,
+                    poll_seconds,
+                )
+                torch.cuda.empty_cache()
+                time.sleep(poll_seconds)
+                adaptive_memory_gb = reusable_cuda_memory_gb(device)
+            selected_batch_size = select_adaptive_batch_size(
+                adaptive_batch_plan,
+                adaptive_memory_gb,
+            )
+            if selected_batch_size != int(args.batch_size):
+                previous_batch_size = int(args.batch_size)
+                args.batch_size = selected_batch_size
+                paired_loader = IndependentDomainLoaders(
+                    source_train,
+                    target_train,
+                    args,
+                    seed=int(args.seed) + epoch * 10_007,
+                )
+                logger.info(
+                    "Epoch %d adaptive batch change: %d -> %d at %.2f GiB "
+                    "reusable CUDA memory.",
+                    epoch,
+                    previous_batch_size,
+                    selected_batch_size,
+                    adaptive_memory_gb,
+                )
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         train_phase_start = time.time()
@@ -2219,6 +2360,8 @@ def run_training(args) -> Dict[str, object]:
             num_classes=num_classes,
             epoch=epoch,
         )
+        train_metrics["train_batch_size"] = int(args.batch_size)
+        train_metrics["adaptive_reusable_memory_gb"] = adaptive_memory_gb
         train_seconds = time.time() - train_phase_start
 
         val_phase_start = time.time()
@@ -2508,7 +2651,7 @@ def run_training(args) -> Dict[str, object]:
         target_test = build_m4sar_test_dataset(args, domain="target")
         source_test_loader = DataLoader(
             source_test,
-            batch_size=args.batch_size,
+            batch_size=eval_batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             drop_last=False,
@@ -2516,7 +2659,7 @@ def run_training(args) -> Dict[str, object]:
         )
         test_loader = DataLoader(
             target_test,
-            batch_size=args.batch_size,
+            batch_size=eval_batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             drop_last=False,
