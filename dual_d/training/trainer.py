@@ -35,11 +35,13 @@ from torch.utils.data import DataLoader, Subset
 
 from dual_d.config import load_config
 from dual_d.data import (
+    M4SARClassificationDataset,
     MultiModalDomainDataset,
     PairedClassSampler,
     So2SatLCZ42Dataset,
     audit_dataset_splits,
     data_audit_errors,
+    inverse_sqrt_class_weights,
     stratified_split_indices,
 )
 from dual_d.integration_adapter import DualDTrainingAdapter
@@ -71,6 +73,51 @@ class ModelBundle:
     tal: TensorBasedAlignmentStable
     dual_adapter: DualDTrainingAdapter
     classifier: Classifier
+
+
+class IndependentDomainLoaders:
+    """Zip independently shuffled Source/Target loaders without pair matching.
+
+    M4-SAR manifest rows retain physical correspondence for audit and later
+    error analysis.  Training deliberately discards that correspondence: the
+    two domains use distinct RandomSampler generators and are only joined by
+    step number.
+    """
+
+    def __init__(self, source_dataset, target_dataset, args) -> None:
+        loader_kwargs = {
+            "batch_size": int(args.batch_size),
+            "num_workers": int(args.num_workers),
+            "pin_memory": bool(getattr(args, "pin_memory", False)),
+            "drop_last": True,
+        }
+        if int(args.num_workers) > 0:
+            loader_kwargs["persistent_workers"] = bool(
+                getattr(args, "persistent_workers", False)
+            )
+            loader_kwargs["prefetch_factor"] = int(
+                getattr(args, "prefetch_factor", 2)
+            )
+        source_generator = torch.Generator().manual_seed(int(args.seed))
+        target_generator = torch.Generator().manual_seed(int(args.seed) + 1_000_003)
+        self.source_loader = DataLoader(
+            source_dataset,
+            shuffle=True,
+            generator=source_generator,
+            **loader_kwargs,
+        )
+        self.target_loader = DataLoader(
+            target_dataset,
+            shuffle=True,
+            generator=target_generator,
+            **loader_kwargs,
+        )
+
+    def __iter__(self):
+        return zip(self.source_loader, self.target_loader)
+
+    def __len__(self) -> int:
+        return min(len(self.source_loader), len(self.target_loader))
 
 
 def set_seed(seed: int, deterministic: bool = False) -> None:
@@ -218,6 +265,8 @@ def build_datasets(args):
 
     if getattr(args, "dataset_type", "directory") == "so2sat_lcz42":
         return _build_so2sat_datasets(args)
+    if getattr(args, "dataset_type", "directory") == "m4sar_classification":
+        return _build_m4sar_datasets(args)
 
     source_train = MultiModalDomainDataset(
         root_dir=args.source_root,
@@ -338,6 +387,59 @@ def build_datasets(args):
         target_val,
         None,
         label_map,
+    )
+
+
+def _build_m4sar_datasets(args):
+    """Build official M4-SAR train/val splits without opening Target test."""
+
+    common = {
+        "manifest_path": args.m4sar_manifest,
+        "data_root": getattr(args, "m4sar_data_root", "") or None,
+        "input_size": int(getattr(args, "m4sar_input_size", 128)),
+    }
+    source_train = M4SARClassificationDataset(
+        split="train",
+        domain="source",
+        augment=bool(getattr(args, "satellite_augment", True)),
+        **common,
+    )
+    source_train_eval = source_train.with_domain("source", augment=False)
+    target_train = source_train.with_domain(
+        "target",
+        augment=bool(getattr(args, "satellite_augment", True)),
+    )
+    target_train_eval = source_train.with_domain("target", augment=False)
+    target_val = M4SARClassificationDataset(
+        split="val",
+        domain="target",
+        augment=False,
+        **common,
+    )
+    # Deliberately defer constructing the test dataset until checkpoint
+    # selection is complete. This makes accidental test-driven selection
+    # impossible inside the epoch loop.
+    return (
+        source_train,
+        source_train_eval,
+        target_train,
+        target_train_eval,
+        target_val,
+        None,
+        source_train.get_label_map(),
+    )
+
+
+def build_m4sar_test_dataset(args, domain: str = "target"):
+    """Construct one M4-SAR test view only for post-selection evaluation."""
+
+    return M4SARClassificationDataset(
+        manifest_path=args.m4sar_manifest,
+        data_root=getattr(args, "m4sar_data_root", "") or None,
+        split="test",
+        domain=domain,
+        input_size=int(getattr(args, "m4sar_input_size", 128)),
+        augment=False,
     )
 
 
@@ -477,6 +579,65 @@ def _audit_so2sat_protocol(
     }
 
 
+def _audit_m4sar_protocol(source_train, target_train, target_val) -> Dict[str, object]:
+    """Audit official M4-SAR roles without inspecting Target test."""
+
+    source_pairs = [record.pair_id for record in source_train.records]
+    target_pairs = [record.pair_id for record in target_train.records]
+    source_labels = [int(record.label) for record in source_train.records]
+    target_labels = [int(record.label) for record in target_train.records]
+    train_views_match = source_pairs == target_pairs and source_labels == target_labels
+    validation_pairs = {record.pair_id for record in target_val.records}
+    split_overlap = sorted(set(source_pairs) & validation_pairs)
+    train_source_scenes = {int(record.source_scene_id) for record in source_train.records}
+    train_target_scenes = {int(record.target_scene_id) for record in source_train.records}
+    validation_source_scenes = {
+        int(record.source_scene_id) for record in target_val.records
+    }
+    validation_target_scenes = {
+        int(record.target_scene_id) for record in target_val.records
+    }
+    source_scene_overlap = sorted(train_source_scenes & validation_source_scenes)
+    target_scene_overlap = sorted(train_target_scenes & validation_target_scenes)
+    valid_scene_partition = all(
+        int(record.source_scene_id) <= 56087
+        and int(record.target_scene_id) > 56087
+        for record in (*source_train.records, *target_val.records)
+    )
+    return {
+        "dataset_type": "m4sar_classification",
+        "manifest": str(Path(source_train.manifest_path).resolve()),
+        "source_train_count": len(source_train),
+        "target_train_count": len(target_train),
+        "target_val_count": len(target_val),
+        "target_test_opened_during_selection": False,
+        "physical_pair_metadata_retained": True,
+        "pair_correspondence_used_for_training": False,
+        "independent_source_target_shuffle": True,
+        "train_domain_views_match_manifest": train_views_match,
+        "source_scene_id_max_56087_and_target_above": valid_scene_partition,
+        "train_validation_pair_overlap_count": len(split_overlap),
+        "train_validation_pair_overlap_examples": split_overlap[:10],
+        "train_validation_source_scene_overlap_count": len(source_scene_overlap),
+        "train_validation_target_scene_overlap_count": len(target_scene_overlap),
+        "leakage_detected": not (
+            train_views_match
+            and valid_scene_partition
+            and not split_overlap
+            and not source_scene_overlap
+            and not target_scene_overlap
+        ),
+    }
+
+
+def _model_mode(args) -> str:
+    mode = str(getattr(args, "model_mode", "dual_d")).lower()
+    allowed = {"dual_d", "optical_only", "sar_only", "simple_concat"}
+    if mode not in allowed:
+        raise ValueError(f"Unsupported model_mode={mode!r}; choose from {sorted(allowed)}.")
+    return mode
+
+
 def _apply_dual_loss_weight_overrides(dual_config, overrides):
     """Tune active loss weights while preserving ablation-config zeros."""
 
@@ -515,24 +676,39 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
         getattr(args, "dual_loss_weights", {}),
     )
     dataset_type = getattr(args, "dataset_type", "directory")
+    model_mode = _model_mode(args)
     use_ais = bool(getattr(args, "use_ais", False))
-    if dataset_type == "so2sat_lcz42" and use_ais:
-        raise ValueError("AIS is not part of the So2Sat Optical-SAR pipeline.")
+    is_satellite = dataset_type in {"so2sat_lcz42", "m4sar_classification"}
+    if is_satellite and use_ais:
+        raise ValueError("AIS is not part of the satellite Optical-SAR pipeline.")
     num_modalities = 3 if use_ais else 2
-    fused_dim = args.proj_dim * num_modalities
+    if model_mode == "dual_d":
+        fused_dim = args.proj_dim * num_modalities
+    elif model_mode == "simple_concat":
+        fused_dim = args.feature_dim * num_modalities
+    else:
+        fused_dim = args.feature_dim
     if dual_config.feature_dim != fused_dim:
         dual_config.feature_dim = fused_dim
     dual_config.modality_dims = tuple(args.proj_dim for _ in range(num_modalities))
 
-    if dataset_type == "so2sat_lcz42":
+    if is_satellite:
         # Preserve legacy field/checkpoint names while assigning clear satellite
         # roles: net_vis=S2 Optical, net_ir=S1 SAR. Parameters are independent.
         net_vis = OpticalResNet20Encoder(
-            input_channels=int(getattr(args, "s2_channels", 10)),
+            input_channels=int(
+                getattr(args, "optical_channels", 3)
+                if dataset_type == "m4sar_classification"
+                else getattr(args, "s2_channels", 10)
+            ),
             output_dim=args.feature_dim,
         ).to(device)
         net_ir = SARResNet20Encoder(
-            input_channels=int(getattr(args, "s1_channels", 8)),
+            input_channels=int(
+                getattr(args, "sar_channels", 1)
+                if dataset_type == "m4sar_classification"
+                else getattr(args, "s1_channels", 8)
+            ),
             output_dim=args.feature_dim,
         ).to(device)
     else:
@@ -568,6 +744,14 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
         num_classes=num_classes,
         dropout=getattr(args, "classifier_dropout", 0.30),
     ).to(device)
+
+    if model_mode != "dual_d":
+        set_requires_grad(tal, False)
+        set_requires_grad(dual_adapter, False)
+        if model_mode == "optical_only":
+            set_requires_grad(net_ir, False)
+        elif model_mode == "sar_only":
+            set_requires_grad(net_vis, False)
 
     # The feature extractors and classifier have ordinary tensor forward paths,
     # so they can use both server GPUs without wrapping the custom dual-loss
@@ -623,7 +807,10 @@ def _stable_monitor_score(
 def build_optimizers(args, models: ModelBundle):
     """Build main and discriminator optimizers."""
 
-    is_so2sat = getattr(args, "dataset_type", "directory") == "so2sat_lcz42"
+    is_satellite = getattr(args, "dataset_type", "directory") in {
+        "so2sat_lcz42",
+        "m4sar_classification",
+    }
     visual_params = [parameter for parameter in models.net_vis.parameters() if parameter.requires_grad]
     infrared_params = [
         parameter for parameter in models.net_ir.parameters() if parameter.requires_grad
@@ -634,15 +821,19 @@ def build_optimizers(args, models: ModelBundle):
         else []
     )
     main_params = [
-        *([] if is_so2sat else infrared_params),
+        *([] if is_satellite else infrared_params),
         *ais_params,
-        *list(models.tal.parameters()),
-        *list(models.dual_adapter.generator_parameters()),
-        *list(models.classifier.parameters()),
+        *[parameter for parameter in models.tal.parameters() if parameter.requires_grad],
+        *[
+            parameter
+            for parameter in models.dual_adapter.generator_parameters()
+            if parameter.requires_grad
+        ],
+        *[parameter for parameter in models.classifier.parameters() if parameter.requires_grad],
     ]
 
     param_groups = []
-    if is_so2sat:
+    if is_satellite:
         encoder_params = [*visual_params, *infrared_params]
         if encoder_params:
             param_groups.append(
@@ -664,14 +855,55 @@ def build_optimizers(args, models: ModelBundle):
     return optimizer_main, optimizer_disc
 
 
+def build_classification_criterion(
+    args,
+    source_dataset,
+    device: torch.device,
+    num_classes: int,
+) -> nn.Module:
+    """Build CE, using Source-train-only weights for M4-SAR when requested."""
+
+    weights = None
+    if (
+        getattr(args, "dataset_type", "directory") == "m4sar_classification"
+        and bool(getattr(args, "class_weighted_ce", True))
+    ):
+        configured = getattr(args, "class_weights", None)
+        if configured:
+            values = tuple(float(value) for value in configured)
+        else:
+            counts = [0 for _ in range(num_classes)]
+            for label in source_dataset.labels:
+                counts[int(label)] += 1
+            values = inverse_sqrt_class_weights(counts)
+        if len(values) != num_classes:
+            raise ValueError(
+                f"Expected {num_classes} class weights, received {len(values)}."
+            )
+        weights = torch.tensor(values, dtype=torch.float32, device=device)
+        args.effective_class_weights = [float(value) for value in values]
+    else:
+        args.effective_class_weights = None
+    return LabelSmoothingCrossEntropy(
+        eps=float(getattr(args, "label_smoothing", 0.0)),
+        weight=weights,
+    ).to(device)
+
+
 def extract_fused_features(
     models: ModelBundle,
     source_batch: Dict[str, torch.Tensor],
     target_batch: Dict[str, torch.Tensor],
     device: torch.device,
+    args=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Extract TAL-aligned features without changing TAL's mathematics."""
+    """Extract Dual_D or baseline features without changing core modules."""
 
+    model_mode = _model_mode(args) if args is not None else "dual_d"
+    if model_mode != "dual_d":
+        feat_src = _encode_baseline_features(models, source_batch, device, model_mode)
+        feat_tgt = _encode_baseline_features(models, target_batch, device, model_mode)
+        return feat_src, feat_tgt, feat_src.new_zeros(())
     source_modalities = _encode_batch_modalities(models, source_batch, device)
     target_modalities = _encode_batch_modalities(models, target_batch, device)
     projected_source, projected_target, loss_tal = models.tal(
@@ -681,6 +913,24 @@ def extract_fused_features(
     feat_src = torch.cat(projected_source, dim=1)
     feat_tgt = torch.cat(projected_target, dim=1)
     return feat_src, feat_tgt, loss_tal
+
+
+def _encode_baseline_features(
+    models: ModelBundle,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    model_mode: str,
+) -> torch.Tensor:
+    """Run only the front ends needed by the selected satellite baseline."""
+
+    features = []
+    if model_mode in {"sar_only", "simple_concat"}:
+        features.append(models.net_ir(batch["sar"].to(device, non_blocking=True)))
+    if model_mode in {"optical_only", "simple_concat"}:
+        features.append(models.net_vis(batch["optical"].to(device, non_blocking=True)))
+    if not features:
+        raise ValueError(f"Unsupported baseline mode: {model_mode}")
+    return features[0] if len(features) == 1 else torch.cat(features, dim=1)
 
 
 def _encode_batch_modalities(
@@ -827,10 +1077,124 @@ def _compact_distribution(summary: Dict[str, object]) -> str:
     return ", ".join(parts) if parts else "none"
 
 
+def _train_baseline_one_epoch(
+    args,
+    models: ModelBundle,
+    training_loader,
+    optimizer_main,
+    criterion_cls: nn.Module,
+    device: torch.device,
+    epoch: int,
+) -> Dict[str, float]:
+    """Train a source-only M4-SAR baseline; Target batches remain unused."""
+
+    mode = _model_mode(args)
+    models.net_vis.train(mode in {"optical_only", "simple_concat"})
+    models.net_ir.train(mode in {"sar_only", "simple_concat"})
+    models.tal.eval()
+    models.dual_adapter.eval()
+    models.classifier.train()
+    loss_total = 0.0
+    correct = 0
+    sample_total = 0
+    grad_norm_total = 0.0
+    clipped_steps = 0
+    steps = 0
+    main_parameters = [
+        parameter
+        for group in optimizer_main.param_groups
+        for parameter in group["params"]
+        if parameter.requires_grad
+    ]
+
+    for source_batch, _target_batch in training_loader:
+        labels = source_batch["label"].to(device, non_blocking=True)
+        optimizer_main.zero_grad(set_to_none=True)
+        features = _encode_baseline_features(models, source_batch, device, mode)
+        logits = models.classifier(features)
+        loss = criterion_cls(logits, labels)
+        if not bool(torch.isfinite(loss)):
+            raise FloatingPointError(
+                f"Non-finite baseline loss at epoch={epoch}, step={steps + 1}."
+            )
+        loss.backward()
+        if args.grad_clip > 0:
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(main_parameters, args.grad_clip)
+                .detach()
+                .cpu()
+            )
+        else:
+            grad_norm = _gradient_norm(main_parameters)
+        if args.grad_clip > 0 and grad_norm > args.grad_clip:
+            clipped_steps += 1
+        optimizer_main.step()
+
+        correct += int((torch.argmax(logits.detach(), dim=1) == labels).sum().item())
+        sample_total += int(labels.numel())
+        loss_total += float(loss.detach().cpu())
+        grad_norm_total += grad_norm
+        steps += 1
+
+    divisor = max(steps, 1)
+    accuracy = correct / max(sample_total, 1)
+    metrics = {
+        "epoch": epoch,
+        "train_loss": loss_total / divisor,
+        "train_loss_cls": loss_total / divisor,
+        "train_loss_cls_source": loss_total / divisor,
+        "train_loss_cls_target": 0.0,
+        "train_loss_tal": 0.0,
+        "train_loss_dual_g": 0.0,
+        "train_loss_dual_d": 0.0,
+        "train_grad_norm_main": grad_norm_total / divisor,
+        "train_grad_norm_discriminator": 0.0,
+        "train_grad_clip_fraction_main": clipped_steps / divisor,
+        "train_grad_clip_fraction_discriminator": 0.0,
+        "train_discriminator_steps": 0.0,
+        "train_adversarial_scale": 0.0,
+        "train_module_c_scale": 0.0,
+        "train_modality_drift_scale": 0.0,
+        "train_acc": accuracy,
+        "train_acc_source": accuracy,
+        "train_acc_target": 0.0,
+        "train_acc_source_like": 0.0,
+        "train_acc_target_like": 0.0,
+    }
+    for name in (
+        "discriminator_total",
+        "discriminator_primary",
+        "discriminator_auxiliary",
+        "generator_total",
+        "adv_primary",
+        "adv_auxiliary",
+        "cycle",
+        "identity",
+        "contrastive",
+        "prototype_contrastive",
+        "classification_feedback",
+        "modality_drift",
+        "modality_alignment_source_before",
+        "modality_alignment_target_like_after",
+        "modality_drift_source_to_target_raw",
+        "modality_alignment_target_before",
+        "modality_alignment_source_like_after",
+        "modality_drift_target_to_source_raw",
+        "weighted_cycle",
+        "weighted_identity",
+        "weighted_contrastive",
+        "weighted_prototype_contrastive",
+        "weighted_classification_feedback",
+        "weighted_modality_drift",
+    ):
+        metrics[f"train_dual_d_{name}"] = 0.0
+    return metrics
+
+
 def train_one_epoch(
     args,
     models: ModelBundle,
-    paired_loader: PairedClassSampler,
+    paired_loader,
     optimizer_main,
     optimizer_disc,
     criterion_cls: nn.Module,
@@ -839,6 +1203,17 @@ def train_one_epoch(
     epoch: int,
 ) -> Dict[str, float]:
     """Train all Dual_D components for one epoch."""
+
+    if _model_mode(args) != "dual_d":
+        return _train_baseline_one_epoch(
+            args,
+            models,
+            paired_loader,
+            optimizer_main,
+            criterion_cls,
+            device,
+            epoch,
+        )
 
     models.net_vis.train()
     if bool(getattr(args, "freeze_frozen_batch_norm_stats", False)):
@@ -884,6 +1259,7 @@ def train_one_epoch(
             source_batch,
             target_batch,
             device,
+            args,
         )
         dual_outputs = models.dual_adapter.forward_features(
             feat_src,
@@ -1161,15 +1537,25 @@ def evaluate(
 
     for batch in dataloader:
         labels = batch["label"].to(device, non_blocking=True)
-        modalities = _encode_batch_modalities(models, batch, device)
-        projected_target = models.tal.project_target(modalities)
-        features = torch.cat(projected_target, dim=1)
+        model_mode = _model_mode(args)
         selected_mode = feature_mode or args.eval_feature_mode
-        if selected_mode != "raw":
-            features = models.dual_adapter.inference_features(
-                features,
-                mode=selected_mode,
+        if model_mode == "dual_d":
+            modalities = _encode_batch_modalities(models, batch, device)
+            projected_target = models.tal.project_target(modalities)
+            features = torch.cat(projected_target, dim=1)
+            if selected_mode != "raw":
+                features = models.dual_adapter.inference_features(
+                    features,
+                    mode=selected_mode,
+                )
+        else:
+            features = _encode_baseline_features(
+                models,
+                batch,
+                device,
+                model_mode,
             )
+            selected_mode = "raw"
         logits = models.classifier(features)
         loss = criterion_cls(logits, labels)
         predictions = torch.argmax(logits, dim=1)
@@ -1183,7 +1569,7 @@ def evaluate(
     labels_tensor = torch.cat(all_labels) if all_labels else torch.empty(0, dtype=torch.long)
     metrics = classification_metrics(predictions_tensor, labels_tensor, num_classes)
     metrics["val_loss"] = total_loss / max(steps, 1)
-    metrics["feature_mode"] = feature_mode or args.eval_feature_mode
+    metrics["feature_mode"] = selected_mode
     return metrics
 
 
@@ -1438,7 +1824,13 @@ def run_training(args) -> Dict[str, object]:
     device = resolve_device(args.device)
     validate_cuda_architecture(device)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = args.run_name or f"dual_d_{Path(args.target_root).name}_{timestamp}"
+    dataset_type = getattr(args, "dataset_type", "directory")
+    default_target_name = (
+        "m4sar_target"
+        if dataset_type == "m4sar_classification"
+        else Path(args.target_root).name
+    )
+    run_name = args.run_name or f"dual_d_{default_target_name}_{timestamp}"
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1486,6 +1878,14 @@ def run_training(args) -> Dict[str, object]:
             "per_sample",
         )
     num_classes = len(label_map)
+    if _model_mode(args) != "dual_d":
+        args.eval_feature_mode = "raw"
+    criterion_cls = build_classification_criterion(
+        args,
+        source_train,
+        device,
+        num_classes,
+    )
     save_json(
         {"args": vars(args), "label_map": label_map},
         _artifact_path(run_dir, "resolved_config.json", args),
@@ -1499,7 +1899,8 @@ def run_training(args) -> Dict[str, object]:
         logger.info(f"Target final test samples: {len(target_test)}")
     logger.info(f"Classes: {num_classes}")
 
-    is_so2sat = getattr(args, "dataset_type", "directory") == "so2sat_lcz42"
+    is_so2sat = dataset_type == "so2sat_lcz42"
+    is_m4sar = dataset_type == "m4sar_classification"
     if is_so2sat:
         if target_test is None:
             raise RuntimeError("So2Sat requires an independent target-test split.")
@@ -1523,6 +1924,25 @@ def run_training(args) -> Dict[str, object]:
             data_audit["target_adapt_row_overlap_count"],
             data_audit["target_test_is_separate_file"],
             data_audit["closed_set_17_classes"],
+        )
+    elif is_m4sar:
+        data_audit = _audit_m4sar_protocol(
+            source_train,
+            target_train,
+            target_val,
+        )
+        audit_errors = []
+        if data_audit["leakage_detected"]:
+            audit_errors.append("M4-SAR manifest domain/split protocol is invalid")
+        logger.info(
+            "M4-SAR audit: Source/Target train=%d/%d | Target val=%d | "
+            "paired metadata retained=%s | paired sampling=%s | Target test opened=%s",
+            len(source_train),
+            len(target_train),
+            len(target_val),
+            data_audit["physical_pair_metadata_retained"],
+            data_audit["pair_correspondence_used_for_training"],
+            data_audit["target_test_opened_during_selection"],
         )
     else:
         data_audit = audit_dataset_splits(
@@ -1572,31 +1992,44 @@ def run_training(args) -> Dict[str, object]:
             _compact_distribution(split_summary),
         )
 
-    paired_loader = PairedClassSampler(
-        source_train,
-        target_train,
-        args.batch_size,
-        min_steps_per_epoch=getattr(args, "min_steps_per_epoch", 4),
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-    )
-    paired_common_classes = list(paired_loader.classes)
+    if is_m4sar:
+        args.pin_memory = device.type == "cuda"
+        paired_loader = IndependentDomainLoaders(source_train, target_train, args)
+        paired_common_classes = sorted(
+            set(int(value) for value in source_train.labels)
+            & set(int(value) for value in target_train.labels)
+        )
+    else:
+        paired_loader = PairedClassSampler(
+            source_train,
+            target_train,
+            args.batch_size,
+            min_steps_per_epoch=getattr(args, "min_steps_per_epoch", 4),
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+        paired_common_classes = list(paired_loader.classes)
     save_json(
         {
             "label_map": label_map,
             "paired_training_classes": paired_common_classes,
+            "source_target_loader_policy": (
+                "independent_shuffle_no_pair_correspondence"
+                if is_m4sar
+                else "class_matched_sampler"
+            ),
             **class_summaries,
         },
         _artifact_path(run_dir, "class_distribution.json", args),
     )
     logger.info(
-        "Paired training classes: %d/%d | class ids [%s]",
+        "Training classes shared by domains: %d/%d | class ids [%s]",
         len(paired_common_classes),
         num_classes,
         ", ".join(str(class_id) for class_id in paired_common_classes),
     )
     logger.info(
-        "Runtime profile: batch=%d | paired_steps=%d | workers=%d | "
+        "Runtime profile: batch=%d | training_steps=%d | workers=%d | "
         "train_eval_every=%d | raw_eval_every=%d | stability_window=%d | "
         "lr_scheduler_start=%d | checkpoint_select_from=%d | "
         "early_stop=%d after min_epoch=%d",
@@ -1614,7 +2047,17 @@ def run_training(args) -> Dict[str, object]:
     base_augmentation = float(getattr(args, "augmentation_strength", 0.0))
     visible_augmentation = getattr(args, "vis_augmentation_strength", None)
     infrared_augmentation = getattr(args, "ir_augmentation_strength", None)
-    if is_so2sat:
+    if is_m4sar:
+        logger.info(
+            "M4-SAR modalities: Optical RGB (3ch) + SAR grayscale (1ch) | "
+            "TAL block order=SAR,Optical | loader policy=independent shuffle"
+        )
+        logger.info(
+            "M4-SAR model mode: %s | Target test is deferred until after "
+            "validation checkpoint selection",
+            _model_mode(args),
+        )
+    elif is_so2sat:
         logger.info(
             "Satellite augmentation: synchronized S1/S2 geometry=%s | "
             "SAR clip after Z-score=%s",
@@ -1729,7 +2172,6 @@ def run_training(args) -> Dict[str, object]:
         total_parameters,
         trainable_parameters,
     )
-    criterion_cls = LabelSmoothingCrossEntropy(eps=args.label_smoothing)
     optimizer_main, optimizer_disc = build_optimizers(args, models)
     monitor_metric = getattr(args, "monitor_metric", "val_acc")
     monitor_mode = "min" if monitor_metric == "val_loss" else "max"
@@ -2010,12 +2452,17 @@ def run_training(args) -> Dict[str, object]:
                 ),
                 "epoch": epoch,
             }
-            if test_loader is not None:
+            if test_loader is not None or (
+                is_m4sar and bool(getattr(args, "evaluate_target_test", True))
+            ):
                 best_model_weights = _capture_model_weights(models)
             if save_checkpoints and last_state is not None:
                 save_checkpoint(last_state, _checkpoint_path(run_dir, "best_model.pt", args))
             save_json(best_metrics, _artifact_path(run_dir, "best_metrics.json", args))
-            if bool(getattr(args, "save_feature_embeddings", False)):
+            if (
+                bool(getattr(args, "save_feature_embeddings", False))
+                and _model_mode(args) == "dual_d"
+            ):
                 save_feature_embeddings(
                     models=models,
                     source_dataloader=source_eval_loader,
@@ -2051,13 +2498,57 @@ def run_training(args) -> Dict[str, object]:
             )
             break
 
+    if is_m4sar and bool(getattr(args, "evaluate_target_test", True)):
+        if best_model_weights is None:
+            raise RuntimeError(
+                "No eligible validation checkpoint was selected; M4-SAR Target test "
+                "was not opened."
+            )
+        source_test = build_m4sar_test_dataset(args, domain="source")
+        target_test = build_m4sar_test_dataset(args, domain="target")
+        source_test_loader = DataLoader(
+            source_test,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            drop_last=False,
+            pin_memory=device.type == "cuda",
+        )
+        test_loader = DataLoader(
+            target_test,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            drop_last=False,
+            pin_memory=device.type == "cuda",
+        )
+        logger.info(
+            "Checkpoint selection is complete; opening M4-SAR Target test for one "
+            "final evaluation (%d samples).",
+            len(target_test),
+        )
+
+    source_test_metrics = None
     target_test_metrics = None
     if test_loader is not None:
         if best_model_weights is None:
             raise RuntimeError(
-                "No eligible checkpoint was selected; final So2Sat test was not run."
+                "No eligible checkpoint was selected; final Target test was not run."
             )
         _restore_model_weights(models, best_model_weights)
+        if is_m4sar:
+            source_test_metrics = evaluate(
+                args=args,
+                models=models,
+                dataloader=source_test_loader,
+                criterion_cls=criterion_cls,
+                device=device,
+                num_classes=num_classes,
+            )
+            save_json(
+                source_test_metrics,
+                _artifact_path(run_dir, "source_test_metrics.json", args),
+            )
         target_test_metrics = evaluate(
             args=args,
             models=models,
@@ -2076,6 +2567,13 @@ def run_training(args) -> Dict[str, object]:
             float(target_test_metrics["accuracy"]),
             float(target_test_metrics["f1_macro_present"]),
         )
+        if source_test_metrics is not None:
+            logger.info(
+                "M4-SAR Source test at the same selected checkpoint | ACC %.4f | "
+                "F1 %.4f",
+                float(source_test_metrics["accuracy"]),
+                float(source_test_metrics["f1_macro_present"]),
+            )
 
     summary = {
         "run_dir": str(run_dir),
@@ -2093,6 +2591,7 @@ def run_training(args) -> Dict[str, object]:
         "best_metrics": best_metrics,
         "epochs_completed": epochs_completed,
         "early_stopped": early_stopped,
+        "source_test": source_test_metrics,
         "target_test": target_test_metrics,
         "total_seconds": time.time() - start_time,
     }

@@ -324,9 +324,9 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dataset-type",
-        choices=["directory", "so2sat_lcz42"],
+        choices=["directory", "so2sat_lcz42", "m4sar_classification"],
         default=default("dataset_type", "directory"),
-        help="Select the legacy directory dataset or the So2Sat HDF5 pipeline.",
+        help="Select the legacy directory, So2Sat HDF5, or M4-SAR pipeline.",
     )
     parser.add_argument(
         "--dataset-root",
@@ -362,8 +362,8 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=default("evaluate_target_test", True),
         help=(
-            "Evaluate testing.h5 once after restoring the selected checkpoint. "
-            "Disable this for preflight and smoke runs to avoid test-set peeking."
+            "Evaluate the official Target test once after restoring the selected "
+            "checkpoint. Disable this for preflight and smoke runs."
         ),
     )
     parser.add_argument(
@@ -391,6 +391,50 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     )
     parser.add_argument("--s1-channels", type=int, default=default("s1_channels", 8))
     parser.add_argument("--s2-channels", type=int, default=default("s2_channels", 10))
+    parser.add_argument(
+        "--m4sar-manifest",
+        default=default("m4sar_manifest", ""),
+        help="M4-SAR paired_manifest.csv or paired_manifest.csv.gz.",
+    )
+    parser.add_argument(
+        "--m4sar-data-root",
+        default=default("m4sar_data_root", ""),
+        help="Root used to resolve relative M4-SAR image paths.",
+    )
+    parser.add_argument(
+        "--m4sar-input-size",
+        type=int,
+        default=default("m4sar_input_size", 128),
+    )
+    parser.add_argument(
+        "--optical-channels",
+        type=int,
+        default=default("optical_channels", 3),
+    )
+    parser.add_argument(
+        "--sar-channels",
+        type=int,
+        default=default("sar_channels", 1),
+    )
+    parser.add_argument(
+        "--model-mode",
+        choices=["dual_d", "optical_only", "sar_only", "simple_concat"],
+        default=default("model_mode", "dual_d"),
+        help="Full Dual_D or a source-only M4-SAR baseline.",
+    )
+    parser.add_argument(
+        "--class-weighted-ce",
+        action=argparse.BooleanOptionalAction,
+        default=default("class_weighted_ce", True),
+        help="Use inverse-sqrt Source-train class weights for M4-SAR CE.",
+    )
+    parser.add_argument(
+        "--class-weights",
+        type=float,
+        nargs="+",
+        default=default("class_weights", None),
+        help="Optional explicit Source-derived CE weights in class-id order.",
+    )
 
     parser.add_argument("--source-root", default=default("source_root", ""))
     parser.add_argument("--target-root", default=default("target_root", ""))
@@ -504,6 +548,16 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=default("epochs", 60))
     parser.add_argument("--batch-size", type=int, default=default("batch_size", 32))
     parser.add_argument("--num-workers", type=int, default=default("num_workers", 4))
+    parser.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=default("persistent_workers", False),
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=default("prefetch_factor", 2),
+    )
     parser.add_argument("--device", default=default("device", "auto"))
     parser.add_argument("--seed", type=int, default=default("seed", 42))
     parser.add_argument(
@@ -801,6 +855,19 @@ def parse_args() -> argparse.Namespace:
             parser.error("So2Sat v1 requires all 8 S1 and all 10 S2 channels.")
         if args.sar_clip_after_normalize is not None and args.sar_clip_after_normalize <= 0:
             parser.error("--sar-clip-after-normalize must be positive.")
+    elif args.dataset_type == "m4sar_classification":
+        if not args.m4sar_manifest:
+            parser.error("--m4sar-manifest is required for M4-SAR.")
+        if args.use_ais:
+            parser.error("--use-ais is incompatible with M4-SAR Optical-SAR mode.")
+        if args.optical_channels != 3 or args.sar_channels != 1:
+            parser.error("M4-SAR requires 3-channel Optical and 1-channel SAR inputs.")
+        if args.m4sar_input_size <= 0:
+            parser.error("--m4sar-input-size must be positive.")
+        if args.class_weights is not None and len(args.class_weights) != 6:
+            parser.error("--class-weights must contain exactly six M4-SAR values.")
+        if args.class_weights is not None and any(value <= 0 for value in args.class_weights):
+            parser.error("--class-weights values must all be positive.")
     else:
         if not args.source_root:
             parser.error("--source-root is required, or provide it in --config.")
@@ -816,6 +883,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--epochs must be positive.")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive.")
+    if args.prefetch_factor <= 0:
+        parser.error("--prefetch-factor must be positive.")
     if args.min_steps_per_epoch <= 0:
         parser.error("--min-steps-per-epoch must be positive.")
     if args.ais_sequence_length <= 0:
@@ -862,6 +931,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--checkpoint-selection-min-epoch cannot exceed --epochs.")
     if args.feature_visualization_samples <= 0:
         parser.error("--feature-visualization-samples must be positive.")
+    if args.dataset_type != "m4sar_classification" and args.model_mode != "dual_d":
+        parser.error("Baseline --model-mode values are currently scoped to M4-SAR.")
     return args
 
 
@@ -870,6 +941,13 @@ def resolve_experiments(args: argparse.Namespace) -> List[Tuple[str, Path, str]]
 
     if getattr(args, "dataset_type", "directory") == "so2sat_lcz42":
         return [("so2sat_target", Path(args.dataset_root), "")]
+    if getattr(args, "dataset_type", "directory") == "m4sar_classification":
+        root = (
+            Path(args.m4sar_data_root)
+            if args.m4sar_data_root
+            else Path(args.m4sar_manifest).parent
+        )
+        return [("m4sar_target", root, "")]
 
     if args.target_root:
         target_root = Path(args.target_root)
@@ -896,15 +974,27 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
     """Run every target domain for the requested number of independent trials."""
 
     experiments = resolve_experiments(args)
-    is_so2sat = getattr(args, "dataset_type", "directory") == "so2sat_lcz42"
+    dataset_type = getattr(args, "dataset_type", "directory")
+    is_so2sat = dataset_type == "so2sat_lcz42"
+    is_m4sar = dataset_type == "m4sar_classification"
+    is_satellite = is_so2sat or is_m4sar
     weather_profiles = (
         {}
-        if is_so2sat
+        if is_satellite
         else load_weather_profiles(getattr(args, "weather_profile_config", ""))
     )
     if is_so2sat:
         if not Path(args.dataset_root).is_dir():
             raise FileNotFoundError(f"So2Sat root does not exist: {args.dataset_root}")
+    elif is_m4sar:
+        if not Path(args.m4sar_manifest).is_file():
+            raise FileNotFoundError(
+                f"M4-SAR manifest does not exist: {args.m4sar_manifest}"
+            )
+        if args.m4sar_data_root and not Path(args.m4sar_data_root).is_dir():
+            raise FileNotFoundError(
+                f"M4-SAR data root does not exist: {args.m4sar_data_root}"
+            )
     elif not Path(args.source_root).exists():
         raise FileNotFoundError(f"Source domain does not exist: {args.source_root}")
     if args.use_ais and args.source_ais_root and not Path(args.source_ais_root).exists():
@@ -940,11 +1030,13 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
             run_index += 1
             run_args = deepcopy(args)
             run_args.target_root = str(target_root)
-            if is_so2sat:
+            if is_satellite:
                 # Keep legacy run naming/checkpoint metadata valid. Dataset
                 # construction uses dataset_root and does not interpret this as
                 # a directory-layout target domain.
-                run_args.source_root = str(Path(args.dataset_root))
+                run_args.source_root = str(
+                    Path(args.dataset_root) if is_so2sat else target_root
+                )
             if (
                 target_ais_root
                 and not Path(target_ais_root).exists()
@@ -1037,7 +1129,7 @@ def run_experiment_matrix(args: argparse.Namespace) -> Dict[str, Any]:
                 "best_acc_max": max(best_accuracies),
             }
         )
-        if is_so2sat:
+        if is_satellite:
             test_metrics = [
                 item["target_test"]
                 for item in domain_runs

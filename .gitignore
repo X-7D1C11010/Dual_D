@@ -2,6 +2,9 @@
 *.pt
 *.pth
 *.safetensors
+*.docx
+*.pdf
+*.md
 
 # 忽略数据集和训练日志
 

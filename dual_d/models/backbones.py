@@ -403,13 +403,39 @@ class Classifier(nn.Module):
 class LabelSmoothingCrossEntropy(nn.Module):
     """Cross entropy with label smoothing."""
 
-    def __init__(self, eps: float = 0.10, reduction: str = "mean"):
+    def __init__(
+        self,
+        eps: float = 0.10,
+        reduction: str = "mean",
+        weight: torch.Tensor | None = None,
+    ):
         super().__init__()
         self.eps = float(eps)
         self.reduction = reduction
+        if weight is not None:
+            weight = torch.as_tensor(weight, dtype=torch.float32).detach().clone()
+            if weight.dim() != 1 or weight.numel() == 0:
+                raise ValueError("Class weights must be a non-empty one-dimensional tensor.")
+            if not bool(torch.isfinite(weight).all()) or bool((weight <= 0).any()):
+                raise ValueError("Class weights must be finite and strictly positive.")
+        self.register_buffer("weight", weight)
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Compute smoothed cross entropy."""
+
+        if self.weight is not None:
+            if self.weight.numel() != logits.size(-1):
+                raise ValueError(
+                    "Class-weight count does not match logits: "
+                    f"{self.weight.numel()} vs {logits.size(-1)}."
+                )
+            return F.cross_entropy(
+                logits,
+                target,
+                weight=self.weight,
+                label_smoothing=self.eps,
+                reduction=self.reduction,
+            )
 
         num_classes = logits.size(-1)
         log_probs = F.log_softmax(logits, dim=-1)
