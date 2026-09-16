@@ -276,10 +276,43 @@ class M4SARTrainingContractTests(unittest.TestCase):
             summary = run_training(args)
             self.assertEqual(summary["source_test"]["total"], 12)
             self.assertEqual(summary["target_test"]["total"], 12)
-            audit_path = root / "runs" / "m4sar_baseline_smoke" / "data_audit.json"
+            run_dir = root / "runs" / "m4sar_baseline_smoke"
+            audit_path = run_dir / "data_audit.json"
             with audit_path.open("r", encoding="utf-8") as stream:
                 audit = json.load(stream)
             self.assertFalse(audit["target_test_opened_during_selection"])
+
+            with (run_dir / "training_component_status.json").open(
+                "r", encoding="utf-8"
+            ) as stream:
+                component_status = json.load(stream)
+            self.assertEqual(component_status["model_mode"], "optical_only")
+            self.assertEqual(
+                component_status["training_objective"],
+                "source_only_classification_baseline",
+            )
+            self.assertFalse(component_status["tal_active"])
+            self.assertFalse(component_status["translator_active"])
+
+            with (run_dir / "metrics.csv").open(
+                "r", encoding="utf-8", newline=""
+            ) as stream:
+                metric_row = next(csv.DictReader(stream))
+            self.assertEqual(metric_row["train_acc_domain"], "source")
+            self.assertEqual(metric_row["train_loss_tal"], "")
+            self.assertEqual(metric_row["train_loss_dual_g"], "")
+            self.assertEqual(metric_row["train_sampled_minus_full_acc"], "")
+            self.assertEqual(
+                metric_row["target_train_eval_acc"],
+                metric_row["train_full_acc"],
+            )
+            self.assertIn("target_train_eval", summary["best_metrics"])
+
+            train_log = (run_dir / "train.log").read_text(encoding="utf-8")
+            self.assertIn("SOURCE-ONLY BASELINE ACTIVE", train_log)
+            self.assertIn("tal n/a", train_log)
+            self.assertIn("source_train_acc", train_log)
+            self.assertIn("target_val_acc", train_log)
 
 
 if __name__ == "__main__":

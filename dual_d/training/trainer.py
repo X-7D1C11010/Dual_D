@@ -703,6 +703,35 @@ def _model_mode(args) -> str:
     return mode
 
 
+def _training_component_status(args) -> Dict[str, object]:
+    """Describe which optimization path is active for unambiguous artifacts."""
+
+    mode = _model_mode(args)
+    dual_d_active = mode == "dual_d"
+    return {
+        "model_mode": mode,
+        "training_objective": (
+            "dual_d_domain_adaptation"
+            if dual_d_active
+            else "source_only_classification_baseline"
+        ),
+        "train_acc_domain": "target" if dual_d_active else "source",
+        "tal_active": dual_d_active,
+        "translator_active": dual_d_active,
+        "discriminators_active": dual_d_active,
+        "module_c_active": dual_d_active,
+        "relation_drift_active": dual_d_active,
+    }
+
+
+def _format_optional_metric(value, precision: int = 4) -> str:
+    """Render disabled/not-evaluated metrics as n/a instead of a false zero."""
+
+    if value is None:
+        return "n/a"
+    return f"{float(value):.{precision}f}"
+
+
 def _apply_dual_loss_weight_overrides(dual_config, overrides):
     """Tune active loss weights while preserving ablation-config zeros."""
 
@@ -1150,7 +1179,7 @@ def _train_baseline_one_epoch(
     criterion_cls: nn.Module,
     device: torch.device,
     epoch: int,
-) -> Dict[str, float]:
+) -> Dict[str, object]:
     """Train a source-only M4-SAR baseline; Target batches remain unused."""
 
     mode = _model_mode(args)
@@ -1204,27 +1233,28 @@ def _train_baseline_one_epoch(
     divisor = max(steps, 1)
     accuracy = correct / max(sample_total, 1)
     metrics = {
+        **_training_component_status(args),
         "epoch": epoch,
         "train_loss": loss_total / divisor,
         "train_loss_cls": loss_total / divisor,
         "train_loss_cls_source": loss_total / divisor,
-        "train_loss_cls_target": 0.0,
-        "train_loss_tal": 0.0,
-        "train_loss_dual_g": 0.0,
-        "train_loss_dual_d": 0.0,
+        "train_loss_cls_target": None,
+        "train_loss_tal": None,
+        "train_loss_dual_g": None,
+        "train_loss_dual_d": None,
         "train_grad_norm_main": grad_norm_total / divisor,
-        "train_grad_norm_discriminator": 0.0,
+        "train_grad_norm_discriminator": None,
         "train_grad_clip_fraction_main": clipped_steps / divisor,
-        "train_grad_clip_fraction_discriminator": 0.0,
+        "train_grad_clip_fraction_discriminator": None,
         "train_discriminator_steps": 0.0,
-        "train_adversarial_scale": 0.0,
-        "train_module_c_scale": 0.0,
-        "train_modality_drift_scale": 0.0,
+        "train_adversarial_scale": None,
+        "train_module_c_scale": None,
+        "train_modality_drift_scale": None,
         "train_acc": accuracy,
         "train_acc_source": accuracy,
-        "train_acc_target": 0.0,
-        "train_acc_source_like": 0.0,
-        "train_acc_target_like": 0.0,
+        "train_acc_target": None,
+        "train_acc_source_like": None,
+        "train_acc_target_like": None,
     }
     for name in (
         "discriminator_total",
@@ -1252,7 +1282,7 @@ def _train_baseline_one_epoch(
         "weighted_classification_feedback",
         "weighted_modality_drift",
     ):
-        metrics[f"train_dual_d_{name}"] = 0.0
+        metrics[f"train_dual_d_{name}"] = None
     return metrics
 
 
@@ -1449,6 +1479,7 @@ def train_one_epoch(
     disc_steps = max(totals["disc_steps"], 1.0)
     sample_total = max(totals["sample_total"], 1.0)
     return {
+        **_training_component_status(args),
         "epoch": epoch,
         "train_loss": totals["loss_total"] / steps,
         "train_loss_cls": totals["loss_cls"] / steps,
@@ -2150,6 +2181,13 @@ def run_training(args) -> Dict[str, object]:
             "validation checkpoint selection",
             _model_mode(args),
         )
+        if _model_mode(args) != "dual_d":
+            logger.warning(
+                "SOURCE-ONLY BASELINE ACTIVE: TAL, translators, discriminators, "
+                "Module C, and Relation Drift are disabled; their metrics are n/a. "
+                "train_acc is Source-domain online accuracy, while validation is "
+                "Target-domain accuracy. Use --model-mode dual_d for the full method."
+            )
     elif is_so2sat:
         logger.info(
             "Satellite augmentation: synchronized S1/S2 geometry=%s | "
@@ -2228,6 +2266,11 @@ def run_training(args) -> Dict[str, object]:
     )
 
     models = build_models(args, num_classes, device)
+    component_status = _training_component_status(args)
+    save_json(
+        component_status,
+        _artifact_path(run_dir, "training_component_status.json", args),
+    )
     args.effective_dual_config = models.dual_adapter.config.to_dict()
     save_json(
         {"args": vars(args), "label_map": label_map},
@@ -2237,17 +2280,23 @@ def run_training(args) -> Dict[str, object]:
         args.effective_dual_config,
         _artifact_path(run_dir, "resolved_dual_config.json", args),
     )
-    logger.info(
-        "Effective Dual-D loss weights: %s",
-        json.dumps(args.effective_dual_config["loss_weights"], sort_keys=True),
-    )
-    logger.info(
-        "Modality drift: dims=%s | margin=%.6f | warmup=%d | ramp=%d",
-        args.effective_dual_config.get("modality_dims", []),
-        float(args.effective_dual_config.get("modality_drift_margin", 0.0)),
-        max(int(getattr(args, "modality_drift_warmup_epochs", 0)), 0),
-        max(int(getattr(args, "modality_drift_ramp_epochs", 0)), 0),
-    )
+    if component_status["tal_active"]:
+        logger.info(
+            "Effective Dual-D loss weights: %s",
+            json.dumps(args.effective_dual_config["loss_weights"], sort_keys=True),
+        )
+        logger.info(
+            "Modality drift: dims=%s | margin=%.6f | warmup=%d | ramp=%d",
+            args.effective_dual_config.get("modality_dims", []),
+            float(args.effective_dual_config.get("modality_drift_margin", 0.0)),
+            max(int(getattr(args, "modality_drift_warmup_epochs", 0)), 0),
+            max(int(getattr(args, "modality_drift_ramp_epochs", 0)), 0),
+        )
+    else:
+        logger.info(
+            "Active components: encoder(s) + classifier only | inactive: "
+            "TAL, translators, discriminators, Module C, Relation Drift"
+        )
     multi_gpu_active = isinstance(models.net_vis, nn.DataParallel)
     if bool(getattr(args, "multi_gpu", False)) and device.type == "cuda":
         logger.info(
@@ -2443,11 +2492,14 @@ def run_training(args) -> Dict[str, object]:
             scheduler_disc.step(monitor_value)
 
         if args.eval_feature_mode == "raw":
-            sampled_mode_acc = float(train_metrics["train_acc_target"])
+            sampled_value = train_metrics.get("train_acc_target")
         elif args.eval_feature_mode == "source_like":
-            sampled_mode_acc = float(train_metrics["train_acc_source_like"])
+            sampled_value = train_metrics.get("train_acc_source_like")
         else:
-            sampled_mode_acc = float("nan")
+            sampled_value = None
+        sampled_mode_acc = (
+            float(sampled_value) if sampled_value is not None else float("nan")
+        )
         full_train_acc = train_full_metrics.get("accuracy")
         if device.type == "cuda":
             gibibyte = float(1024**3)
@@ -2476,10 +2528,18 @@ def run_training(args) -> Dict[str, object]:
             "val_raw_f1_macro_present": val_raw_metrics.get("f1_macro_present"),
             "train_full_acc": full_train_acc,
             "train_full_f1_macro_present": train_full_metrics.get("f1_macro_present"),
+            "target_train_eval_acc": full_train_acc,
+            "target_train_eval_f1_macro_present": train_full_metrics.get(
+                "f1_macro_present"
+            ),
             "train_sampled_minus_full_acc": (
                 sampled_mode_acc - float(full_train_acc)
                 if full_train_acc is not None and np.isfinite(sampled_mode_acc)
                 else None
+            ),
+            "source_train_minus_target_val_acc": (
+                float(train_metrics["train_acc_source"])
+                - float(val_metrics["accuracy"])
             ),
             "monitor_value": monitor_value,
             "monitor_selection_score": monitor_selection_score,
@@ -2507,32 +2567,38 @@ def run_training(args) -> Dict[str, object]:
         metrics_logger.write_row(row)
 
         logger.info(
-            "Epoch %03d/%03d | loss %.4f | cls %.4f | tal %.4f | dual_g %.4f | "
-            "dual_d %.4f | train_acc %.4f | train_full %s | val_acc %.4f | "
-            "val_f1 %.4f | adv/moduleC/drift %.2f/%.2f/%.2f | "
-            "drift(s2t/t2s) %.4f/%.4f | disc_steps %.0f | "
-            "grad(main/disc) %.3f/%.3f | lr(main/disc) %.2e/%.2e | "
+            "Epoch %03d/%03d | mode %s | loss %.4f | cls %.4f | tal %s | dual_g %s | "
+            "dual_d %s | %s_train_acc %.4f | target_train_eval %s | target_val_acc %.4f | "
+            "val_f1 %.4f | adv/moduleC/drift %s/%s/%s | "
+            "drift(s2t/t2s) %s/%s | disc_steps %.0f | "
+            "grad(main/disc) %.3f/%s | lr(main/disc) %.2e/%.2e | "
             "cuda_peak(alloc/resv) %.2f/%.2fGB | "
             "phase(train/val/raw/train_eval) %.1f/%.1f/%.1f/%.1fs | %.1fs",
             epoch,
             args.epochs,
+            row["model_mode"],
             row["train_loss"],
             row["train_loss_cls"],
-            row["train_loss_tal"],
-            row["train_loss_dual_g"],
-            row["train_loss_dual_d"],
+            _format_optional_metric(row["train_loss_tal"]),
+            _format_optional_metric(row["train_loss_dual_g"]),
+            _format_optional_metric(row["train_loss_dual_d"]),
+            row["train_acc_domain"],
             row["train_acc"],
-            f"{row['train_full_acc']:.4f}" if row["train_full_acc"] is not None else "n/a",
+            _format_optional_metric(row["target_train_eval_acc"]),
             row["val_acc"],
             row["val_f1_macro_present"],
-            row["train_adversarial_scale"],
-            row["train_module_c_scale"],
-            row["train_modality_drift_scale"],
-            row["train_dual_d_modality_drift_source_to_target_raw"],
-            row["train_dual_d_modality_drift_target_to_source_raw"],
+            _format_optional_metric(row["train_adversarial_scale"], precision=2),
+            _format_optional_metric(row["train_module_c_scale"], precision=2),
+            _format_optional_metric(row["train_modality_drift_scale"], precision=2),
+            _format_optional_metric(
+                row["train_dual_d_modality_drift_source_to_target_raw"]
+            ),
+            _format_optional_metric(
+                row["train_dual_d_modality_drift_target_to_source_raw"]
+            ),
             row["train_discriminator_steps"],
             row["train_grad_norm_main"],
-            row["train_grad_norm_discriminator"],
+            _format_optional_metric(row["train_grad_norm_discriminator"], precision=3),
             row["lr_main"],
             row["lr_discriminator"],
             row["cuda_peak_allocated_gb"],
@@ -2583,6 +2649,7 @@ def run_training(args) -> Dict[str, object]:
             best_metrics = {
                 "train": train_metrics,
                 "train_full": train_full_metrics,
+                "target_train_eval": train_full_metrics,
                 "val": val_metrics,
                 "val_raw": val_raw_metrics,
                 "monitor_metric": monitor_metric,
