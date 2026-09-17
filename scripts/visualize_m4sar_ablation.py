@@ -14,6 +14,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
+from matplotlib.ft2font import FT2Font
 
 # Required Chinese-safe matplotlib defaults.
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 或 ['Microsoft YaHei'] 微软雅黑 等
@@ -26,34 +27,80 @@ elif "Microsoft YaHei" in _available_fonts:
     plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
 
 
-def _configure_chinese_font(font_path: str = "") -> None:
-    """Prefer SimSun and refuse silent tofu glyphs when no CJK font exists."""
+_CHINESE_GLYPH_PROBE = "张量对齐模态类别漂移约束特征可视化"
 
-    candidates = []
+
+def _supports_chinese_glyphs(path: Path) -> bool:
+    """Return whether a font really contains the Chinese glyphs used by plots."""
+
+    try:
+        charmap = FT2Font(str(path)).get_charmap()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return all(ord(character) in charmap for character in _CHINESE_GLYPH_PROBE)
+
+
+def _configure_chinese_font(font_path: str = "") -> str:
+    """Select a real CJK font by glyph coverage, preferring SimSun."""
+
+    candidates: list[Path] = []
     if font_path:
-        candidates.append(Path(font_path))
+        explicit = Path(font_path).expanduser()
+        if not explicit.is_file():
+            raise FileNotFoundError(f"指定的中文字体文件不存在：{explicit}")
+        candidates.append(explicit)
     candidates.extend(
         [
             Path.home() / ".fonts" / "simsun.ttc",
+            Path.home() / ".local" / "share" / "fonts" / "simsun.ttc",
             Path("/usr/share/fonts/truetype/msttcorefonts/simsun.ttf"),
             Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
             Path("/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc"),
+            Path("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
+            Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
         ]
     )
+    preferred_families = (
+        "SimSun",
+        "宋体",
+        "SimHei",
+        "Microsoft YaHei",
+        "Noto Sans CJK SC",
+        "Noto Serif CJK SC",
+        "WenQuanYi Micro Hei",
+        "WenQuanYi Zen Hei",
+    )
+    installed = list(font_manager.fontManager.ttflist)
+    installed.sort(
+        key=lambda entry: (
+            preferred_families.index(entry.name)
+            if entry.name in preferred_families
+            else len(preferred_families),
+            entry.name,
+        )
+    )
+    candidates.extend(Path(entry.fname) for entry in installed)
+    # findSystemFonts also sees newly installed fonts when Matplotlib's cache is stale.
+    candidates.extend(Path(path) for path in font_manager.findSystemFonts())
+
+    visited: set[Path] = set()
     for candidate in candidates:
-        if candidate.is_file():
-            font_manager.fontManager.addfont(str(candidate))
-            family = font_manager.FontProperties(fname=str(candidate)).get_name()
-            plt.rcParams["font.sans-serif"] = [family, "SimSun", "SimHei"]
-            return
-    available = {font.name for font in font_manager.fontManager.ttflist}
-    for family in ("SimSun", "宋体", "SimHei", "Microsoft YaHei", "Noto Sans CJK SC"):
-        if family in available:
-            plt.rcParams["font.sans-serif"] = [family, "SimSun", "SimHei"]
-            return
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in visited or not resolved.is_file():
+            continue
+        visited.add(resolved)
+        if not _supports_chinese_glyphs(resolved):
+            continue
+        font_manager.fontManager.addfont(str(resolved))
+        family = font_manager.FontProperties(fname=str(resolved)).get_name()
+        plt.rcParams["font.sans-serif"] = [family, "SimSun", "SimHei"]
+        return f"{family} ({resolved})"
     raise RuntimeError(
-        "未找到中文字体。请安装 SimSun/SimHei/Noto CJK，或使用 --font-path "
-        "指定宋体 ttf/ttc 文件，避免图片中文乱码。"
+        "服务器上未找到实际包含中文字形的字体。请安装 SimSun/SimHei/"
+        "Noto CJK/文泉驿，或使用 --font-path 指定宋体 ttf/ttc 文件。"
     )
 
 
@@ -397,11 +444,11 @@ def main() -> None:
     parser.add_argument("--font-path", default="")
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
-    _configure_chinese_font(args.font_path)
+    selected_font = _configure_chinese_font(args.font_path)
     if args.check_only:
         from sklearn.manifold import TSNE  # noqa: F401
 
-        print("可视化依赖和中文字体检查通过。")
+        print(f"可视化依赖和中文字体检查通过：{selected_font}")
         return
     if not args.experiment_dir:
         parser.error("--experiment-dir is required unless --check-only is used.")
