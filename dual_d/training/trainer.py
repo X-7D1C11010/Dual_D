@@ -51,6 +51,7 @@ from dual_d.models import (
     IRFeatureExtractor,
     LabelSmoothingCrossEntropy,
     OpticalResNet20Encoder,
+    PlainMultimodalProjection,
     SARResNet20Encoder,
     TensorBasedAlignmentStable,
     VisualFeatureExtractor,
@@ -70,7 +71,7 @@ class ModelBundle:
     net_vis: nn.Module
     net_ir: nn.Module
     net_ais: Optional[nn.Module]
-    tal: TensorBasedAlignmentStable
+    tal: nn.Module
     dual_adapter: DualDTrainingAdapter
     classifier: Classifier
 
@@ -708,19 +709,30 @@ def _training_component_status(args) -> Dict[str, object]:
 
     mode = _model_mode(args)
     dual_d_active = mode == "dual_d"
+    alignment_mode = str(getattr(args, "alignment_mode", "tal")).lower()
+    translation_active = dual_d_active and bool(
+        getattr(args, "translation_enabled", True)
+    )
     return {
         "model_mode": mode,
         "training_objective": (
             "dual_d_domain_adaptation"
-            if dual_d_active
-            else "source_only_classification_baseline"
+            if translation_active
+            else (
+                "aligned_source_target_classification_no_translation"
+                if dual_d_active
+                else "source_only_classification_baseline"
+            )
         ),
         "train_acc_domain": "target" if dual_d_active else "source",
-        "tal_active": dual_d_active,
-        "translator_active": dual_d_active,
-        "discriminators_active": dual_d_active,
-        "module_c_active": dual_d_active,
-        "relation_drift_active": dual_d_active,
+        "alignment_mode": alignment_mode,
+        "tal_active": dual_d_active and alignment_mode == "tal",
+        "translator_active": translation_active,
+        "discriminators_active": translation_active,
+        "module_c_active": translation_active
+        and bool(getattr(args, "module_c_enabled", True)),
+        "relation_drift_active": translation_active
+        and bool(getattr(args, "modality_drift_enabled", True)),
     }
 
 
@@ -827,11 +839,20 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
             output_dim=args.feature_dim,
             dropout=args.ais_dropout,
         ).to(device)
-    tal = TensorBasedAlignmentStable(
-        input_dims=[args.feature_dim] * num_modalities,
-        output_dims=[args.proj_dim] * num_modalities,
-        num_modalities=num_modalities,
-    ).to(device)
+    alignment_mode = str(getattr(args, "alignment_mode", "tal")).lower()
+    if alignment_mode == "tal":
+        tal = TensorBasedAlignmentStable(
+            input_dims=[args.feature_dim] * num_modalities,
+            output_dims=[args.proj_dim] * num_modalities,
+            num_modalities=num_modalities,
+        ).to(device)
+    elif alignment_mode == "plain":
+        tal = PlainMultimodalProjection(
+            input_dims=[args.feature_dim] * num_modalities,
+            output_dims=[args.proj_dim] * num_modalities,
+        ).to(device)
+    else:
+        raise ValueError(f"Unsupported alignment_mode={alignment_mode!r}.")
     dual_adapter = DualDTrainingAdapter(dual_config).to(device)
     classifier = Classifier(
         input_dim=fused_dim,
@@ -846,6 +867,8 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
             set_requires_grad(net_ir, False)
         elif model_mode == "sar_only":
             set_requires_grad(net_vis, False)
+    elif not bool(getattr(args, "translation_enabled", True)):
+        set_requires_grad(dual_adapter, False)
 
     # The feature extractors and classifier have ordinary tensor forward paths,
     # so they can use both server GPUs without wrapping the custom dual-loss
@@ -1171,6 +1194,41 @@ def _compact_distribution(summary: Dict[str, object]) -> str:
     return ", ".join(parts) if parts else "none"
 
 
+def _write_per_class_metrics(
+    metric_logger: CSVMetricLogger,
+    metrics: Dict[str, object],
+    label_map: Dict[str, int],
+    *,
+    epoch: int,
+    split: str,
+    domain: str,
+    checkpoint_selected: bool,
+) -> None:
+    """Write one auditable row per class for an evaluated split."""
+
+    id_to_name = {int(class_id): name for name, class_id in label_map.items()}
+    confusion = metrics["confusion_matrix"]
+    for class_id in range(int(metrics["num_classes"])):
+        metric_logger.write_row(
+            {
+                "epoch": int(epoch),
+                "split": split,
+                "domain": domain,
+                "class_id": class_id,
+                "class_name": id_to_name.get(class_id, str(class_id)),
+                "accuracy_ovr": metrics["per_class_accuracy_ovr"][class_id],
+                "precision": metrics["per_class_precision"][class_id],
+                "recall": metrics["per_class_recall"][class_id],
+                "f1": metrics["per_class_f1"][class_id],
+                "specificity": metrics["per_class_specificity"][class_id],
+                "correct": metrics["per_class_correct"][class_id],
+                "support": metrics["per_class_support"][class_id],
+                "predicted": int(sum(row[class_id] for row in confusion)),
+                "became_best_checkpoint": bool(checkpoint_selected),
+            }
+        )
+
+
 def _train_baseline_one_epoch(
     args,
     models: ModelBundle,
@@ -1317,11 +1375,20 @@ def train_one_epoch(
     if models.net_ais is not None:
         models.net_ais.train()
     models.tal.train()
-    models.dual_adapter.train()
+    translation_enabled = bool(getattr(args, "translation_enabled", True))
+    models.dual_adapter.train(translation_enabled)
     models.classifier.train()
-    adversarial_scale = _adversarial_scale(args, epoch)
-    module_c_scale = _module_c_scale(args, epoch)
-    modality_drift_scale = _modality_drift_scale(args, epoch)
+    adversarial_scale = _adversarial_scale(args, epoch) if translation_enabled else 0.0
+    module_c_scale = (
+        _module_c_scale(args, epoch)
+        if translation_enabled and bool(getattr(args, "module_c_enabled", True))
+        else 0.0
+    )
+    modality_drift_scale = (
+        _modality_drift_scale(args, epoch)
+        if translation_enabled and bool(getattr(args, "modality_drift_enabled", True))
+        else 0.0
+    )
 
     totals = {
         "loss_total": 0.0,
@@ -1356,13 +1423,21 @@ def train_one_epoch(
             device,
             args,
         )
-        dual_outputs = models.dual_adapter.forward_features(
-            feat_src,
-            feat_tgt,
-            labels=labels_for_contrast,
+        dual_outputs = (
+            models.dual_adapter.forward_features(
+                feat_src,
+                feat_tgt,
+                labels=labels_for_contrast,
+            )
+            if translation_enabled
+            else None
         )
 
-        if adversarial_scale > 0 and step % args.discriminator_update_interval == 0:
+        if (
+            translation_enabled
+            and adversarial_scale > 0
+            and step % args.discriminator_update_interval == 0
+        ):
             models.dual_adapter.set_discriminators_trainable(True)
             optimizer_disc.zero_grad(set_to_none=True)
             loss_dual_d, d_logs = models.dual_adapter.compute_discriminator_loss(dual_outputs)
@@ -1388,7 +1463,8 @@ def train_one_epoch(
             _accumulate_logs(totals, d_logs)
             totals["disc_steps"] += 1.0
 
-        models.dual_adapter.set_discriminators_trainable(False)
+        if translation_enabled:
+            models.dual_adapter.set_discriminators_trainable(False)
         optimizer_main.zero_grad(set_to_none=True)
 
         pred_src = models.classifier(feat_src)
@@ -1401,19 +1477,26 @@ def train_one_epoch(
         )
         loss_cls = loss_cls_source + target_cls_weight * loss_cls_target
 
-        loss_dual_g, g_logs = models.dual_adapter.compute_generator_loss(
-            outputs=dual_outputs,
-            labels=labels_for_contrast,
-            classifier=models.classifier,
-            criterion_cls=criterion_cls,
-            source_labels=source_labels,
-            target_labels=target_labels,
-            num_classes=num_classes,
-            adversarial_scale=adversarial_scale,
-            module_c_scale=module_c_scale,
-            modality_drift_scale=modality_drift_scale,
-        )
-        _accumulate_logs(totals, g_logs)
+        if translation_enabled:
+            loss_dual_g, g_logs = models.dual_adapter.compute_generator_loss(
+                outputs=dual_outputs,
+                labels=labels_for_contrast,
+                classifier=models.classifier,
+                criterion_cls=criterion_cls,
+                source_labels=source_labels,
+                target_labels=target_labels,
+                num_classes=num_classes,
+                adversarial_scale=adversarial_scale,
+                module_c_scale=module_c_scale,
+                modality_drift_scale=modality_drift_scale,
+                module_c_enabled=bool(getattr(args, "module_c_enabled", True)),
+                modality_drift_enabled=bool(
+                    getattr(args, "modality_drift_enabled", True)
+                ),
+            )
+            _accumulate_logs(totals, g_logs)
+        else:
+            loss_dual_g = feat_src.new_zeros(())
         loss_total = loss_cls + args.tal_weight * loss_tal + loss_dual_g
         if not bool(torch.isfinite(loss_total)):
             raise FloatingPointError(
@@ -1430,8 +1513,12 @@ def train_one_epoch(
             *[p for p in models.net_vis.parameters() if p.requires_grad],
             *[p for p in models.net_ir.parameters() if p.requires_grad],
             *ais_parameters,
-            *list(models.tal.parameters()),
-            *list(models.dual_adapter.generator_parameters()),
+            *[p for p in models.tal.parameters() if p.requires_grad],
+            *[
+                p
+                for p in models.dual_adapter.generator_parameters()
+                if p.requires_grad
+            ],
             *list(models.classifier.parameters()),
         ]
         if args.grad_clip > 0:
@@ -1447,13 +1534,20 @@ def train_one_epoch(
 
         optimizer_main.step()
         models.tal.apply_orthogonal_projection()
-        models.dual_adapter.set_discriminators_trainable(True)
+        if translation_enabled:
+            models.dual_adapter.set_discriminators_trainable(True)
 
         with torch.no_grad():
             pred_source_labels = torch.argmax(pred_src.detach(), dim=1)
             pred_target_labels = torch.argmax(pred_tgt.detach(), dim=1)
-            source_like_logits = models.classifier(dual_outputs.source_like.detach())
-            target_like_logits = models.classifier(dual_outputs.target_like.detach())
+            source_like_features = (
+                dual_outputs.source_like.detach() if translation_enabled else feat_tgt.detach()
+            )
+            target_like_features = (
+                dual_outputs.target_like.detach() if translation_enabled else feat_src.detach()
+            )
+            source_like_logits = models.classifier(source_like_features)
+            target_like_logits = models.classifier(target_like_features)
             pred_source_like_labels = torch.argmax(source_like_logits, dim=1)
             pred_target_like_labels = torch.argmax(target_like_logits, dim=1)
 
@@ -1615,8 +1709,13 @@ def evaluate(
     device: torch.device,
     num_classes: int,
     feature_mode: str | None = None,
+    domain: str = "target",
 ) -> Dict[str, object]:
-    """Evaluate target-domain validation accuracy and metrics."""
+    """Evaluate one explicitly named domain without crossing inference paths."""
+
+    domain = str(domain).lower()
+    if domain not in {"source", "target"}:
+        raise ValueError("Evaluation domain must be 'source' or 'target'.")
 
     models.net_vis.eval()
     models.net_ir.eval()
@@ -1637,13 +1736,19 @@ def evaluate(
         selected_mode = feature_mode or args.eval_feature_mode
         if model_mode == "dual_d":
             modalities = _encode_batch_modalities(models, batch, device)
-            projected_target = models.tal.project_target(modalities)
-            features = torch.cat(projected_target, dim=1)
-            if selected_mode != "raw":
+            projected = (
+                models.tal.project_source(modalities)
+                if domain == "source"
+                else models.tal.project_target(modalities)
+            )
+            features = torch.cat(projected, dim=1)
+            if domain == "target" and selected_mode != "raw":
                 features = models.dual_adapter.inference_features(
                     features,
                     mode=selected_mode,
                 )
+            elif domain == "source":
+                selected_mode = "raw"
         else:
             features = _encode_baseline_features(
                 models,
@@ -1703,6 +1808,7 @@ def save_feature_embeddings(
     device: torch.device,
     output_path: Path,
     max_samples: int = 512,
+    translation_enabled: bool = True,
 ) -> None:
     """Save source and target features for post-hoc alignment diagnostics.
 
@@ -1736,6 +1842,8 @@ def save_feature_embeddings(
                 collate_fn=dataloader.collate_fn,
             )
         raw_parts = []
+        pre_modality_parts: List[List[np.ndarray]] = []
+        post_modality_parts: List[List[np.ndarray]] = []
         generated_parts: Dict[str, List[np.ndarray]] = {}
         label_parts = []
         sample_ids = []
@@ -1750,25 +1858,39 @@ def save_feature_embeddings(
             raw = torch.cat(projected, dim=1)
             remaining = max_samples - sample_count
             raw_parts.append(raw[:remaining].cpu().numpy())
-            translator = models.dual_adapter.coordinator.translator
-            if domain == "source":
-                target_like, reconstruction = translator.cycle_from_source(raw)
-                generated = {
-                    "target_like": target_like,
-                    "reconstruction": reconstruction,
-                    "identity": translator.target_to_source(raw),
-                    "raw_logits": models.classifier(raw),
-                    "target_like_logits": models.classifier(target_like),
-                }
-            else:
-                source_like, reconstruction = translator.cycle_from_target(raw)
-                generated = {
-                    "source_like": source_like,
-                    "reconstruction": reconstruction,
-                    "identity": translator.source_to_target(raw),
-                    "raw_logits": models.classifier(raw),
-                    "source_like_logits": models.classifier(source_like),
-                }
+            while len(pre_modality_parts) < len(modalities):
+                pre_modality_parts.append([])
+                post_modality_parts.append([])
+            for modality_index, (before, after) in enumerate(zip(modalities, projected)):
+                pre_modality_parts[modality_index].append(
+                    before[:remaining].cpu().numpy()
+                )
+                post_modality_parts[modality_index].append(
+                    after[:remaining].cpu().numpy()
+                )
+            generated = {"raw_logits": models.classifier(raw)}
+            if translation_enabled:
+                translator = models.dual_adapter.coordinator.translator
+                if domain == "source":
+                    target_like, reconstruction = translator.cycle_from_source(raw)
+                    generated.update(
+                        {
+                            "target_like": target_like,
+                            "reconstruction": reconstruction,
+                            "identity": translator.target_to_source(raw),
+                            "target_like_logits": models.classifier(target_like),
+                        }
+                    )
+                else:
+                    source_like, reconstruction = translator.cycle_from_target(raw)
+                    generated.update(
+                        {
+                            "source_like": source_like,
+                            "reconstruction": reconstruction,
+                            "identity": translator.source_to_target(raw),
+                            "source_like_logits": models.classifier(source_like),
+                        }
+                    )
             for name, features in generated.items():
                 generated_parts.setdefault(name, []).append(
                     features[:remaining].cpu().numpy()
@@ -1800,40 +1922,72 @@ def save_feature_embeddings(
             if label_parts
             else np.empty(0, dtype=np.int64)
         )
-        return raw_array, generated_arrays, label_array, np.asarray(sample_ids, dtype=str)
+        pre_arrays = [np.concatenate(parts, axis=0) for parts in pre_modality_parts]
+        post_arrays = [np.concatenate(parts, axis=0) for parts in post_modality_parts]
+        return (
+            raw_array,
+            generated_arrays,
+            label_array,
+            np.asarray(sample_ids, dtype=str),
+            pre_arrays,
+            post_arrays,
+        )
 
-    source_raw, source_generated, source_labels, source_ids = collect(
-        source_dataloader, "source"
-    )
-    target_raw, target_generated, target_labels, target_ids = collect(
-        target_dataloader, "target"
-    )
+    (
+        source_raw,
+        source_generated,
+        source_labels,
+        source_ids,
+        source_pre,
+        source_post,
+    ) = collect(source_dataloader, "source")
+    (
+        target_raw,
+        target_generated,
+        target_labels,
+        target_ids,
+        target_pre,
+        target_post,
+    ) = collect(target_dataloader, "target")
     if not len(source_labels) or not len(target_labels):
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output_path,
-        source_raw=source_raw,
-        source_target_like=source_generated["target_like"],
-        source_reconstruction=source_generated["reconstruction"],
-        source_identity=source_generated["identity"],
-        source_raw_logits=source_generated["raw_logits"],
-        source_target_like_logits=source_generated["target_like_logits"],
-        source_labels=source_labels,
-        source_sample_ids=source_ids,
-        target_raw=target_raw,
-        target_source_like=target_generated["source_like"],
-        target_reconstruction=target_generated["reconstruction"],
-        target_identity=target_generated["identity"],
-        target_raw_logits=target_generated["raw_logits"],
-        target_source_like_logits=target_generated["source_like_logits"],
-        target_labels=target_labels,
-        target_sample_ids=target_ids,
-        # Backward-compatible aliases for older analysis consumers.
-        raw=target_raw,
-        source_like=target_generated["source_like"],
-        labels=target_labels,
-    )
+    arrays = {
+        "source_raw": source_raw,
+        "source_raw_logits": source_generated["raw_logits"],
+        "source_labels": source_labels,
+        "source_sample_ids": source_ids,
+        "target_raw": target_raw,
+        "target_raw_logits": target_generated["raw_logits"],
+        "target_labels": target_labels,
+        "target_sample_ids": target_ids,
+        "raw": target_raw,
+        "labels": target_labels,
+    }
+    modality_names = ["sar", "optical"] + [
+        f"modality_{index}" for index in range(2, len(source_pre))
+    ]
+    for index, name in enumerate(modality_names[: len(source_pre)]):
+        arrays[f"source_{name}_pre_alignment"] = source_pre[index]
+        arrays[f"source_{name}_post_alignment"] = source_post[index]
+        arrays[f"target_{name}_pre_alignment"] = target_pre[index]
+        arrays[f"target_{name}_post_alignment"] = target_post[index]
+    if translation_enabled:
+        arrays.update(
+            {
+                "source_target_like": source_generated["target_like"],
+                "source_reconstruction": source_generated["reconstruction"],
+                "source_identity": source_generated["identity"],
+                "source_target_like_logits": source_generated["target_like_logits"],
+                "target_source_like": target_generated["source_like"],
+                "target_reconstruction": target_generated["reconstruction"],
+                "target_identity": target_generated["identity"],
+                "target_source_like_logits": target_generated["source_like_logits"],
+                # Backward-compatible alias for older analysis consumers.
+                "source_like": target_generated["source_like"],
+            }
+        )
+    np.savez_compressed(output_path, **arrays)
 
 
 def checkpoint_state(
@@ -1932,6 +2086,9 @@ def run_training(args) -> Dict[str, object]:
 
     logger = setup_text_logger(_artifact_path(run_dir, "train.log", args))
     metrics_logger = CSVMetricLogger(_artifact_path(run_dir, "metrics.csv", args))
+    per_class_logger = CSVMetricLogger(
+        _artifact_path(run_dir, "per_class_metrics.csv", args)
+    )
 
     logger.info("Starting Dual_D standalone training")
     logger.info(f"Run directory: {run_dir}")
@@ -1974,7 +2131,9 @@ def run_training(args) -> Dict[str, object]:
             "per_sample",
         )
     num_classes = len(label_map)
-    if _model_mode(args) != "dual_d":
+    if _model_mode(args) != "dual_d" or not bool(
+        getattr(args, "translation_enabled", True)
+    ):
         args.eval_feature_mode = "raw"
     criterion_cls = build_classification_criterion(
         args,
@@ -2177,9 +2336,14 @@ def run_training(args) -> Dict[str, object]:
             "TAL block order=SAR,Optical | loader policy=independent shuffle"
         )
         logger.info(
-            "M4-SAR model mode: %s | Target test is deferred until after "
+            "M4-SAR model mode: %s | alignment=%s | translation=%s | "
+            "Module-C=%s | Relation-Drift=%s | Target test is deferred until after "
             "validation checkpoint selection",
             _model_mode(args),
+            getattr(args, "alignment_mode", "tal"),
+            bool(getattr(args, "translation_enabled", True)),
+            bool(getattr(args, "module_c_enabled", True)),
+            bool(getattr(args, "modality_drift_enabled", True)),
         )
         if _model_mode(args) != "dual_d":
             logger.warning(
@@ -2280,7 +2444,7 @@ def run_training(args) -> Dict[str, object]:
         args.effective_dual_config,
         _artifact_path(run_dir, "resolved_dual_config.json", args),
     )
-    if component_status["tal_active"]:
+    if component_status["translator_active"]:
         logger.info(
             "Effective Dual-D loss weights: %s",
             json.dumps(args.effective_dual_config["loss_weights"], sort_keys=True),
@@ -2292,9 +2456,15 @@ def run_training(args) -> Dict[str, object]:
             max(int(getattr(args, "modality_drift_warmup_epochs", 0)), 0),
             max(int(getattr(args, "modality_drift_ramp_epochs", 0)), 0),
         )
+    elif component_status["model_mode"] == "dual_d":
+        logger.info(
+            "Active components: encoders + %s alignment + classifier | inactive: "
+            "translators, discriminators, Module C, Relation Drift",
+            component_status["alignment_mode"],
+        )
     else:
         logger.info(
-            "Active components: encoder(s) + classifier only | inactive: "
+            "Active components: baseline encoder(s) + classifier | inactive: "
             "TAL, translators, discriminators, Module C, Relation Drift"
         )
     multi_gpu_active = isinstance(models.net_vis, nn.DataParallel)
@@ -2643,6 +2813,25 @@ def run_training(args) -> Dict[str, object]:
                     _checkpoint_path(run_dir, "best_f1_model.pt", args),
                 )
         improved = would_improve
+        _write_per_class_metrics(
+            per_class_logger,
+            val_metrics,
+            label_map,
+            epoch=epoch,
+            split="validation",
+            domain="target",
+            checkpoint_selected=improved,
+        )
+        if train_full_metrics:
+            _write_per_class_metrics(
+                per_class_logger,
+                train_full_metrics,
+                label_map,
+                epoch=epoch,
+                split="train_eval",
+                domain="target",
+                checkpoint_selected=False,
+            )
         if improved:
             best_selection_score = monitor_selection_score
             epochs_without_improvement = 0
@@ -2680,6 +2869,9 @@ def run_training(args) -> Dict[str, object]:
                     device=device,
                     output_path=_artifact_path(run_dir, "feature_embeddings.npz", args),
                     max_samples=getattr(args, "feature_visualization_samples", 512),
+                    translation_enabled=bool(
+                        getattr(args, "translation_enabled", True)
+                    ),
                 )
             logger.info(
                 "New best %s: raw=%.4f stable_score=%.4f at epoch %d",
@@ -2707,6 +2899,17 @@ def run_training(args) -> Dict[str, object]:
                 monitor_metric,
             )
             break
+
+    if best_metrics:
+        _write_per_class_metrics(
+            per_class_logger,
+            best_metrics["val"],
+            label_map,
+            epoch=int(best_metrics["epoch"]),
+            split="validation_selected",
+            domain="target",
+            checkpoint_selected=True,
+        )
 
     if is_m4sar and bool(getattr(args, "evaluate_target_test", True)):
         if best_model_weights is None:
@@ -2754,10 +2957,20 @@ def run_training(args) -> Dict[str, object]:
                 criterion_cls=criterion_cls,
                 device=device,
                 num_classes=num_classes,
+                domain="source",
             )
             save_json(
                 source_test_metrics,
                 _artifact_path(run_dir, "source_test_metrics.json", args),
+            )
+            _write_per_class_metrics(
+                per_class_logger,
+                source_test_metrics,
+                label_map,
+                epoch=int(best_metrics["epoch"]),
+                split="test",
+                domain="source",
+                checkpoint_selected=True,
             )
         target_test_metrics = evaluate(
             args=args,
@@ -2770,6 +2983,15 @@ def run_training(args) -> Dict[str, object]:
         save_json(
             target_test_metrics,
             _artifact_path(run_dir, "target_test_metrics.json", args),
+        )
+        _write_per_class_metrics(
+            per_class_logger,
+            target_test_metrics,
+            label_map,
+            epoch=int(best_metrics["epoch"]),
+            split="test",
+            domain="target",
+            checkpoint_selected=True,
         )
         logger.info(
             "Independent target test at selected epoch %d | ACC %.4f | F1 %.4f",
@@ -2787,6 +3009,7 @@ def run_training(args) -> Dict[str, object]:
 
     summary = {
         "run_dir": str(run_dir),
+        "component_status": component_status,
         "best_acc": best_acc,
         "best_acc_epoch": best_acc_epoch,
         "best_f1_macro_present": best_f1,

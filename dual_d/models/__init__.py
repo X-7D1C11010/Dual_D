@@ -14,7 +14,7 @@ from .backbones import (
     VisualFeatureExtractor,
     set_requires_grad,
 )
-from .tensor_alignment import TensorBasedAlignmentStable
+from .tensor_alignment import PlainMultimodalProjection, TensorBasedAlignmentStable
 
 __all__ = [
     "AISFeatureExtractor",
@@ -25,6 +25,7 @@ __all__ = [
     "IRFeatureExtractor",
     "LabelSmoothingCrossEntropy",
     "OpticalResNet20Encoder",
+    "PlainMultimodalProjection",
     "SARResNet20Encoder",
     "SmallResNet20Encoder",
     "TensorBasedAlignmentStable",

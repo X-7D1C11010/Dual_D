@@ -218,6 +218,8 @@ class DualDiscriminatorCoordinator(nn.Module):
         adversarial_scale: float = 1.0,
         module_c_scale: float = 1.0,
         modality_drift_scale: float = 1.0,
+        module_c_enabled: bool = True,
+        modality_drift_enabled: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute generator-side cooperative loss.
 
@@ -230,6 +232,12 @@ class DualDiscriminatorCoordinator(nn.Module):
         adversarial_scale = max(0.0, min(float(adversarial_scale), 1.0))
         module_c_scale = max(0.0, min(float(module_c_scale), 1.0))
         modality_drift_scale = max(0.0, min(float(modality_drift_scale), 1.0))
+        module_c_enabled = bool(module_c_enabled)
+        modality_drift_enabled = bool(modality_drift_enabled)
+        if not module_c_enabled:
+            module_c_scale = 0.0
+        if not modality_drift_enabled:
+            modality_drift_scale = 0.0
 
         primary_adv = generator_fooling_loss(
             self.primary_discriminator(outputs.source_like)
@@ -280,7 +288,7 @@ class DualDiscriminatorCoordinator(nn.Module):
         )
 
         prototype_contrastive_loss = outputs.source_features.new_tensor(0.0)
-        if source_labels is not None and target_labels is not None:
+        if module_c_enabled and source_labels is not None and target_labels is not None:
             if num_classes is None:
                 max_label = torch.cat([source_labels.view(-1), target_labels.view(-1)]).max()
                 resolved_num_classes = int(max_label.detach().cpu().item()) + 1
@@ -288,7 +296,7 @@ class DualDiscriminatorCoordinator(nn.Module):
                 resolved_num_classes = int(num_classes)
 
             if resolved_num_classes > 0:
-                if self.training:
+                if module_c_enabled and self.training:
                     self._update_ema_prototypes(
                         outputs.source_features,
                         source_labels,
@@ -318,7 +326,7 @@ class DualDiscriminatorCoordinator(nn.Module):
                 )
 
         classification_loss = outputs.source_features.new_tensor(0.0)
-        if classifier is not None and criterion_cls is not None:
+        if module_c_enabled and classifier is not None and criterion_cls is not None:
             classifier_parameters = list(classifier.parameters())
             original_requires_grad = [parameter.requires_grad for parameter in classifier_parameters]
             freeze_classifier = bool(self.config.freeze_classifier_during_feedback)
@@ -343,6 +351,15 @@ class DualDiscriminatorCoordinator(nn.Module):
                     ):
                         parameter.requires_grad_(requires_grad)
 
+        if not module_c_enabled:
+            # Preserve raw diagnostics without retaining any Module-C autograd
+            # path or mutating prototype state in the ablation.
+            cycle_loss = cycle_loss.detach()
+            identity_loss = identity_loss.detach()
+            contrast_loss = contrast_loss.detach()
+            prototype_contrastive_loss = prototype_contrastive_loss.detach()
+            classification_loss = classification_loss.detach()
+
         drift_loss = outputs.source_features.new_tensor(0.0)
         drift_source_before = outputs.source_features.new_tensor(0.0)
         drift_target_like_after = outputs.source_features.new_tensor(0.0)
@@ -358,7 +375,8 @@ class DualDiscriminatorCoordinator(nn.Module):
         )
         if drift_layout_is_valid:
             drift_is_trainable = (
-                modality_drift_scale > 0.0
+                modality_drift_enabled
+                and modality_drift_scale > 0.0
                 and float(weights.modality_drift) > 0.0
             )
             if drift_is_trainable:

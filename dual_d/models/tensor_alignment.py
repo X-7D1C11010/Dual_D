@@ -10,6 +10,7 @@ Module purpose:
 
 Public interface:
     - TensorBasedAlignmentStable
+    - PlainMultimodalProjection
 
 Usage:
     >>> tal = TensorBasedAlignmentStable([512, 512, 512], [128, 128, 128], num_modalities=3)
@@ -218,3 +219,61 @@ class TensorBasedAlignmentStable(nn.Module):
                 q_target, _ = torch.linalg.qr(self.V_matrices[idx].data, mode="reduced")
                 self.U_matrices[idx].data = q_source[:, : self.output_dims[idx]]
                 self.V_matrices[idx].data = q_target[:, : self.output_dims[idx]]
+
+
+class PlainMultimodalProjection(nn.Module):
+    """Non-tensor ablation: shared per-modality linear projection and concat.
+
+    The same projection is used in Source and Target so the downstream fused
+    dimension and modality block layout match TAL. No tensor contraction,
+    domain-specific U/V matrices, correlation objective, or pair information
+    is used.
+    """
+
+    def __init__(self, input_dims: List[int], output_dims: List[int]):
+        super().__init__()
+        if len(input_dims) != len(output_dims) or not input_dims:
+            raise ValueError("Plain projection dimensions must be non-empty and aligned.")
+        self.input_dims = list(input_dims)
+        self.output_dims = list(output_dims)
+        self.num_modalities = len(input_dims)
+        self.projections = nn.ModuleList(
+            [
+                nn.Linear(input_dim, output_dim, bias=False)
+                for input_dim, output_dim in zip(input_dims, output_dims)
+            ]
+        )
+        for projection in self.projections:
+            nn.init.orthogonal_(projection.weight)
+
+    def _project(self, modalities: List[torch.Tensor]) -> List[torch.Tensor]:
+        if len(modalities) != self.num_modalities:
+            raise ValueError(
+                f"Expected {self.num_modalities} modalities, got {len(modalities)}."
+            )
+        return [
+            projection(features)
+            for projection, features in zip(self.projections, modalities)
+        ]
+
+    def project_source(self, source_modalities: List[torch.Tensor]) -> List[torch.Tensor]:
+        return self._project(source_modalities)
+
+    def project_target(self, target_modalities: List[torch.Tensor]) -> List[torch.Tensor]:
+        return self._project(target_modalities)
+
+    def forward(
+        self,
+        source_modalities: List[torch.Tensor],
+        target_modalities: List[torch.Tensor],
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
+        projected_source = self.project_source(source_modalities)
+        projected_target = self.project_target(target_modalities)
+        return (
+            projected_source,
+            projected_target,
+            projected_source[0].new_zeros(()),
+        )
+
+    def apply_orthogonal_projection(self) -> None:
+        """Plain projections have no TAL-specific post-step constraint."""

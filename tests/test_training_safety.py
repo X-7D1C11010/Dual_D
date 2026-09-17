@@ -323,6 +323,46 @@ class TrainingSafetyTests(unittest.TestCase):
         ]
         self.assertTrue(any(gradient is not None for gradient in translator_gradients))
 
+    def test_disabling_module_c_prevents_prototype_updates_and_gradients(self) -> None:
+        config = DualDConfig(
+            feature_dim=4,
+            loss_weights=LossWeights(
+                classification=1.0,
+                adv_primary=0.0,
+                adv_auxiliary=0.0,
+                cycle=1.0,
+                identity=1.0,
+                contrastive=1.0,
+                prototype_contrastive=1.0,
+                modality_drift=0.0,
+            ),
+        )
+        coordinator = DualDiscriminatorCoordinator(config)
+        source = torch.randn(4, 4)
+        target = torch.randn(4, 4)
+        source_labels = torch.tensor([0, 1, 0, 1])
+        target_labels = torch.tensor([1, 0, 1, 0])
+        outputs = coordinator(source, target)
+        loss, logs = coordinator.compute_generator_loss(
+            outputs,
+            classifier=torch.nn.Linear(4, 2),
+            criterion_cls=torch.nn.CrossEntropyLoss(),
+            source_labels=source_labels,
+            target_labels=target_labels,
+            num_classes=2,
+            module_c_enabled=False,
+            modality_drift_enabled=False,
+        )
+        loss.backward()
+
+        self.assertEqual(coordinator.source_prototype_seen.numel(), 0)
+        self.assertEqual(coordinator.target_prototype_seen.numel(), 0)
+        self.assertEqual(logs["dual_d/weighted_cycle"], 0.0)
+        self.assertEqual(logs["dual_d/weighted_classification_feedback"], 0.0)
+        for gradient in (parameter.grad for parameter in coordinator.generator_parameters()):
+            if gradient is not None:
+                self.assertTrue(torch.count_nonzero(gradient) == 0)
+
     def test_class_prototype_contrastive_prefers_matching_class(self) -> None:
         prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         prototype_mask = torch.tensor([True, True])

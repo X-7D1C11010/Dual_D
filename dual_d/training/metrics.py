@@ -57,21 +57,30 @@ def classification_metrics(
     per_class_precision = []
     per_class_recall = []
     per_class_f1 = []
+    per_class_accuracy_ovr = []
+    per_class_specificity = []
+    per_class_correct = []
     per_class_support = []
     classes_present = []
     for class_idx in range(num_classes):
         tp = float(confusion[class_idx, class_idx].item())
         fp = float(confusion[:, class_idx].sum().item() - tp)
         fn = float(confusion[class_idx, :].sum().item() - tp)
+        tn = float(total - tp - fp - fn)
         support = float(confusion[class_idx, :].sum().item())
         if support > 0:
             classes_present.append(class_idx)
         precision = _safe_divide(tp, tp + fp)
         recall = _safe_divide(tp, tp + fn)
         f1 = _safe_divide(2.0 * precision * recall, precision + recall)
+        accuracy_ovr = _safe_divide(tp + tn, tp + tn + fp + fn)
+        specificity = _safe_divide(tn, tn + fp)
         per_class_precision.append(precision)
         per_class_recall.append(recall)
         per_class_f1.append(f1)
+        per_class_accuracy_ovr.append(accuracy_ovr)
+        per_class_specificity.append(specificity)
+        per_class_correct.append(tp)
         per_class_support.append(support)
 
     if classes_present:
@@ -134,6 +143,9 @@ def classification_metrics(
         "per_class_precision": per_class_precision,
         "per_class_recall": per_class_recall,
         "per_class_f1": per_class_f1,
+        "per_class_accuracy_ovr": per_class_accuracy_ovr,
+        "per_class_specificity": per_class_specificity,
+        "per_class_correct": per_class_correct,
         "per_class_support": per_class_support,
         "confusion_matrix": confusion.tolist(),
         "total": total,

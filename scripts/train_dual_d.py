@@ -423,6 +423,30 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         help="Full Dual_D or a source-only M4-SAR baseline.",
     )
     parser.add_argument(
+        "--alignment-mode",
+        choices=["tal", "plain"],
+        default=default("alignment_mode", "tal"),
+        help="Tensor alignment, or shared per-modality linear projection for ablation.",
+    )
+    parser.add_argument(
+        "--translation-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=default("translation_enabled", True),
+        help="Enable bidirectional translators and both discriminators.",
+    )
+    parser.add_argument(
+        "--module-c-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=default("module_c_enabled", True),
+        help="Enable all category-aware Module-C constraints and prototype updates.",
+    )
+    parser.add_argument(
+        "--modality-drift-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=default("modality_drift_enabled", True),
+        help="Enable the modality relation drift constraint.",
+    )
+    parser.add_argument(
         "--class-weighted-ce",
         action=argparse.BooleanOptionalAction,
         default=default("class_weighted_ce", True),
@@ -965,6 +989,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("--feature-visualization-samples must be positive.")
     if args.dataset_type != "m4sar_classification" and args.model_mode != "dual_d":
         parser.error("Baseline --model-mode values are currently scoped to M4-SAR.")
+    if args.model_mode != "dual_d" and args.alignment_mode != "tal":
+        parser.error("--alignment-mode applies only to model_mode=dual_d.")
+    if not args.translation_enabled and (
+        args.module_c_enabled or args.modality_drift_enabled
+    ):
+        parser.error(
+            "Disabling translation also requires --no-module-c-enabled and "
+            "--no-modality-drift-enabled because both depend on translated features."
+        )
     return args
 
 

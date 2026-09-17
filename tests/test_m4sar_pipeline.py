@@ -234,6 +234,34 @@ class M4SARTrainingContractTests(unittest.TestCase):
                         any(p.requires_grad for p in models.dual_adapter.parameters())
                     )
 
+    def test_plain_alignment_ablation_preserves_fused_dimension(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = _write_m4sar_fixture(root)
+            args = _fixture_args(root, manifest)
+            args.model_mode = "dual_d"
+            args.alignment_mode = "plain"
+            models = build_models(args, 6, torch.device("cpu"))
+            source = [torch.randn(4, 16), torch.randn(4, 16)]
+            target = [torch.randn(4, 16), torch.randn(4, 16)]
+            projected_source, projected_target, loss = models.tal(source, target)
+            self.assertEqual([tuple(value.shape) for value in projected_source], [(4, 8), (4, 8)])
+            self.assertEqual([tuple(value.shape) for value in projected_target], [(4, 8), (4, 8)])
+            self.assertEqual(float(loss), 0.0)
+
+    def test_no_translation_stack_freezes_adapter(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = _write_m4sar_fixture(root)
+            args = _fixture_args(root, manifest)
+            args.model_mode = "dual_d"
+            args.translation_enabled = False
+            args.module_c_enabled = False
+            args.modality_drift_enabled = False
+            models = build_models(args, 6, torch.device("cpu"))
+            self.assertFalse(any(p.requires_grad for p in models.dual_adapter.parameters()))
+            self.assertTrue(any(p.requires_grad for p in models.tal.parameters()))
+
     def test_full_preflight_uses_no_target_test(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -313,6 +341,18 @@ class M4SARTrainingContractTests(unittest.TestCase):
             self.assertIn("tal n/a", train_log)
             self.assertIn("source_train_acc", train_log)
             self.assertIn("target_val_acc", train_log)
+
+            with (run_dir / "per_class_metrics.csv").open(
+                "r", encoding="utf-8", newline=""
+            ) as stream:
+                per_class_rows = list(csv.DictReader(stream))
+            self.assertEqual(len(per_class_rows), 30)
+            self.assertEqual(
+                {row["class_name"] for row in per_class_rows},
+                {"bridge", "harbor", "oil_tank", "playground", "airport", "wind_turbine"},
+            )
+            for field in ("accuracy_ovr", "precision", "recall", "f1", "support"):
+                self.assertIn(field, per_class_rows[0])
 
 
 if __name__ == "__main__":
