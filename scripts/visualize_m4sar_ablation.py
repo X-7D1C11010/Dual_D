@@ -43,30 +43,28 @@ def _supports_chinese_glyphs(path: Path) -> bool:
 def _configure_chinese_font(font_path: str = "") -> str:
     """Select a real CJK font by glyph coverage, preferring SimSun."""
 
-    candidates: list[Path] = []
+    candidates = []
     if font_path:
         explicit = Path(font_path).expanduser()
         if not explicit.is_file():
             raise FileNotFoundError(f"指定的中文字体文件不存在：{explicit}")
-        candidates.append(explicit)
+        candidates.append((explicit, None))
     candidates.extend(
         [
-            Path.home() / ".fonts" / "simsun.ttc",
-            Path.home() / ".local" / "share" / "fonts" / "simsun.ttc",
-            Path("/usr/share/fonts/truetype/msttcorefonts/simsun.ttf"),
-            Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-            Path("/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc"),
-            Path("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
-            Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
+            (Path.home() / ".fonts" / "simsun.ttc", None),
+            (Path.home() / ".local" / "share" / "fonts" / "simsun.ttc", None),
+            (Path("/usr/share/fonts/truetype/msttcorefonts/simsun.ttf"), None),
         ]
     )
     preferred_families = (
         "SimSun",
         "宋体",
-        "SimHei",
-        "Microsoft YaHei",
-        "Noto Sans CJK SC",
         "Noto Serif CJK SC",
+        "Source Han Serif SC",
+        "Noto Sans CJK SC",
+        "Source Han Sans SC",
+        "Microsoft YaHei",
+        "SimHei",
         "WenQuanYi Micro Hei",
         "WenQuanYi Zen Hei",
     )
@@ -79,23 +77,35 @@ def _configure_chinese_font(font_path: str = "") -> str:
             entry.name,
         )
     )
-    candidates.extend(Path(entry.fname) for entry in installed)
+    # Retain FontManager's family name. A TTC collection may contain JP/SC/TC
+    # faces at the same path; reconstructing a family only from the path often
+    # selects the first (usually JP) face even when an SC face is installed.
+    candidates.extend((Path(entry.fname), entry.name) for entry in installed)
+    candidates.extend(
+        [
+            (Path("/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc"), None),
+            (Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"), None),
+            (Path("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"), None),
+            (Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"), None),
+        ]
+    )
     # findSystemFonts also sees newly installed fonts when Matplotlib's cache is stale.
-    candidates.extend(Path(path) for path in font_manager.findSystemFonts())
+    candidates.extend((Path(path), None) for path in font_manager.findSystemFonts())
 
-    visited: set[Path] = set()
-    for candidate in candidates:
+    visited = set()
+    for candidate, family_hint in candidates:
         try:
             resolved = candidate.resolve()
         except OSError:
             continue
-        if resolved in visited or not resolved.is_file():
+        identity = (resolved, family_hint)
+        if identity in visited or not resolved.is_file():
             continue
-        visited.add(resolved)
+        visited.add(identity)
         if not _supports_chinese_glyphs(resolved):
             continue
         font_manager.fontManager.addfont(str(resolved))
-        family = font_manager.FontProperties(fname=str(resolved)).get_name()
+        family = family_hint or font_manager.FontProperties(fname=str(resolved)).get_name()
         plt.rcParams["font.sans-serif"] = [family, "SimSun", "SimHei"]
         return f"{family} ({resolved})"
     raise RuntimeError(
