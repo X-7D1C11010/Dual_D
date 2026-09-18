@@ -198,6 +198,13 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
         torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        # M4-SAR uses a fixed input shape, so cuDNN can benchmark convolution
+        # algorithms once and reuse the fastest choice. Reset deterministic
+        # state as run_training may be called repeatedly in one Python process.
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        torch.use_deterministic_algorithms(False)
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -2114,6 +2121,11 @@ def run_training(args) -> Dict[str, object]:
     logger.info("Starting Dual_D standalone training")
     logger.info(f"Run directory: {run_dir}")
     logger.info(f"Device: {device}")
+    logger.info(
+        "CUDA reproducibility mode: deterministic=%s | cudnn_benchmark=%s",
+        bool(getattr(args, "deterministic_training", False)),
+        bool(torch.backends.cudnn.benchmark),
+    )
 
     (
         source_train,
