@@ -1,15 +1,17 @@
-"""Run Full M4-SAR Dual-D and four structural ablations sequentially.
+"""Run Full M4-SAR Dual-D and four structural ablations.
 
 One invocation launches every variant/seed with a fixed batch configuration,
-then generates the Chinese summary figures. Completed runs can be reused with
-``--resume``. Target test remains inside the trainer and is opened only after
-Target-validation checkpoint selection has completed.
+optionally using one exclusive FIFO queue per GPU, then generates the Chinese
+summary figures. Completed runs can be reused with ``--resume``. Target test
+remains inside the trainer and is opened only after Target-validation checkpoint
+selection has completed.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import json
 import os
@@ -71,6 +73,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--parallel-runs",
+        type=int,
+        default=1,
+        help="Number of independent runs launched concurrently.",
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Physical GPU ids dedicated to parallel runs, e.g. --gpu-ids 0 1.",
+    )
     parser.add_argument("--min-free-gb", type=float, default=10.0)
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument(
@@ -106,6 +121,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--preflight",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--deterministic-training",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use deterministic CUDA kernels for strict repeatability; disabling "
+            "may improve throughput while seeds remain recorded."
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -148,6 +172,86 @@ def _wait_for_gpu(min_free_gb: float, poll_seconds: float) -> int:
         if selected[1] >= min_free_gb:
             return selected[0]
         time.sleep(poll_seconds)
+
+
+def _gpu_free_memory() -> dict[int, float]:
+    completed = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,memory.free",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    devices = {}
+    for line in completed.stdout.splitlines():
+        if line.strip():
+            index, free_mib = (int(value.strip()) for value in line.split(","))
+            devices[index] = free_mib / 1024.0
+    if not devices:
+        raise RuntimeError("nvidia-smi returned no GPUs.")
+    return devices
+
+
+def _wait_for_specific_gpu(
+    gpu_index: int,
+    min_free_gb: float,
+    poll_seconds: float,
+) -> None:
+    while True:
+        devices = _gpu_free_memory()
+        if gpu_index not in devices:
+            raise RuntimeError(f"Requested physical GPU {gpu_index} does not exist.")
+        free_gb = devices[gpu_index]
+        print(
+            f"[显存检查] GPU {gpu_index}: {free_gb:.2f} GiB free",
+            flush=True,
+        )
+        if free_gb >= min_free_gb:
+            return
+        time.sleep(poll_seconds)
+
+
+def _run_gpu_queue(
+    gpu_index: int,
+    jobs: list[tuple[str, Path, list[str]]],
+    *,
+    wait_for_gpu: bool,
+    min_free_gb: float,
+    poll_seconds: float,
+) -> None:
+    """Run one FIFO job queue on one exclusively assigned physical GPU."""
+
+    for run_name, run_dir, command in jobs:
+        if wait_for_gpu:
+            _wait_for_specific_gpu(gpu_index, min_free_gb, poll_seconds)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        environment = os.environ.copy()
+        environment["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        environment.setdefault(
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "expandable_segments:True",
+        )
+        launcher_log = run_dir / "launcher.log"
+        print(
+            f"\n[开始] {run_name} | physical GPU {gpu_index}\n"
+            f"{' '.join(command)}\n[子进程日志] {launcher_log}",
+            flush=True,
+        )
+        with launcher_log.open("a", encoding="utf-8") as stream:
+            completed = subprocess.run(
+                command,
+                cwd=PROJECT_ROOT,
+                env=environment,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        if completed.returncode != 0:
+            raise subprocess.CalledProcessError(completed.returncode, command)
+        print(f"[完成] {run_name} | physical GPU {gpu_index}", flush=True)
 
 
 def _write_json(path: Path, payload) -> None:
@@ -271,6 +375,18 @@ def main() -> None:
         parser.error("--batch-size must be positive.")
     if args.min_free_gb <= 0 or args.poll_seconds <= 0:
         parser.error("GPU memory threshold and poll interval must be positive.")
+    if args.parallel_runs <= 0:
+        parser.error("--parallel-runs must be positive.")
+    if args.parallel_runs > 1:
+        if args.device not in {None, "auto", "cuda"}:
+            parser.error("Parallel runs require --device auto/cuda or no --device.")
+        if not args.gpu_ids or len(args.gpu_ids) < args.parallel_runs:
+            parser.error(
+                "Parallel runs require at least one exclusive --gpu-ids entry "
+                "per concurrent run."
+            )
+    if args.gpu_ids and len(set(args.gpu_ids)) != len(args.gpu_ids):
+        parser.error("--gpu-ids must not contain duplicates.")
 
     experiment_name = args.experiment_name or datetime.now().strftime(
         "m4sar_full_ablation_%Y%m%d_%H%M%S"
@@ -285,6 +401,8 @@ def main() -> None:
         "target_test_policy": "validation-selected checkpoint; final evaluation only",
         "loader_policy": "independent Source/Target shuffle; no pair correspondence",
         "fixed_batch_size": args.batch_size,
+        "parallel_runs": args.parallel_runs,
+        "gpu_ids": args.gpu_ids,
     }
     _write_json(experiment_dir / "experiment_manifest.json", manifest)
 
@@ -314,6 +432,7 @@ def main() -> None:
             check=True,
         )
 
+    jobs: list[tuple[str, Path, list[str]]] = []
     for variant in args.variants:
         for seed in args.seeds:
             run_name = f"{variant}_seed{seed}"
@@ -331,7 +450,11 @@ def main() -> None:
                 "--iterations", "1",
                 "--seed", str(seed),
                 "--model-mode", "dual_d",
-                "--deterministic-training",
+                (
+                    "--deterministic-training"
+                    if args.deterministic_training
+                    else "--no-deterministic-training"
+                ),
                 "--save-checkpoints",
                 "--save-feature-embeddings",
                 (
@@ -350,22 +473,62 @@ def main() -> None:
             if args.device is not None:
                 command.extend(["--device", str(args.device)])
             command.extend(forwarded)
-            print(f"\n[开始] {run_name}\n{' '.join(command)}", flush=True)
-            if args.dry_run:
-                continue
-            environment = os.environ.copy()
-            if args.wait_for_gpu and args.device in {None, "auto", "cuda"}:
-                gpu_index = _wait_for_gpu(args.min_free_gb, args.poll_seconds)
-                environment["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
-                environment.setdefault(
-                    "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
-                )
-                print(f"[选择 GPU] 物理 GPU {gpu_index}", flush=True)
-            subprocess.run(command, cwd=PROJECT_ROOT, env=environment, check=True)
+            jobs.append((run_name, run_dir, command))
 
     if args.dry_run:
+        for index, (run_name, _run_dir, command) in enumerate(jobs):
+            gpu_note = ""
+            if args.gpu_ids:
+                gpu_note = f" | physical GPU {args.gpu_ids[index % args.parallel_runs]}"
+            print(f"\n[计划] {run_name}{gpu_note}\n{' '.join(command)}", flush=True)
         print("Dry run complete; no training or visualization was started.")
         return
+
+    if args.parallel_runs > 1:
+        selected_gpus = list(args.gpu_ids[: args.parallel_runs])
+        gpu_queues: dict[int, list[tuple[str, Path, list[str]]]] = {
+            gpu_index: [] for gpu_index in selected_gpus
+        }
+        for index, job in enumerate(jobs):
+            gpu_queues[selected_gpus[index % len(selected_gpus)]].append(job)
+        with ThreadPoolExecutor(max_workers=args.parallel_runs) as executor:
+            futures = [
+                executor.submit(
+                    _run_gpu_queue,
+                    gpu_index,
+                    gpu_queues[gpu_index],
+                    wait_for_gpu=args.wait_for_gpu,
+                    min_free_gb=args.min_free_gb,
+                    poll_seconds=args.poll_seconds,
+                )
+                for gpu_index in selected_gpus
+            ]
+            for future in futures:
+                future.result()
+    else:
+        for run_name, run_dir, command in jobs:
+            print(f"\n[开始] {run_name}\n{' '.join(command)}", flush=True)
+            environment = os.environ.copy()
+            if args.device in {None, "auto", "cuda"}:
+                if args.gpu_ids:
+                    gpu_index = int(args.gpu_ids[0])
+                    if args.wait_for_gpu:
+                        _wait_for_specific_gpu(
+                            gpu_index,
+                            args.min_free_gb,
+                            args.poll_seconds,
+                        )
+                elif args.wait_for_gpu:
+                    gpu_index = _wait_for_gpu(args.min_free_gb, args.poll_seconds)
+                else:
+                    gpu_index = None
+                if gpu_index is not None:
+                    environment["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+                    environment.setdefault(
+                        "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+                    )
+                    print(f"[选择 GPU] 物理 GPU {gpu_index}", flush=True)
+            subprocess.run(command, cwd=PROJECT_ROOT, env=environment, check=True)
 
     _write_summary_csv(experiment_dir)
     if args.visualize:

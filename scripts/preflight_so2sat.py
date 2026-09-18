@@ -121,6 +121,9 @@ def run_preflight(args) -> dict[str, object]:
         projected_source, projected_target, tensor_loss = models.tal(
             source_modalities,
             target_modalities,
+            source_labels=source_labels,
+            target_labels=target_labels,
+            num_classes=len(label_map),
         )
         source_features = torch.cat(projected_source, dim=1)
         target_features = torch.cat(projected_target, dim=1)

@@ -270,6 +270,9 @@ class M4SARClassificationDataset(Dataset):
         data_root: str | Path | None = None,
         input_size: int = 128,
         augment: bool = False,
+        optical_jitter: float = 0.0,
+        sar_gain_jitter: float = 0.0,
+        sar_noise_std: float = 0.0,
         records: Sequence[M4SARRecord] | None = None,
     ) -> None:
         super().__init__()
@@ -285,6 +288,16 @@ class M4SARClassificationDataset(Dataset):
         if self.input_size <= 0:
             raise ValueError("input_size must be positive.")
         self.augment = bool(augment)
+        self.optical_jitter = float(optical_jitter)
+        self.sar_gain_jitter = float(sar_gain_jitter)
+        self.sar_noise_std = float(sar_noise_std)
+        for name, value in (
+            ("optical_jitter", self.optical_jitter),
+            ("sar_gain_jitter", self.sar_gain_jitter),
+            ("sar_noise_std", self.sar_noise_std),
+        ):
+            if not 0.0 <= value <= 0.5:
+                raise ValueError(f"{name} must be in [0, 0.5], got {value}.")
         self.records = tuple(records) if records is not None else load_m4sar_manifest(
             self.manifest_path,
             self.split,
@@ -309,6 +322,9 @@ class M4SARClassificationDataset(Dataset):
             data_root=self.data_root,
             input_size=self.input_size,
             augment=self.augment if augment is None else augment,
+            optical_jitter=self.optical_jitter,
+            sar_gain_jitter=self.sar_gain_jitter,
+            sar_noise_std=self.sar_noise_std,
             records=self.records,
         )
 
@@ -342,6 +358,46 @@ class M4SARClassificationDataset(Dataset):
             sar = torch.rot90(sar, rotations, (1, 2))
         return optical.contiguous(), sar.contiguous()
 
+    def _photometric_augmentation(
+        self,
+        optical: torch.Tensor,
+        sar: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply mild modality-specific radiometric perturbations.
+
+        Geometry remains synchronized within one domain sample.  Optical and
+        SAR radiometry is intentionally perturbed independently because their
+        sensing physics differs.  Values are clipped before Source-derived
+        normalization so the augmentation cannot create impossible byte-range
+        intensities.
+        """
+
+        if not self.augment:
+            return optical, sar
+        if self.optical_jitter > 0.0:
+            strength = self.optical_jitter
+            brightness = 1.0 + float(torch.empty(()).uniform_(-strength, strength))
+            contrast = 1.0 + float(torch.empty(()).uniform_(-strength, strength))
+            channel_gain = torch.empty((3, 1, 1)).uniform_(
+                1.0 - 0.5 * strength,
+                1.0 + 0.5 * strength,
+            )
+            channel_mean = optical.mean(dim=(1, 2), keepdim=True)
+            optical = (optical - channel_mean) * contrast + channel_mean
+            optical = optical * brightness * channel_gain
+            optical = optical.clamp_(0.0, 1.0)
+        if self.sar_gain_jitter > 0.0:
+            gain = 1.0 + float(
+                torch.empty(()).uniform_(
+                    -self.sar_gain_jitter,
+                    self.sar_gain_jitter,
+                )
+            )
+            sar = sar * gain
+        if self.sar_noise_std > 0.0:
+            sar = sar + torch.randn_like(sar) * self.sar_noise_std
+        return optical.contiguous(), sar.clamp_(0.0, 1.0).contiguous()
+
     def __getitem__(self, index: int):
         record = self.records[int(index)]
         if self.domain == "source":
@@ -367,6 +423,7 @@ class M4SARClassificationDataset(Dataset):
             sar = self._to_tensor(sar_image)
 
         optical, sar = self._synchronized_geometry(optical, sar)
+        optical, sar = self._photometric_augmentation(optical, sar)
         optical = (optical - self._optical_mean) / self._optical_std
         sar = (sar - self._sar_mean) / self._sar_std
         label = int(record.label)

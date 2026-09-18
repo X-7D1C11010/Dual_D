@@ -463,6 +463,11 @@ def _build_m4sar_datasets(args):
         "manifest_path": args.m4sar_manifest,
         "data_root": getattr(args, "m4sar_data_root", "") or None,
         "input_size": int(getattr(args, "m4sar_input_size", 128)),
+        "optical_jitter": float(getattr(args, "m4sar_optical_jitter", 0.0)),
+        "sar_gain_jitter": float(
+            getattr(args, "m4sar_sar_gain_jitter", 0.0)
+        ),
+        "sar_noise_std": float(getattr(args, "m4sar_sar_noise_std", 0.0)),
     }
     source_train = M4SARClassificationDataset(
         split="train",
@@ -506,6 +511,9 @@ def build_m4sar_test_dataset(args, domain: str = "target"):
         domain=domain,
         input_size=int(getattr(args, "m4sar_input_size", 128)),
         augment=False,
+        optical_jitter=float(getattr(args, "m4sar_optical_jitter", 0.0)),
+        sar_gain_jitter=float(getattr(args, "m4sar_sar_gain_jitter", 0.0)),
+        sar_noise_std=float(getattr(args, "m4sar_sar_noise_std", 0.0)),
     )
 
 
@@ -1023,9 +1031,22 @@ def extract_fused_features(
         return feat_src, feat_tgt, feat_src.new_zeros(())
     source_modalities = _encode_batch_modalities(models, source_batch, device)
     target_modalities = _encode_batch_modalities(models, target_batch, device)
+    source_labels = source_batch.get("label")
+    target_labels = target_batch.get("label")
+    if source_labels is not None:
+        source_labels = source_labels.to(device, non_blocking=True)
+    if target_labels is not None:
+        target_labels = target_labels.to(device, non_blocking=True)
     projected_source, projected_target, loss_tal = models.tal(
         source_modalities,
         target_modalities,
+        source_labels=source_labels,
+        target_labels=target_labels,
+        num_classes=(
+            int(getattr(args, "num_classes"))
+            if args is not None and getattr(args, "num_classes", None) is not None
+            else None
+        ),
     )
     feat_src = torch.cat(projected_source, dim=1)
     feat_tgt = torch.cat(projected_target, dim=1)
@@ -2336,6 +2357,17 @@ def run_training(args) -> Dict[str, object]:
             "TAL block order=SAR,Optical | loader policy=independent shuffle"
         )
         logger.info(
+            "TAL alignment policy: unpaired class prototypes | no row-wise or "
+            "physical-pair correspondence"
+        )
+        logger.info(
+            "M4-SAR train-only radiometric augmentation: optical_jitter=%.3f | "
+            "sar_gain_jitter=%.3f | sar_noise_std=%.3f",
+            float(getattr(args, "m4sar_optical_jitter", 0.0)),
+            float(getattr(args, "m4sar_sar_gain_jitter", 0.0)),
+            float(getattr(args, "m4sar_sar_noise_std", 0.0)),
+        )
+        logger.info(
             "M4-SAR model mode: %s | alignment=%s | translation=%s | "
             "Module-C=%s | Relation-Drift=%s | Target test is deferred until after "
             "validation checkpoint selection",
@@ -2382,11 +2414,17 @@ def run_training(args) -> Dict[str, object]:
             getattr(source_train, "reference_ais_pool_indices", np.empty(0)).size,
             getattr(target_val, "reference_ais_pool_indices", np.empty(0)).size,
         )
+    configured_eval_batch = getattr(args, "eval_batch_size", None)
     eval_batch_size = (
-        min(batch_size for _threshold, batch_size in adaptive_batch_plan)
-        if adaptive_batch_plan is not None
-        else args.batch_size
+        int(configured_eval_batch)
+        if configured_eval_batch is not None
+        else (
+            min(batch_size for _threshold, batch_size in adaptive_batch_plan)
+            if adaptive_batch_plan is not None
+            else int(args.batch_size)
+        )
     )
+    logger.info("Evaluation batch size: %d", eval_batch_size)
     val_loader = DataLoader(
         target_val,
         batch_size=eval_batch_size,

@@ -4,9 +4,9 @@ Module purpose:
     Provide a standalone implementation of the stable tensor alignment layer
     used before the Dual_D feature-level adversarial module. It projects source
     and target modality features into a shared low-dimensional space while
-    maximizing paired correlation.  The forward path uses an algebraically
-    factorized tensor contraction so three 512-D modalities do not materialize
-    an infeasible ``512 x 512 x 512`` outer-product tensor.
+    maximizing class-prototype correlation between independently sampled
+    domains. The tensor-product correlation is evaluated algebraically so a
+    large multimodal outer-product tensor is never materialized.
 
 Public interface:
     - TensorBasedAlignmentStable
@@ -21,7 +21,7 @@ Usage:
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -129,6 +129,90 @@ class TensorBasedAlignmentStable(nn.Module):
         return torch.diagonal(similarity).mean()
 
     @staticmethod
+    def class_prototype_tensor_correlation(
+        projected_source: List[torch.Tensor],
+        projected_target: List[torch.Tensor],
+        source_labels: Optional[torch.Tensor] = None,
+        target_labels: Optional[torch.Tensor] = None,
+        num_classes: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Align unpaired domains through class-level tensor prototypes.
+
+        Source and Target samples are never matched by row.  For every class
+        present in both independently shuffled batches, this method forms one
+        prototype per modality and compares the corresponding rank-one tensor
+        products.  The tensor-product cosine factorizes into the product of
+        per-modality cosines, so no large outer-product tensor is materialized.
+
+        A per-modality mean term removes the sign ambiguity of an even-order
+        tensor product (two anti-aligned modalities must not count as aligned).
+        When labels are unavailable, each complete batch is treated as one
+        unpaired domain prototype rather than using arbitrary diagonal pairs.
+        """
+
+        if not projected_source or len(projected_source) != len(projected_target):
+            raise ValueError("Source and Target projected modalities must align.")
+        device = projected_source[0].device
+        if source_labels is None or target_labels is None:
+            modality_scores = []
+            for source_features, target_features in zip(
+                projected_source,
+                projected_target,
+            ):
+                modality_scores.append(
+                    F.cosine_similarity(
+                        source_features.mean(dim=0, keepdim=True),
+                        target_features.mean(dim=0, keepdim=True),
+                        dim=1,
+                        eps=1e-6,
+                    ).squeeze(0)
+                )
+            stacked = torch.stack(modality_scores)
+            return 0.5 * (torch.prod(stacked) + stacked.mean())
+
+        source_labels = source_labels.to(device=device, dtype=torch.long)
+        target_labels = target_labels.to(device=device, dtype=torch.long)
+        if num_classes is None:
+            num_classes = int(
+                torch.cat([source_labels, target_labels]).max().detach().cpu()
+            ) + 1
+        resolved_classes = int(num_classes)
+        source_assignment = F.one_hot(
+            source_labels,
+            num_classes=resolved_classes,
+        ).to(projected_source[0].dtype)
+        target_assignment = F.one_hot(
+            target_labels,
+            num_classes=resolved_classes,
+        ).to(projected_target[0].dtype)
+        source_counts = source_assignment.sum(dim=0)
+        target_counts = target_assignment.sum(dim=0)
+        shared_mask = (source_counts > 0) & (target_counts > 0)
+        shared_weight = shared_mask.to(projected_source[0].dtype)
+
+        modality_scores = []
+        for source_features, target_features in zip(
+            projected_source,
+            projected_target,
+        ):
+            source_prototypes = torch.mm(source_assignment.t(), source_features)
+            target_prototypes = torch.mm(target_assignment.t(), target_features)
+            source_prototypes = source_prototypes / source_counts.clamp_min(1).unsqueeze(1)
+            target_prototypes = target_prototypes / target_counts.clamp_min(1).unsqueeze(1)
+            modality_scores.append(
+                F.cosine_similarity(
+                    source_prototypes,
+                    target_prototypes,
+                    dim=1,
+                    eps=1e-6,
+                )
+            )
+        stacked = torch.stack(modality_scores)
+        tensor_score = torch.prod(stacked, dim=0)
+        class_score = 0.5 * (tensor_score + stacked.mean(dim=0))
+        return (class_score * shared_weight).sum() / shared_weight.sum().clamp_min(1.0)
+
+    @staticmethod
     def factorized_tensor_contraction(
         modalities: List[torch.Tensor],
         matrices: nn.ParameterList | List[torch.Tensor],
@@ -174,8 +258,11 @@ class TensorBasedAlignmentStable(nn.Module):
         self,
         source_modalities: List[torch.Tensor],
         target_modalities: List[torch.Tensor],
+        source_labels: Optional[torch.Tensor] = None,
+        target_labels: Optional[torch.Tensor] = None,
+        num_classes: Optional[int] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
-        """Project modalities and return correlation alignment loss."""
+        """Project modalities and return an unpaired tensor-alignment loss."""
 
         if len(source_modalities) != self.num_modalities:
             raise ValueError(
@@ -188,26 +275,16 @@ class TensorBasedAlignmentStable(nn.Module):
                 f"got {len(target_modalities)}."
             )
 
-        total_correlation = source_modalities[0].new_tensor(0.0)
-        for mode in range(self.num_modalities):
-            source_contracted = self.factorized_tensor_contraction(
-                source_modalities,
-                self.U_matrices,
-                mode,
-            )
-            target_contracted = self.factorized_tensor_contraction(
-                target_modalities,
-                self.V_matrices,
-                mode,
-            )
-            total_correlation = total_correlation + self.compute_correlation_score(
-                source_contracted,
-                target_contracted,
-            )
-
         projected_source = self.project_source(source_modalities)
         projected_target = self.project_target(target_modalities)
-        alignment_loss = -total_correlation / self.num_modalities
+        tensor_correlation = self.class_prototype_tensor_correlation(
+            projected_source,
+            projected_target,
+            source_labels,
+            target_labels,
+            num_classes,
+        )
+        alignment_loss = 1.0 - tensor_correlation
         return projected_source, projected_target, alignment_loss
 
     def apply_orthogonal_projection(self) -> None:
@@ -266,7 +343,11 @@ class PlainMultimodalProjection(nn.Module):
         self,
         source_modalities: List[torch.Tensor],
         target_modalities: List[torch.Tensor],
+        source_labels: Optional[torch.Tensor] = None,
+        target_labels: Optional[torch.Tensor] = None,
+        num_classes: Optional[int] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
+        del source_labels, target_labels, num_classes
         projected_source = self.project_source(source_modalities)
         projected_target = self.project_target(target_modalities)
         return (

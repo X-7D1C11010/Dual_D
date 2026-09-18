@@ -35,6 +35,7 @@ from dual_d.training.trainer import (
     _stable_monitor_score,
     validate_cuda_architecture,
 )
+from dual_d.models import TensorBasedAlignmentStable
 from dual_d.config import DualDConfig
 
 
@@ -45,6 +46,57 @@ def _write_image(path: Path, value: int) -> None:
 
 
 class TrainingSafetyTests(unittest.TestCase):
+    def test_tal_is_invariant_to_unpaired_target_row_order(self) -> None:
+        torch.manual_seed(17)
+        tal = TensorBasedAlignmentStable([6, 6], [4, 4], num_modalities=2)
+        source = [torch.randn(8, 6), torch.randn(8, 6)]
+        target = [torch.randn(8, 6), torch.randn(8, 6)]
+        source_labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+        target_labels = torch.tensor([3, 0, 2, 1, 3, 2, 0, 1])
+        permutation = torch.tensor([6, 3, 5, 0, 7, 2, 4, 1])
+
+        _, _, original = tal(
+            source,
+            target,
+            source_labels=source_labels,
+            target_labels=target_labels,
+        )
+        shuffled_target = [features[permutation] for features in target]
+        _, _, shuffled = tal(
+            source,
+            shuffled_target,
+            source_labels=source_labels,
+            target_labels=target_labels[permutation],
+        )
+
+        self.assertTrue(torch.allclose(original, shuffled, atol=1e-6))
+
+    def test_tal_near_zero_features_keep_finite_gradients(self) -> None:
+        torch.manual_seed(19)
+        tal = TensorBasedAlignmentStable([5, 5], [3, 3], num_modalities=2)
+        source = [
+            (torch.randn(6, 5) * 1e-10).requires_grad_(True),
+            (torch.randn(6, 5) * 1e-10).requires_grad_(True),
+        ]
+        target = [
+            (torch.randn(6, 5) * 1e-10).requires_grad_(True),
+            (torch.randn(6, 5) * 1e-10).requires_grad_(True),
+        ]
+        labels = torch.tensor([0, 0, 1, 1, 2, 2])
+
+        _, _, loss = tal(
+            source,
+            target,
+            source_labels=labels,
+            target_labels=labels.flip(0),
+        )
+        loss.backward()
+
+        self.assertTrue(bool(torch.isfinite(loss)))
+        gradients = [parameter.grad for parameter in tal.parameters()]
+        self.assertTrue(all(gradient is not None for gradient in gradients))
+        self.assertTrue(all(bool(torch.isfinite(gradient).all()) for gradient in gradients))
+
     def test_frozen_batch_norm_keeps_running_statistics_fixed(self) -> None:
         frozen = torch.nn.BatchNorm1d(4)
         trainable = torch.nn.BatchNorm1d(4)
@@ -263,9 +315,9 @@ class TrainingSafetyTests(unittest.TestCase):
             (2, 2, 2),
             margin=0.0,
         )
-        self.assertGreater(float(after), float(before))
-        self.assertGreater(float(raw_drift), 0.0)
-        self.assertGreater(float(penalty), 0.0)
+        self.assertGreater(float(after.detach()), float(before.detach()))
+        self.assertGreater(float(raw_drift.detach()), 0.0)
+        self.assertGreater(float(penalty.detach()), 0.0)
         penalty.backward()
         self.assertIsNotNone(damaged.grad)
 

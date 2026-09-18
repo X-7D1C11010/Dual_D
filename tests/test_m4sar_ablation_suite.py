@@ -2,7 +2,7 @@
 
 import unittest
 
-from scripts.run_m4sar_ablation_suite import VARIANTS
+from scripts.run_m4sar_ablation_suite import VARIANTS, build_parser
 
 
 class M4SARAblationSuiteTests(unittest.TestCase):
@@ -30,6 +30,13 @@ class M4SARAblationSuiteTests(unittest.TestCase):
         self.assertIn("--translation-enabled", flags)
         self.assertIn("--module-c-enabled", flags)
         self.assertIn("--modality-drift-enabled", flags)
+
+    def test_parallel_runner_accepts_two_exclusive_gpus(self) -> None:
+        args = build_parser().parse_args(
+            ["--parallel-runs", "2", "--gpu-ids", "0", "1", "--dry-run"]
+        )
+        self.assertEqual(args.parallel_runs, 2)
+        self.assertEqual(args.gpu_ids, [0, 1])
 
 
 if __name__ == "__main__":

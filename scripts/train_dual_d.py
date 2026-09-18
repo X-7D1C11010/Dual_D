@@ -407,6 +407,24 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         default=default("m4sar_input_size", 128),
     )
     parser.add_argument(
+        "--m4sar-optical-jitter",
+        type=float,
+        default=default("m4sar_optical_jitter", 0.0),
+        help="Training-only Optical brightness/contrast/channel-gain jitter.",
+    )
+    parser.add_argument(
+        "--m4sar-sar-gain-jitter",
+        type=float,
+        default=default("m4sar_sar_gain_jitter", 0.0),
+        help="Training-only multiplicative SAR intensity jitter.",
+    )
+    parser.add_argument(
+        "--m4sar-sar-noise-std",
+        type=float,
+        default=default("m4sar_sar_noise_std", 0.0),
+        help="Training-only SAR noise standard deviation in [0,1] intensity units.",
+    )
+    parser.add_argument(
         "--optical-channels",
         type=int,
         default=default("optical_channels", 3),
@@ -594,6 +612,12 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         default=default("adaptive_memory_poll_seconds", 60.0),
     )
     parser.add_argument("--num-workers", type=int, default=default("num_workers", 4))
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=default("eval_batch_size", None),
+        help="Optional larger evaluation batch; defaults to the training batch.",
+    )
     parser.add_argument(
         "--persistent-workers",
         action=argparse.BooleanOptionalAction,
@@ -910,6 +934,14 @@ def parse_args() -> argparse.Namespace:
             parser.error("M4-SAR requires 3-channel Optical and 1-channel SAR inputs.")
         if args.m4sar_input_size <= 0:
             parser.error("--m4sar-input-size must be positive.")
+        for option_name in (
+            "m4sar_optical_jitter",
+            "m4sar_sar_gain_jitter",
+            "m4sar_sar_noise_std",
+        ):
+            value = float(getattr(args, option_name))
+            if not 0.0 <= value <= 0.5:
+                parser.error(f"--{option_name.replace('_', '-')} must be in [0, 0.5].")
         if args.class_weights is not None and len(args.class_weights) != 6:
             parser.error("--class-weights must contain exactly six M4-SAR values.")
         if args.class_weights is not None and any(value <= 0 for value in args.class_weights):
@@ -929,6 +961,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--epochs must be positive.")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive.")
+    if args.eval_batch_size is not None and args.eval_batch_size <= 0:
+        parser.error("--eval-batch-size must be positive when provided.")
+    if args.num_workers < 0:
+        parser.error("--num-workers must be non-negative.")
     try:
         parse_adaptive_batch_plan(args.adaptive_batch_plan)
     except ValueError as error:

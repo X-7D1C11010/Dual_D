@@ -180,6 +180,51 @@ class M4SARDatasetTests(unittest.TestCase):
             sar_channel = sample["sar"][0] * M4SAR_SAR_STD[0] + M4SAR_SAR_MEAN[0]
             self.assertTrue(torch.allclose(optical_channel, sar_channel, atol=1e-6))
 
+    def test_modality_specific_radiometric_augmentation_is_training_only(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = _write_m4sar_fixture(root)
+            augmented = M4SARClassificationDataset(
+                manifest,
+                "train",
+                "source",
+                root,
+                input_size=32,
+                augment=True,
+                optical_jitter=0.10,
+                sar_gain_jitter=0.08,
+                sar_noise_std=0.01,
+            )
+            evaluation = M4SARClassificationDataset(
+                manifest,
+                "train",
+                "source",
+                root,
+                input_size=32,
+                augment=False,
+                optical_jitter=0.10,
+                sar_gain_jitter=0.08,
+                sar_noise_std=0.01,
+            )
+            optical = torch.full((3, 32, 32), 0.5)
+            sar = torch.full((1, 32, 32), 0.5)
+            torch.manual_seed(23)
+            augmented_optical, augmented_sar = augmented._photometric_augmentation(
+                optical.clone(),
+                sar.clone(),
+            )
+            evaluation_optical, evaluation_sar = evaluation._photometric_augmentation(
+                optical.clone(),
+                sar.clone(),
+            )
+
+            self.assertTrue(bool(torch.isfinite(augmented_optical).all()))
+            self.assertTrue(bool(torch.isfinite(augmented_sar).all()))
+            self.assertFalse(torch.allclose(augmented_optical, optical))
+            self.assertFalse(torch.allclose(augmented_sar, sar))
+            self.assertTrue(torch.equal(evaluation_optical, optical))
+            self.assertTrue(torch.equal(evaluation_sar, sar))
+
     def test_inverse_sqrt_weights_have_mean_one(self) -> None:
         weights = inverse_sqrt_class_weights((105400, 6768, 88030, 38388, 783, 3554))
         self.assertAlmostEqual(sum(weights) / len(weights), 1.0, places=7)
