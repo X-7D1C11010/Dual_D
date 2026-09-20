@@ -31,6 +31,7 @@ from dual_d.training.trainer import (
     run_training,
 )
 from scripts.preflight_m4sar import preflight
+from scripts.export_m4sar_class_examples import export_examples
 from scripts.train_dual_d import build_parser, load_json_defaults
 
 
@@ -110,6 +111,35 @@ def _fixture_args(root: Path, manifest: Path):
 
 
 class M4SARDatasetTests(unittest.TestCase):
+    def test_export_separate_paired_optical_and_sar_examples(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = _write_m4sar_fixture(root)
+            output = root / "examples"
+            metadata = export_examples(
+                manifest_path=manifest,
+                data_root=root,
+                output_dir=output,
+                split="val",
+                domain="target",
+                input_size=32,
+                seed=42,
+            )
+            self.assertEqual(len(metadata["examples"]), 6)
+            self.assertEqual(len(list((output / "target" / "optical").glob("*.png"))), 6)
+            self.assertEqual(len(list((output / "target" / "sar").glob("*.png"))), 6)
+            self.assertTrue((output / "metadata.json").is_file())
+            for example in metadata["examples"]:
+                domain_files = example["domains"]["target"]
+                with Image.open(domain_files["optical_png"]) as optical:
+                    self.assertEqual(optical.mode, "RGB")
+                    self.assertEqual(optical.size, (32, 32))
+                with Image.open(domain_files["sar_png"]) as sar:
+                    self.assertEqual(sar.mode, "L")
+                    self.assertEqual(sar.size, (32, 32))
+                self.assertIn(example["pair_id"], Path(domain_files["optical_png"]).name)
+                self.assertIn(example["pair_id"], Path(domain_files["sar_png"]).name)
+
     def test_manifest_crop_shapes_domain_and_source_normalization(self) -> None:
         self.assertEqual(
             M4SAR_OPTICAL_MEAN,
