@@ -2,7 +2,10 @@
 
 import unittest
 
+import numpy as np
+
 from scripts.run_m4sar_ablation_suite import VARIANTS, build_parser
+from scripts.visualize_m4sar_ablation import _relation_statistics
 
 
 class M4SARAblationSuiteTests(unittest.TestCase):
@@ -37,6 +40,31 @@ class M4SARAblationSuiteTests(unittest.TestCase):
         )
         self.assertEqual(args.parallel_runs, 2)
         self.assertEqual(args.gpu_ids, [0, 1])
+
+    def test_visualized_relation_drift_matches_training_definition(self) -> None:
+        sar = np.asarray(
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, -1.0]],
+            dtype=np.float32,
+        )
+        # An orthogonal modality basis has the same sample-relation matrix.
+        optical = sar[:, ::-1]
+        original = np.concatenate([sar, optical], axis=1)
+        translated = np.concatenate([sar, optical[[1, 0, 3, 2]]], axis=1)
+
+        statistics = _relation_statistics(original, translated, margin=0.01)
+
+        self.assertAlmostEqual(statistics["before"], 0.0, places=6)
+        self.assertGreater(statistics["after"], statistics["before"])
+        self.assertAlmostEqual(
+            statistics["signed_drift"],
+            statistics["after"] - statistics["before"],
+            places=7,
+        )
+        self.assertAlmostEqual(
+            float(np.mean(statistics["per_sample_signed_drift"])),
+            statistics["signed_drift"],
+            places=7,
+        )
 
 
 if __name__ == "__main__":

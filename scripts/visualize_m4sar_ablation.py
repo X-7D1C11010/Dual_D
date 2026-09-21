@@ -227,6 +227,165 @@ def _tsne(values: np.ndarray, seed: int = 42) -> np.ndarray:
     ).fit_transform(values)
 
 
+def _l2_normalize(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    return values / (np.linalg.norm(values, axis=1, keepdims=True) + 1e-8)
+
+
+def _fused_alignment_features(snapshot, domain: str, stage: str) -> np.ndarray:
+    """Return the SAR/optical representation on one side of TAL."""
+
+    return np.concatenate(
+        [
+            np.asarray(snapshot[f"{domain}_sar_{stage}"], dtype=np.float32),
+            np.asarray(snapshot[f"{domain}_optical_{stage}"], dtype=np.float32),
+        ],
+        axis=1,
+    )
+
+
+def _class_conditional_centroid_distance(
+    source: np.ndarray,
+    target: np.ndarray,
+    source_labels: np.ndarray,
+    target_labels: np.ndarray,
+) -> float:
+    """Mean cosine distance between same-class Source/Target prototypes."""
+
+    distances = []
+    for class_id in range(len(CLASS_NAMES)):
+        source_mask = np.asarray(source_labels) == class_id
+        target_mask = np.asarray(target_labels) == class_id
+        if not np.any(source_mask) or not np.any(target_mask):
+            continue
+        source_center = np.mean(source[source_mask], axis=0)
+        target_center = np.mean(target[target_mask], axis=0)
+        similarity = float(
+            np.dot(source_center, target_center)
+            / (
+                np.linalg.norm(source_center)
+                * np.linalg.norm(target_center)
+                + 1e-8
+            )
+        )
+        distances.append(1.0 - similarity)
+    return float(np.mean(distances)) if distances else float("nan")
+
+
+def _class_conditional_domain_neighbor_purity(
+    source: np.ndarray,
+    target: np.ndarray,
+    source_labels: np.ndarray,
+    target_labels: np.ndarray,
+    neighbors: int = 10,
+) -> float:
+    """Measure local domain separability while controlling for class.
+
+    A value near 0.5 means that a balanced Source/Target sample has equally
+    many neighbours from either domain. Larger values mean stronger residual
+    domain separation. The calculation is performed in the original feature
+    space and therefore does not depend on a t-SNE layout.
+    """
+
+    purities = []
+    for class_id in range(len(CLASS_NAMES)):
+        source_class = source[np.asarray(source_labels) == class_id]
+        target_class = target[np.asarray(target_labels) == class_id]
+        sample_count = min(len(source_class), len(target_class))
+        if sample_count < 2:
+            continue
+        values = _l2_normalize(
+            np.concatenate(
+                [source_class[:sample_count], target_class[:sample_count]], axis=0
+            )
+        )
+        domains = np.concatenate(
+            [np.zeros(sample_count, dtype=np.int64), np.ones(sample_count, dtype=np.int64)]
+        )
+        similarity = np.matmul(values, values.T)
+        np.fill_diagonal(similarity, -np.inf)
+        resolved_neighbors = min(max(int(neighbors), 1), len(values) - 1)
+        indices = np.argpartition(
+            similarity,
+            kth=len(values) - resolved_neighbors,
+            axis=1,
+        )[:, -resolved_neighbors:]
+        purity = np.mean(domains[indices] == domains[:, None], axis=1)
+        purities.extend(purity.tolist())
+    return float(np.mean(purities)) if purities else float("nan")
+
+
+def _tensor_prototype_score(snapshot, stage: str) -> float:
+    """Reproduce TAL's factorized class-prototype score on saved features."""
+
+    source_labels = np.asarray(snapshot["source_labels"])
+    target_labels = np.asarray(snapshot["target_labels"])
+    class_scores = []
+    for class_id in range(len(CLASS_NAMES)):
+        modality_scores = []
+        for modality in ("sar", "optical"):
+            source = np.asarray(
+                snapshot[f"source_{modality}_{stage}"], dtype=np.float32
+            )
+            target = np.asarray(
+                snapshot[f"target_{modality}_{stage}"], dtype=np.float32
+            )
+            source_center = np.mean(source[source_labels == class_id], axis=0)
+            target_center = np.mean(target[target_labels == class_id], axis=0)
+            modality_scores.append(
+                float(
+                    np.dot(source_center, target_center)
+                    / (
+                        np.linalg.norm(source_center)
+                        * np.linalg.norm(target_center)
+                        + 1e-8
+                    )
+                )
+            )
+        class_scores.append(
+            0.5 * (float(np.prod(modality_scores)) + float(np.mean(modality_scores)))
+        )
+    return float(np.mean(class_scores))
+
+
+def _domain_scatter(axis, source, target, title, diagnostics):
+    values = np.concatenate([source, target], axis=0)
+    embedding = _tsne(values)
+    source_count = len(source)
+    axis.scatter(
+        embedding[:source_count, 0],
+        embedding[:source_count, 1],
+        s=11,
+        alpha=0.55,
+        c="#2f6f9f",
+        marker="o",
+        label="源域",
+    )
+    axis.scatter(
+        embedding[source_count:, 0],
+        embedding[source_count:, 1],
+        s=13,
+        alpha=0.65,
+        c="#d95f8d",
+        marker="x",
+        label="目标域",
+    )
+    axis.set_title(title)
+    axis.text(
+        0.02,
+        0.02,
+        (
+            f"类别条件质心距离={diagnostics['centroid_distance']:.4f}\n"
+            f"同域近邻比例={diagnostics['neighbor_purity']:.3f}（0.5 越混合）"
+        ),
+        transform=axis.transAxes,
+        fontsize=9,
+        bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "0.8"},
+    )
+    axis.set_xticks([])
+    axis.set_yticks([])
+
+
 def _domain_class_scatter(axis, source, target, source_labels, target_labels, title):
     values = np.concatenate([source, target], axis=0)
     embedding = _tsne(values)
@@ -273,6 +432,67 @@ def plot_tal_tsne(runs, output_dir: Path) -> None:
     ]
     if any(key not in snapshot for key in required):
         return
+    source_labels = np.asarray(snapshot["source_labels"])
+    target_labels = np.asarray(snapshot["target_labels"])
+    stage_data = {}
+    for stage in ("pre_alignment", "post_alignment"):
+        source = _fused_alignment_features(snapshot, "source", stage)
+        target = _fused_alignment_features(snapshot, "target", stage)
+        stage_data[stage] = {
+            "source": source,
+            "target": target,
+            "centroid_distance": _class_conditional_centroid_distance(
+                source,
+                target,
+                source_labels,
+                target_labels,
+            ),
+            "neighbor_purity": _class_conditional_domain_neighbor_purity(
+                source,
+                target,
+                source_labels,
+                target_labels,
+            ),
+            "tensor_score": _tensor_prototype_score(snapshot, stage),
+        }
+
+    # TAL changes the dimensionality (512-D concatenated encoder features to
+    # 256-D projected features), so each panel necessarily has its own t-SNE
+    # coordinate system. Only within-panel domain mixing is interpreted; the
+    # original-space diagnostics make the before/after comparison quantitative.
+    domain_figure, domain_axes = plt.subplots(1, 2, figsize=(14, 6))
+    for axis, stage, title in (
+        (domain_axes[0], "pre_alignment", "TAL 前：编码器融合特征"),
+        (domain_axes[1], "post_alignment", "TAL 后：张量投影融合特征"),
+    ):
+        values = stage_data[stage]
+        _domain_scatter(
+            axis,
+            values["source"],
+            values["target"],
+            title,
+            values,
+        )
+        axis.text(
+            0.02,
+            0.13,
+            f"张量类别原型相关={values['tensor_score']:.4f}",
+            transform=axis.transAxes,
+            fontsize=9,
+            bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "0.8"},
+        )
+    handles, labels = domain_axes[0].get_legend_handles_labels()
+    domain_figure.legend(handles, labels, loc="lower center", ncol=2)
+    domain_figure.suptitle(
+        "TAL 前后的源域—目标域融合特征分布（各面板独立 t-SNE）",
+        fontsize=16,
+    )
+    domain_figure.subplots_adjust(bottom=0.12)
+    _save(domain_figure, output_dir / "TAL前后领域特征TSNE.png")
+
+    # Retain the modality/class view as a supplementary diagnostic. It should
+    # not be used to compare absolute positions across independently fitted
+    # panels.
     figure, axes = plt.subplots(2, 2, figsize=(14, 12))
     labels_source = snapshot["source_labels"]
     labels_target = snapshot["target_labels"]
@@ -293,35 +513,85 @@ def plot_tal_tsne(runs, output_dir: Path) -> None:
         )
     handles, labels = axes.flat[0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="lower center", ncol=6, fontsize=8)
-    figure.suptitle("张量对齐模块前后的同模态跨域特征分布", fontsize=16)
+    figure.suptitle(
+        "张量对齐模块前后的同模态跨域特征分布（各面板独立 t-SNE）",
+        fontsize=16,
+    )
     figure.subplots_adjust(bottom=0.13)
     _save(figure, output_dir / "张量模块前后TSNE.png")
 
 
-def _relation_change(snapshot) -> np.ndarray:
-    values = []
-    for domain, translated_key in (
-        ("source", "source_target_like"),
-        ("target", "target_source_like"),
+def _modality_relation_matrices(features: np.ndarray):
+    """Return the same modality-wise sample relations used by training."""
+
+    features = np.asarray(features, dtype=np.float32)
+    if features.ndim != 2 or features.shape[1] % 2:
+        raise ValueError("Expected an even-width [samples, features] array.")
+    split = features.shape[1] // 2
+    sar = _l2_normalize(features[:, :split])
+    optical = _l2_normalize(features[:, split:])
+    return np.matmul(sar, sar.T), np.matmul(optical, optical.T)
+
+
+def _relation_statistics(
+    original: np.ndarray,
+    translated: np.ndarray,
+    margin: float = 0.01,
+):
+    """Reproduce and decompose ``modality_relation_drift_loss`` in NumPy."""
+
+    original_sar, original_optical = _modality_relation_matrices(original)
+    translated_sar, translated_optical = _modality_relation_matrices(translated)
+    before_squared = np.square(original_sar - original_optical)
+    after_squared = np.square(translated_sar - translated_optical)
+    before = float(np.mean(before_squared))
+    after = float(np.mean(after_squared))
+    signed_drift = after - before
+    return {
+        "before": before,
+        "after": after,
+        "signed_drift": signed_drift,
+        "penalty": max(signed_drift - float(margin), 0.0),
+        # Row means decompose the scalar MSE into a per-sample distribution for
+        # boxplots without changing the loss definition.
+        "per_sample_signed_drift": np.mean(
+            after_squared - before_squared, axis=1
+        ),
+        "before_absolute": np.abs(original_sar - original_optical),
+        "after_absolute": np.abs(translated_sar - translated_optical),
+        "original_signatures": np.concatenate(
+            [original_sar, original_optical], axis=1
+        ),
+        "translated_signatures": np.concatenate(
+            [translated_sar, translated_optical], axis=1
+        ),
+    }
+
+
+def _snapshot_relation_statistics(snapshot, margin: float = 0.01):
+    directions = {}
+    for direction, domain, translated_key in (
+        ("source_to_target", "source", "source_target_like"),
+        ("target_to_source", "target", "target_source_like"),
     ):
         if translated_key not in snapshot:
             continue
-        raw = np.asarray(snapshot[f"{domain}_raw"], dtype=np.float32)
-        translated = np.asarray(snapshot[translated_key], dtype=np.float32)
-        split = raw.shape[1] // 2
-        raw_cos = np.sum(raw[:, :split] * raw[:, split:], axis=1) / (
-            np.linalg.norm(raw[:, :split], axis=1)
-            * np.linalg.norm(raw[:, split:], axis=1)
-            + 1e-8
+        directions[direction] = _relation_statistics(
+            np.asarray(snapshot[f"{domain}_raw"], dtype=np.float32),
+            np.asarray(snapshot[translated_key], dtype=np.float32),
+            margin=margin,
         )
-        translated_cos = np.sum(
-            translated[:, :split] * translated[:, split:], axis=1
-        ) / (
-            np.linalg.norm(translated[:, :split], axis=1)
-            * np.linalg.norm(translated[:, split:], axis=1)
-            + 1e-8
-        )
-        values.append(np.abs(translated_cos - raw_cos))
+    return directions
+
+
+def _relation_change(snapshot) -> np.ndarray:
+    """Return signed per-sample drift under the actual training definition."""
+
+    directions = _snapshot_relation_statistics(snapshot)
+    values = [
+        statistics["per_sample_signed_drift"]
+        for statistics in directions.values()
+    ]
     return np.concatenate(values) if values else np.empty(0)
 
 
@@ -351,61 +621,181 @@ def plot_drift_comparison(runs, output_dir: Path) -> None:
         if not path.is_file():
             return
         snapshots[variant] = np.load(path)
-    figure, axes = plt.subplots(1, 2, figsize=(13, 5.5))
-    values = [_relation_change(snapshots[name]) for name in snapshots]
-    axes[0].boxplot(values, labels=["完整模型", "无漂移约束"], showfliers=False)
-    axes[0].set_ylabel("翻译前后 SAR–光学余弦关系变化")
-    axes[0].set_title("模态关系漂移量")
-    axes[0].grid(axis="y", alpha=0.25)
+    relation_statistics = {
+        variant: _snapshot_relation_statistics(snapshot)
+        for variant, snapshot in snapshots.items()
+    }
 
-    for variant, color in (("full", "#2f6f9f"), ("no_modality_drift", "#b85c38")):
-        snapshot = snapshots[variant]
-        before = np.asarray(snapshot["target_raw"], dtype=np.float32)
-        after = np.asarray(snapshot["target_source_like"], dtype=np.float32)
-        embedding = _tsne(np.concatenate([before, after], axis=0))
-        count = len(before)
-        displacement = np.linalg.norm(
-            embedding[:count] - embedding[count:], axis=1
-        )
-        axes[1].hist(
-            displacement,
-            bins=30,
-            alpha=0.55,
-            color=color,
-            label=VARIANT_NAMES[variant],
-            density=True,
-        )
-    axes[1].set_xlabel("目标域样本翻译位移（联合 t-SNE 空间）")
-    axes[1].set_ylabel("密度")
-    axes[1].set_title("漂移约束对特征移动的影响")
+    figure, axes = plt.subplots(1, 2, figsize=(14, 5.8))
+    values = [_relation_change(snapshots[name]) for name in snapshots]
+    axes[0].boxplot(
+        values,
+        labels=["完整模型", "无漂移约束"],
+        showfliers=False,
+    )
+    axes[0].axhline(0.0, color="black", linewidth=1.0, alpha=0.7)
+    axes[0].axhline(
+        0.01,
+        color="#c44e52",
+        linewidth=1.0,
+        linestyle="--",
+        label="训练 margin=0.01",
+    )
+    axes[0].set_ylabel("翻译后减翻译前的模态关系差异（有符号）")
+    axes[0].set_title("真实训练定义下的样本关系漂移")
+    axes[0].grid(axis="y", alpha=0.25)
+    axes[0].legend()
+
+    groups = []
+    before_values = []
+    after_values = []
+    for variant in ("full", "no_modality_drift"):
+        for direction, direction_name in (
+            ("source_to_target", "源→目标"),
+            ("target_to_source", "目标→源"),
+        ):
+            statistics = relation_statistics[variant][direction]
+            groups.append(f"{VARIANT_NAMES[variant]}\n{direction_name}")
+            before_values.append(statistics["before"])
+            after_values.append(statistics["after"])
+    x = np.arange(len(groups))
+    width = 0.36
+    axes[1].bar(x - width / 2, before_values, width, label="翻译前")
+    axes[1].bar(x + width / 2, after_values, width, label="翻译后")
+    axes[1].set_xticks(x, groups, rotation=8)
+    axes[1].set_ylabel("SAR/光学样本关系矩阵均方差")
+    axes[1].set_title("翻译前后的模态关系差异")
+    axes[1].grid(axis="y", alpha=0.25)
     axes[1].legend()
     _save(figure, output_dir / "漂移约束对比.png")
 
-    tsne_figure, tsne_axes = plt.subplots(2, 2, figsize=(13, 11))
-    for row, variant in enumerate(("full", "no_modality_drift")):
-        snapshot = snapshots[variant]
-        before = np.asarray(snapshot["target_raw"], dtype=np.float32)
-        after = np.asarray(snapshot["target_source_like"], dtype=np.float32)
+    # Relation signatures use sample-to-sample similarities as coordinates,
+    # matching the quantity protected by the loss. Before/after samples are
+    # embedded jointly for each model and linked by a small set of trajectories.
+    tsne_figure, tsne_axes = plt.subplots(1, 2, figsize=(14, 6))
+    for axis, variant in zip(
+        tsne_axes,
+        ("full", "no_modality_drift"),
+    ):
+        statistics = relation_statistics[variant]["target_to_source"]
+        before = statistics["original_signatures"]
+        after = statistics["translated_signatures"]
         embedding = _tsne(np.concatenate([before, after], axis=0))
         count = len(before)
-        labels = snapshot["target_labels"]
-        _class_scatter(
-            tsne_axes[row, 0],
-            embedding[:count],
-            labels,
-            f"{VARIANT_NAMES[variant]}：翻译前",
+        for index in np.linspace(0, count - 1, min(80, count), dtype=int):
+            axis.plot(
+                [embedding[index, 0], embedding[count + index, 0]],
+                [embedding[index, 1], embedding[count + index, 1]],
+                color="0.55",
+                linewidth=0.45,
+                alpha=0.25,
+            )
+        axis.scatter(
+            embedding[:count, 0],
+            embedding[:count, 1],
+            s=10,
+            alpha=0.5,
+            c="#2f6f9f",
+            label="翻译前关系特征",
         )
-        _class_scatter(
-            tsne_axes[row, 1],
-            embedding[count:],
-            labels,
-            f"{VARIANT_NAMES[variant]}：翻译后",
+        axis.scatter(
+            embedding[count:, 0],
+            embedding[count:, 1],
+            s=11,
+            alpha=0.55,
+            c="#d95f8d",
+            marker="x",
+            label="翻译后关系特征",
         )
-    handles, labels = tsne_axes[0, 0].get_legend_handles_labels()
-    tsne_figure.legend(handles, labels, loc="lower center", ncol=6)
-    tsne_figure.suptitle("漂移约束开启与关闭时的翻译前后特征分布", fontsize=16)
-    tsne_figure.subplots_adjust(bottom=0.10)
+        axis.set_title(f"{VARIANT_NAMES[variant]}：目标→源")
+        axis.set_xticks([])
+        axis.set_yticks([])
+    handles, labels = tsne_axes[0].get_legend_handles_labels()
+    tsne_figure.legend(handles, labels, loc="lower center", ncol=2)
+    tsne_figure.suptitle(
+        "漂移约束开启与关闭时的翻译前后模态关系特征",
+        fontsize=16,
+    )
+    tsne_figure.subplots_adjust(bottom=0.12)
     _save(tsne_figure, output_dir / "漂移约束前后TSNE.png")
+
+    # Heatmaps expose exactly where the SAR and optical sample-relation
+    # matrices disagree. A class-balanced subset keeps the figure legible.
+    heatmap_figure, heatmap_axes = plt.subplots(2, 3, figsize=(15, 9))
+    heatmap_payload = []
+    for variant in ("full", "no_modality_drift"):
+        snapshot = snapshots[variant]
+        labels = np.asarray(snapshot["target_labels"])
+        selected = []
+        per_class = 20
+        for class_id in range(len(CLASS_NAMES)):
+            selected.extend(np.flatnonzero(labels == class_id)[:per_class].tolist())
+        selected = np.asarray(selected, dtype=np.int64)
+        statistics = _relation_statistics(
+            np.asarray(snapshot["target_raw"], dtype=np.float32)[selected],
+            np.asarray(snapshot["target_source_like"], dtype=np.float32)[selected],
+        )
+        heatmap_payload.append(statistics)
+    maximum = max(
+        float(np.quantile(statistics[key], 0.98))
+        for statistics in heatmap_payload
+        for key in ("before_absolute", "after_absolute")
+    )
+    delta_maximum = max(
+        float(
+            np.quantile(
+                np.abs(
+                    statistics["after_absolute"]
+                    - statistics["before_absolute"]
+                ),
+                0.98,
+            )
+        )
+        for statistics in heatmap_payload
+    )
+    for row, (variant, statistics) in enumerate(
+        zip(("full", "no_modality_drift"), heatmap_payload)
+    ):
+        delta = statistics["after_absolute"] - statistics["before_absolute"]
+        images = [
+            heatmap_axes[row, 0].imshow(
+                statistics["before_absolute"],
+                cmap="magma",
+                vmin=0.0,
+                vmax=maximum,
+            ),
+            heatmap_axes[row, 1].imshow(
+                statistics["after_absolute"],
+                cmap="magma",
+                vmin=0.0,
+                vmax=maximum,
+            ),
+            heatmap_axes[row, 2].imshow(
+                delta,
+                cmap="coolwarm",
+                vmin=-delta_maximum,
+                vmax=delta_maximum,
+            ),
+        ]
+        for class_boundary in range(20, 120, 20):
+            for axis in heatmap_axes[row]:
+                axis.axhline(class_boundary - 0.5, color="white", linewidth=0.35)
+                axis.axvline(class_boundary - 0.5, color="white", linewidth=0.35)
+        heatmap_axes[row, 0].set_ylabel(VARIANT_NAMES[variant])
+        for axis in heatmap_axes[row]:
+            axis.set_xticks([])
+            axis.set_yticks([])
+        heatmap_figure.colorbar(images[0], ax=heatmap_axes[row, :2], shrink=0.72)
+        heatmap_figure.colorbar(images[2], ax=heatmap_axes[row, 2], shrink=0.72)
+    for column, title in enumerate(
+        ("翻译前关系差异", "翻译后关系差异", "翻译后 − 翻译前")
+    ):
+        heatmap_axes[0, column].set_title(title)
+    heatmap_figure.suptitle(
+        "目标→源翻译前后的 SAR/光学样本关系差异矩阵",
+        fontsize=16,
+    )
+    _save(heatmap_figure, output_dir / "漂移约束模态关系矩阵.png")
 
 
 def write_mechanism_diagnostics(runs, output_dir: Path) -> None:
@@ -414,6 +804,8 @@ def write_mechanism_diagnostics(runs, output_dir: Path) -> None:
         path = runs["full"][0][1] / "feature_embeddings.npz"
         if path.is_file():
             snapshot = np.load(path)
+            source_labels = np.asarray(snapshot["source_labels"])
+            target_labels = np.asarray(snapshot["target_labels"])
             for modality in ("sar", "optical"):
                 for stage in ("pre_alignment", "post_alignment"):
                     source_key = f"source_{modality}_{stage}"
@@ -432,15 +824,44 @@ def write_mechanism_diagnostics(runs, output_dir: Path) -> None:
                         diagnostics[f"{modality}_{stage}_centroid_distance"] = float(
                             np.linalg.norm(source_center - target_center)
                         )
+            for stage in ("pre_alignment", "post_alignment"):
+                source = _fused_alignment_features(snapshot, "source", stage)
+                target = _fused_alignment_features(snapshot, "target", stage)
+                diagnostics[
+                    f"tal_{stage}_class_conditional_centroid_distance"
+                ] = _class_conditional_centroid_distance(
+                    source,
+                    target,
+                    source_labels,
+                    target_labels,
+                )
+                diagnostics[
+                    f"tal_{stage}_same_domain_neighbor_ratio"
+                ] = _class_conditional_domain_neighbor_purity(
+                    source,
+                    target,
+                    source_labels,
+                    target_labels,
+                )
+                diagnostics[
+                    f"tal_{stage}_tensor_prototype_score"
+                ] = _tensor_prototype_score(snapshot, stage)
     for variant in ("full", "no_modality_drift"):
         if variant not in runs:
             continue
         path = runs[variant][0][1] / "feature_embeddings.npz"
         if path.is_file():
-            values = _relation_change(np.load(path))
-            if len(values):
-                diagnostics[f"{variant}_relation_change_mean"] = float(np.mean(values))
-                diagnostics[f"{variant}_relation_change_std"] = float(np.std(values))
+            snapshot = np.load(path)
+            directions = _snapshot_relation_statistics(snapshot)
+            for direction, statistics in directions.items():
+                prefix = f"{variant}_{direction}"
+                diagnostics[f"{prefix}_relation_before"] = statistics["before"]
+                diagnostics[f"{prefix}_relation_after"] = statistics["after"]
+                diagnostics[f"{prefix}_signed_drift"] = statistics["signed_drift"]
+                diagnostics[f"{prefix}_penalty_margin_0_01"] = statistics["penalty"]
+                diagnostics[f"{prefix}_per_sample_drift_std"] = float(
+                    np.std(statistics["per_sample_signed_drift"])
+                )
     with (output_dir / "mechanism_diagnostics.json").open(
         "w", encoding="utf-8"
     ) as stream:
