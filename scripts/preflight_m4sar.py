@@ -159,7 +159,8 @@ def preflight(args) -> dict[str, object]:
             + ", ".join(failed_gradients)
         )
     optimizer_main.step()
-    models.tal.apply_orthogonal_projection()
+    if int(getattr(models.tal, "orthogonalize_interval", 1)) > 0:
+        models.tal.apply_orthogonal_projection()
     models.dual_adapter.set_discriminators_trainable(True)
     if not bool(torch.isfinite(loss_main)) or not bool(torch.isfinite(loss_disc)):
         raise FloatingPointError("M4-SAR preflight produced a non-finite loss.")

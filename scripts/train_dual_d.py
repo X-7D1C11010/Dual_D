@@ -687,6 +687,53 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     )
     parser.add_argument("--feature-dim", type=int, default=default("feature_dim", 512))
     parser.add_argument("--proj-dim", type=int, default=default("proj_dim", 128))
+    parser.add_argument(
+        "--satellite-base-channels",
+        type=int,
+        default=default("satellite_base_channels", 16),
+        help="Base width of each independent satellite residual encoder.",
+    )
+    parser.add_argument(
+        "--satellite-blocks-per-stage",
+        type=int,
+        default=default("satellite_blocks_per_stage", 3),
+        help="Residual blocks in each of the three satellite encoder stages.",
+    )
+    parser.add_argument(
+        "--tal-cross-domain-contrastive-weight",
+        type=float,
+        default=default("tal_cross_domain_contrastive_weight", 0.0),
+        help=(
+            "Weight inside TAL for class-balanced, unpaired Source/Target "
+            "supervised contrastive alignment."
+        ),
+    )
+    parser.add_argument(
+        "--tal-contrastive-temperature",
+        type=float,
+        default=default("tal_contrastive_temperature", 0.15),
+    )
+    parser.add_argument(
+        "--tal-orthogonality-weight",
+        type=float,
+        default=default("tal_orthogonality_weight", 0.0),
+        help="Smooth orthogonality penalty for TAL U/V matrices.",
+    )
+    parser.add_argument(
+        "--tal-orthogonalize-interval",
+        type=int,
+        default=default("tal_orthogonalize_interval", 1),
+        help=(
+            "Apply hard QR every N optimizer steps; 0 disables hard QR and "
+            "leaves the smooth penalty active."
+        ),
+    )
+    parser.add_argument(
+        "--tal-shared-layer-norm",
+        action=argparse.BooleanOptionalAction,
+        default=default("tal_shared_layer_norm", False),
+        help="Use one shared LayerNorm per modality after Source/Target TAL projection.",
+    )
 
     parser.add_argument(
         "--pretrained-visual",
@@ -989,6 +1036,20 @@ def parse_args() -> argparse.Namespace:
         parser.error("--label-smoothing must be in [0, 1).")
     if not 0.0 <= args.classifier_dropout < 1.0:
         parser.error("--classifier-dropout must be in [0, 1).")
+    if args.feature_dim <= 0 or args.proj_dim <= 0:
+        parser.error("--feature-dim and --proj-dim must be positive.")
+    if args.satellite_base_channels <= 0:
+        parser.error("--satellite-base-channels must be positive.")
+    if args.satellite_blocks_per_stage <= 0:
+        parser.error("--satellite-blocks-per-stage must be positive.")
+    if args.tal_cross_domain_contrastive_weight < 0.0:
+        parser.error("--tal-cross-domain-contrastive-weight must be non-negative.")
+    if args.tal_contrastive_temperature <= 0.0:
+        parser.error("--tal-contrastive-temperature must be positive.")
+    if args.tal_orthogonality_weight < 0.0:
+        parser.error("--tal-orthogonality-weight must be non-negative.")
+    if args.tal_orthogonalize_interval < 0:
+        parser.error("--tal-orthogonalize-interval must be non-negative.")
     if args.target_classification_weight < 0.0:
         parser.error("--target-classification-weight must be non-negative.")
     if not 0.0 <= args.augmentation_strength <= 1.0:

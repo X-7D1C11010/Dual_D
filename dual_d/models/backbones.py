@@ -74,29 +74,59 @@ class _SmallResidualBlock(nn.Module):
 
 
 class SmallResNet20Encoder(nn.Module):
-    """Small-stem ResNet-20-style encoder that preserves 32x32 patch detail."""
+    """Configurable small-stem residual encoder for satellite object crops."""
 
-    def __init__(self, input_channels: int, output_dim: int = 256):
+    def __init__(
+        self,
+        input_channels: int,
+        output_dim: int = 256,
+        base_channels: int = 16,
+        blocks_per_stage: int = 3,
+    ):
         super().__init__()
         self.input_channels = int(input_channels)
         self.output_dim = int(output_dim)
+        self.base_channels = int(base_channels)
+        self.blocks_per_stage = int(blocks_per_stage)
+        if self.base_channels <= 0:
+            raise ValueError("base_channels must be positive.")
+        if self.blocks_per_stage <= 0:
+            raise ValueError("blocks_per_stage must be positive.")
+        stage1_channels = self.base_channels
+        stage2_channels = 2 * self.base_channels
+        stage3_channels = 4 * self.base_channels
         self.stem = nn.Sequential(
             nn.Conv2d(
                 self.input_channels,
-                16,
+                stage1_channels,
                 kernel_size=3,
                 stride=1,
                 padding=1,
                 bias=False,
             ),
-            nn.BatchNorm2d(16),
+            nn.BatchNorm2d(stage1_channels),
             nn.ReLU(inplace=True),
         )
-        self.stage1 = self._make_stage(16, 16, blocks=3, stride=1)
-        self.stage2 = self._make_stage(16, 32, blocks=3, stride=2)
-        self.stage3 = self._make_stage(32, 64, blocks=3, stride=2)
+        self.stage1 = self._make_stage(
+            stage1_channels,
+            stage1_channels,
+            blocks=self.blocks_per_stage,
+            stride=1,
+        )
+        self.stage2 = self._make_stage(
+            stage1_channels,
+            stage2_channels,
+            blocks=self.blocks_per_stage,
+            stride=2,
+        )
+        self.stage3 = self._make_stage(
+            stage2_channels,
+            stage3_channels,
+            blocks=self.blocks_per_stage,
+            stride=2,
+        )
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.proj = nn.Linear(64, self.output_dim)
+        self.proj = nn.Linear(stage3_channels, self.output_dim)
         self._initialize_weights()
 
     @staticmethod
@@ -141,15 +171,37 @@ class SmallResNet20Encoder(nn.Module):
 class SARResNet20Encoder(SmallResNet20Encoder):
     """Independent 8-channel Sentinel-1 encoder."""
 
-    def __init__(self, input_channels: int = 8, output_dim: int = 256):
-        super().__init__(input_channels=input_channels, output_dim=output_dim)
+    def __init__(
+        self,
+        input_channels: int = 8,
+        output_dim: int = 256,
+        base_channels: int = 16,
+        blocks_per_stage: int = 3,
+    ):
+        super().__init__(
+            input_channels=input_channels,
+            output_dim=output_dim,
+            base_channels=base_channels,
+            blocks_per_stage=blocks_per_stage,
+        )
 
 
 class OpticalResNet20Encoder(SmallResNet20Encoder):
     """Independent 10-channel Sentinel-2 encoder."""
 
-    def __init__(self, input_channels: int = 10, output_dim: int = 256):
-        super().__init__(input_channels=input_channels, output_dim=output_dim)
+    def __init__(
+        self,
+        input_channels: int = 10,
+        output_dim: int = 256,
+        base_channels: int = 16,
+        blocks_per_stage: int = 3,
+    ):
+        super().__init__(
+            input_channels=input_channels,
+            output_dim=output_dim,
+            base_channels=base_channels,
+            blocks_per_stage=blocks_per_stage,
+        )
 
 
 class VisualFeatureExtractor(nn.Module):

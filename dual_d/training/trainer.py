@@ -823,6 +823,10 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
                 else getattr(args, "s2_channels", 10)
             ),
             output_dim=args.feature_dim,
+            base_channels=int(getattr(args, "satellite_base_channels", 16)),
+            blocks_per_stage=int(
+                getattr(args, "satellite_blocks_per_stage", 3)
+            ),
         ).to(device)
         net_ir = SARResNet20Encoder(
             input_channels=int(
@@ -831,6 +835,10 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
                 else getattr(args, "s1_channels", 8)
             ),
             output_dim=args.feature_dim,
+            base_channels=int(getattr(args, "satellite_base_channels", 16)),
+            blocks_per_stage=int(
+                getattr(args, "satellite_blocks_per_stage", 3)
+            ),
         ).to(device)
     else:
         net_vis = VisualFeatureExtractor(
@@ -860,6 +868,21 @@ def build_models(args, num_classes: int, device: torch.device) -> ModelBundle:
             input_dims=[args.feature_dim] * num_modalities,
             output_dims=[args.proj_dim] * num_modalities,
             num_modalities=num_modalities,
+            cross_domain_contrastive_weight=float(
+                getattr(args, "tal_cross_domain_contrastive_weight", 0.0)
+            ),
+            contrastive_temperature=float(
+                getattr(args, "tal_contrastive_temperature", 0.15)
+            ),
+            orthogonality_weight=float(
+                getattr(args, "tal_orthogonality_weight", 0.0)
+            ),
+            orthogonalize_interval=int(
+                getattr(args, "tal_orthogonalize_interval", 1)
+            ),
+            use_shared_layer_norm=bool(
+                getattr(args, "tal_shared_layer_norm", False)
+            ),
         ).to(device)
     elif alignment_mode == "plain":
         tal = PlainMultimodalProjection(
@@ -1424,6 +1447,10 @@ def train_one_epoch(
         "loss_cls_source": 0.0,
         "loss_cls_target": 0.0,
         "loss_tal": 0.0,
+        "tal_prototype_loss": 0.0,
+        "tal_tensor_correlation": 0.0,
+        "tal_cross_domain_contrastive": 0.0,
+        "tal_orthogonality_penalty": 0.0,
         "loss_dual_g": 0.0,
         "loss_dual_d": 0.0,
         "source_correct": 0.0,
@@ -1451,6 +1478,14 @@ def train_one_epoch(
             device,
             args,
         )
+        for diagnostic_name, diagnostic_value in getattr(
+            models.tal,
+            "last_diagnostics",
+            {},
+        ).items():
+            total_name = f"tal_{diagnostic_name}"
+            if total_name in totals:
+                totals[total_name] += float(diagnostic_value.detach().cpu())
         dual_outputs = (
             models.dual_adapter.forward_features(
                 feat_src,
@@ -1561,7 +1596,11 @@ def train_one_epoch(
             totals["grad_clip_main_steps"] += 1.0
 
         optimizer_main.step()
-        models.tal.apply_orthogonal_projection()
+        orthogonalize_interval = int(
+            getattr(models.tal, "orthogonalize_interval", 1)
+        )
+        if orthogonalize_interval > 0 and step % orthogonalize_interval == 0:
+            models.tal.apply_orthogonal_projection()
         if translation_enabled:
             models.dual_adapter.set_discriminators_trainable(True)
 
@@ -1608,6 +1647,14 @@ def train_one_epoch(
         "train_loss_cls_source": totals["loss_cls_source"] / steps,
         "train_loss_cls_target": totals["loss_cls_target"] / steps,
         "train_loss_tal": totals["loss_tal"] / steps,
+        "train_tal_prototype_loss": totals["tal_prototype_loss"] / steps,
+        "train_tal_tensor_correlation": totals["tal_tensor_correlation"] / steps,
+        "train_tal_cross_domain_contrastive": (
+            totals["tal_cross_domain_contrastive"] / steps
+        ),
+        "train_tal_orthogonality_penalty": (
+            totals["tal_orthogonality_penalty"] / steps
+        ),
         "train_loss_dual_g": totals["loss_dual_g"] / steps,
         "train_loss_dual_d": totals["loss_dual_d"] / disc_steps,
         "train_grad_norm_main": totals["grad_norm_main"] / steps,
@@ -2369,8 +2416,23 @@ def run_training(args) -> Dict[str, object]:
             "TAL block order=SAR,Optical | loader policy=independent shuffle"
         )
         logger.info(
-            "TAL alignment policy: unpaired class prototypes | no row-wise or "
-            "physical-pair correspondence"
+            "TAL alignment policy: unpaired class prototypes + class-balanced "
+            "cross-domain contrastive=%.3f (temperature=%.3f) | no row-wise or "
+            "physical-pair correspondence",
+            float(getattr(args, "tal_cross_domain_contrastive_weight", 0.0)),
+            float(getattr(args, "tal_contrastive_temperature", 0.15)),
+        )
+        logger.info(
+            "Satellite encoder/TAL capacity: base_channels=%d | blocks/stage=%d | "
+            "feature/projection=%d/%d | shared_layer_norm=%s | "
+            "orthogonality_weight=%.4g | hard_QR_interval=%d",
+            int(getattr(args, "satellite_base_channels", 16)),
+            int(getattr(args, "satellite_blocks_per_stage", 3)),
+            int(args.feature_dim),
+            int(args.proj_dim),
+            bool(getattr(args, "tal_shared_layer_norm", False)),
+            float(getattr(args, "tal_orthogonality_weight", 0.0)),
+            int(getattr(args, "tal_orthogonalize_interval", 1)),
         )
         logger.info(
             "M4-SAR train-only radiometric augmentation: optical_jitter=%.3f | "

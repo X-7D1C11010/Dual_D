@@ -97,6 +97,70 @@ class TrainingSafetyTests(unittest.TestCase):
         self.assertTrue(all(gradient is not None for gradient in gradients))
         self.assertTrue(all(bool(torch.isfinite(gradient).all()) for gradient in gradients))
 
+    def test_tal_cross_domain_contrastive_is_unpaired_and_rewards_class_alignment(self) -> None:
+        source = [
+            torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]])
+        ]
+        aligned_target = [
+            torch.tensor([[0.95, 0.05], [1.0, 0.0], [0.05, 0.95], [0.0, 1.0]])
+        ]
+        misaligned_target = [aligned_target[0].flip(0)]
+        labels = torch.tensor([0, 0, 1, 1])
+        permutation = torch.tensor([2, 0, 3, 1])
+
+        aligned = TensorBasedAlignmentStable.class_balanced_cross_domain_contrastive_loss(
+            source,
+            aligned_target,
+            labels,
+            labels,
+            temperature=0.15,
+        )
+        shuffled = TensorBasedAlignmentStable.class_balanced_cross_domain_contrastive_loss(
+            source,
+            [aligned_target[0][permutation]],
+            labels,
+            labels[permutation],
+            temperature=0.15,
+        )
+        misaligned = TensorBasedAlignmentStable.class_balanced_cross_domain_contrastive_loss(
+            source,
+            misaligned_target,
+            labels,
+            labels,
+            temperature=0.15,
+        )
+
+        self.assertTrue(torch.allclose(aligned, shuffled, atol=1e-6))
+        self.assertLess(float(aligned), float(misaligned))
+
+    def test_tal_soft_orthogonality_and_shared_norm_have_gradients(self) -> None:
+        torch.manual_seed(23)
+        tal = TensorBasedAlignmentStable(
+            [6, 6],
+            [4, 4],
+            num_modalities=2,
+            cross_domain_contrastive_weight=0.2,
+            orthogonality_weight=0.01,
+            orthogonalize_interval=0,
+            use_shared_layer_norm=True,
+        )
+        source = [torch.randn(8, 6), torch.randn(8, 6)]
+        target = [torch.randn(8, 6), torch.randn(8, 6)]
+        labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+
+        projected_source, projected_target, loss = tal(
+            source,
+            target,
+            source_labels=labels,
+            target_labels=labels.flip(0),
+        )
+        loss.backward()
+
+        self.assertEqual(tuple(projected_source[0].shape), (8, 4))
+        self.assertEqual(tuple(projected_target[0].shape), (8, 4))
+        self.assertTrue(bool(torch.isfinite(loss)))
+        self.assertTrue(all(parameter.grad is not None for parameter in tal.parameters()))
+
     def test_frozen_batch_norm_keeps_running_statistics_fixed(self) -> None:
         frozen = torch.nn.BatchNorm1d(4)
         trainable = torch.nn.BatchNorm1d(4)

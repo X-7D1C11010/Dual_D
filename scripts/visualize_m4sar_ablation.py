@@ -483,7 +483,7 @@ def _four_group_modality_domain_scatter(
                     snapshot[f"target_optical_{stage}"], dtype=np.float32
                 )[target_indices]
             ),
-            "#e6862a",
+            "#c44e52",
             "x",
             0.72,
         ),
@@ -494,7 +494,7 @@ def _four_group_modality_domain_scatter(
                     target_indices
                 ]
             ),
-            "#2f6f9f",
+            "#55a868",
             "x",
             0.72,
         ),
@@ -658,8 +658,9 @@ def plot_tal_tsne(runs, output_dir: Path) -> None:
     target_indices = _balanced_plot_indices(target_labels)
 
     # Requested four-group view: both modalities and both domains share one
-    # t-SNE fit within each stage. Colour encodes modality and marker encodes
-    # domain. Pre/post remain separate because TAL changes dimensionality.
+    # t-SNE fit within each stage. Every modality-domain combination has a
+    # distinct colour; marker shape redundantly encodes domain. Pre/post remain
+    # separate because TAL changes dimensionality.
     modality_domain_figure, modality_domain_axes = plt.subplots(
         1, 2, figsize=(14, 6)
     )
@@ -700,7 +701,7 @@ def plot_tal_tsne(runs, output_dir: Path) -> None:
     handles, labels = modality_domain_axes[0].get_legend_handles_labels()
     modality_domain_figure.legend(handles, labels, loc="lower center", ncol=4)
     modality_domain_figure.suptitle(
-        "TAL 前后四组模态—领域特征分布（各面板独立 t-SNE）",
+        "TAL 前后四组模态—领域特征分布（四组独立颜色，各面板独立 t-SNE）",
         fontsize=16,
     )
     modality_domain_figure.subplots_adjust(bottom=0.13)

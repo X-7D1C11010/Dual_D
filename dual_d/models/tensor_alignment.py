@@ -42,11 +42,31 @@ class TensorBasedAlignmentStable(nn.Module):
         input_dims: List[int],
         output_dims: List[int],
         num_modalities: int = 2,
+        cross_domain_contrastive_weight: float = 0.0,
+        contrastive_temperature: float = 0.15,
+        orthogonality_weight: float = 0.0,
+        orthogonalize_interval: int = 1,
+        use_shared_layer_norm: bool = False,
     ):
         super().__init__()
         self.input_dims = list(input_dims)
         self.output_dims = list(output_dims)
         self.num_modalities = int(num_modalities)
+        self.cross_domain_contrastive_weight = float(
+            cross_domain_contrastive_weight
+        )
+        self.contrastive_temperature = float(contrastive_temperature)
+        self.orthogonality_weight = float(orthogonality_weight)
+        self.orthogonalize_interval = int(orthogonalize_interval)
+        self.use_shared_layer_norm = bool(use_shared_layer_norm)
+        if self.cross_domain_contrastive_weight < 0.0:
+            raise ValueError("cross_domain_contrastive_weight must be non-negative.")
+        if self.contrastive_temperature <= 0.0:
+            raise ValueError("contrastive_temperature must be positive.")
+        if self.orthogonality_weight < 0.0:
+            raise ValueError("orthogonality_weight must be non-negative.")
+        if self.orthogonalize_interval < 0:
+            raise ValueError("orthogonalize_interval must be non-negative.")
 
         self.U_matrices = nn.ParameterList(
             [
@@ -60,6 +80,12 @@ class TensorBasedAlignmentStable(nn.Module):
                 for idx in range(self.num_modalities)
             ]
         )
+        self.shared_normalizers = nn.ModuleList(
+            [nn.LayerNorm(dim) for dim in self.output_dims]
+            if self.use_shared_layer_norm
+            else []
+        )
+        self.last_diagnostics = {}
         self._init_parameters()
 
     def _init_parameters(self) -> None:
@@ -238,21 +264,125 @@ class TensorBasedAlignmentStable(nn.Module):
             scale = scale * projected.sum(dim=1, keepdim=True)
         return result * scale
 
+    @staticmethod
+    def class_balanced_cross_domain_contrastive_loss(
+        projected_source: List[torch.Tensor],
+        projected_target: List[torch.Tensor],
+        source_labels: Optional[torch.Tensor],
+        target_labels: Optional[torch.Tensor],
+        temperature: float,
+    ) -> torch.Tensor:
+        """Pull same-class cross-domain samples together without pair matching.
+
+        Every Source-modality sample treats *all* Target-modality samples of
+        the same class as positives, and vice versa. All modality pairs are
+        included, so the shared TAL space is encouraged to remove both domain
+        and modality nuisance while different classes remain negatives. Losses
+        are averaged within class before averaging across classes, preventing
+        the very frequent M4-SAR classes from completely dominating TAL. Row
+        order and physical ``pair_id`` are intentionally irrelevant.
+        """
+
+        if source_labels is None or target_labels is None:
+            return projected_source[0].sum() * 0.0
+        source_labels = source_labels.to(
+            device=projected_source[0].device,
+            dtype=torch.long,
+        )
+        target_labels = target_labels.to(
+            device=projected_target[0].device,
+            dtype=torch.long,
+        )
+
+        def directional_loss(
+            anchors: torch.Tensor,
+            candidates: torch.Tensor,
+            anchor_labels: torch.Tensor,
+            candidate_labels: torch.Tensor,
+        ) -> torch.Tensor:
+            logits = torch.mm(
+                F.normalize(anchors, p=2, dim=1, eps=1e-6),
+                F.normalize(candidates, p=2, dim=1, eps=1e-6).t(),
+            ) / float(temperature)
+            positive_mask = anchor_labels[:, None].eq(candidate_labels[None, :])
+            valid_anchors = positive_mask.any(dim=1)
+            if not bool(valid_anchors.any()):
+                return logits.sum() * 0.0
+            logits = logits[valid_anchors]
+            positive_mask = positive_mask[valid_anchors]
+            valid_labels = anchor_labels[valid_anchors]
+            logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+            positive_logits = logits.masked_fill(~positive_mask, float("-inf"))
+            sample_losses = (
+                torch.logsumexp(logits, dim=1)
+                - torch.logsumexp(positive_logits, dim=1)
+            )
+            class_losses = []
+            for class_id in torch.unique(valid_labels):
+                class_mask = valid_labels.eq(class_id)
+                class_losses.append(sample_losses[class_mask].mean())
+            return torch.stack(class_losses).mean()
+
+        cross_view_losses = []
+        for source_features in projected_source:
+            for target_features in projected_target:
+                source_to_target = directional_loss(
+                    source_features,
+                    target_features,
+                    source_labels,
+                    target_labels,
+                )
+                target_to_source = directional_loss(
+                    target_features,
+                    source_features,
+                    target_labels,
+                    source_labels,
+                )
+                cross_view_losses.append(
+                    0.5 * (source_to_target + target_to_source)
+                )
+        return torch.stack(cross_view_losses).mean()
+
+    def orthogonality_penalty(self) -> torch.Tensor:
+        """Return a smooth alternative to overwriting Adam updates with QR."""
+
+        penalties = []
+        for matrix in [*self.U_matrices, *self.V_matrices]:
+            identity = torch.eye(
+                matrix.size(1),
+                device=matrix.device,
+                dtype=matrix.dtype,
+            )
+            penalties.append(F.mse_loss(matrix.t().mm(matrix), identity))
+        return torch.stack(penalties).mean()
+
     def project_source(self, source_modalities: List[torch.Tensor]) -> List[torch.Tensor]:
         """Project source-domain modality features."""
 
-        return [
+        projected = [
             torch.mm(source_modalities[idx], self.U_matrices[idx])
             for idx in range(self.num_modalities)
         ]
+        if self.use_shared_layer_norm:
+            projected = [
+                self.shared_normalizers[idx](features)
+                for idx, features in enumerate(projected)
+            ]
+        return projected
 
     def project_target(self, target_modalities: List[torch.Tensor]) -> List[torch.Tensor]:
         """Project target-domain modality features."""
 
-        return [
+        projected = [
             torch.mm(target_modalities[idx], self.V_matrices[idx])
             for idx in range(self.num_modalities)
         ]
+        if self.use_shared_layer_norm:
+            projected = [
+                self.shared_normalizers[idx](features)
+                for idx, features in enumerate(projected)
+            ]
+        return projected
 
     def forward(
         self,
@@ -284,7 +414,34 @@ class TensorBasedAlignmentStable(nn.Module):
             target_labels,
             num_classes,
         )
-        alignment_loss = 1.0 - tensor_correlation
+        prototype_loss = 1.0 - tensor_correlation
+        alignment_loss = prototype_loss
+        contrastive_loss = alignment_loss.new_zeros(())
+        if self.cross_domain_contrastive_weight > 0.0:
+            contrastive_loss = self.class_balanced_cross_domain_contrastive_loss(
+                projected_source,
+                projected_target,
+                source_labels,
+                target_labels,
+                self.contrastive_temperature,
+            )
+            alignment_loss = (
+                alignment_loss
+                + self.cross_domain_contrastive_weight * contrastive_loss
+            )
+        orthogonality_penalty = alignment_loss.new_zeros(())
+        if self.orthogonality_weight > 0.0:
+            orthogonality_penalty = self.orthogonality_penalty()
+            alignment_loss = (
+                alignment_loss
+                + self.orthogonality_weight * orthogonality_penalty
+            )
+        self.last_diagnostics = {
+            "prototype_loss": prototype_loss.detach(),
+            "tensor_correlation": tensor_correlation.detach(),
+            "cross_domain_contrastive": contrastive_loss.detach(),
+            "orthogonality_penalty": orthogonality_penalty.detach(),
+        }
         return projected_source, projected_target, alignment_loss
 
     def apply_orthogonal_projection(self) -> None:
