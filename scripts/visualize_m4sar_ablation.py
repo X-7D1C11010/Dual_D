@@ -348,6 +348,203 @@ def _tensor_prototype_score(snapshot, stage: str) -> float:
     return float(np.mean(class_scores))
 
 
+def _balanced_plot_indices(labels: np.ndarray, maximum: int = 600) -> np.ndarray:
+    """Select a deterministic class-balanced subset for legible t-SNE plots."""
+
+    labels = np.asarray(labels)
+    per_class = max(int(maximum) // len(CLASS_NAMES), 1)
+    selected = []
+    for class_id in range(len(CLASS_NAMES)):
+        selected.extend(np.flatnonzero(labels == class_id)[:per_class].tolist())
+    return np.asarray(selected, dtype=np.int64)
+
+
+def _class_separability_metrics(
+    source: np.ndarray,
+    target: np.ndarray,
+    source_labels: np.ndarray,
+    target_labels: np.ndarray,
+):
+    """Measure class compactness/separation in the original feature space."""
+
+    values = _l2_normalize(np.concatenate([source, target], axis=0))
+    labels = np.concatenate([source_labels, target_labels], axis=0)
+    similarity = np.matmul(values, values.T)
+    same_class = labels[:, None] == labels[None, :]
+    diagonal = np.eye(len(labels), dtype=bool)
+    same_class &= ~diagonal
+    different_class = ~(same_class | diagonal)
+    intra_class = float(np.mean(similarity[same_class]))
+    inter_class = float(np.mean(similarity[different_class]))
+    return {
+        "intra_class_cosine_similarity": intra_class,
+        "inter_class_cosine_similarity": inter_class,
+        "class_separation_gap": intra_class - inter_class,
+    }
+
+
+def _tal_high_dimensional_metrics(snapshot):
+    source_labels = np.asarray(snapshot["source_labels"])
+    target_labels = np.asarray(snapshot["target_labels"])
+    metrics = {}
+    for stage in ("pre_alignment", "post_alignment"):
+        stage_metrics = {"modalities": {}}
+        for modality in ("sar", "optical"):
+            source = np.asarray(
+                snapshot[f"source_{modality}_{stage}"], dtype=np.float32
+            )
+            target = np.asarray(
+                snapshot[f"target_{modality}_{stage}"], dtype=np.float32
+            )
+            stage_metrics["modalities"][modality] = {
+                "class_conditional_source_target_centroid_distance": (
+                    _class_conditional_centroid_distance(
+                        source,
+                        target,
+                        source_labels,
+                        target_labels,
+                    )
+                ),
+                "same_domain_neighbor_ratio": (
+                    _class_conditional_domain_neighbor_purity(
+                        source,
+                        target,
+                        source_labels,
+                        target_labels,
+                    )
+                ),
+            }
+        source_fused = _fused_alignment_features(snapshot, "source", stage)
+        target_fused = _fused_alignment_features(snapshot, "target", stage)
+        stage_metrics["fused"] = {
+            "class_conditional_source_target_centroid_distance": (
+                _class_conditional_centroid_distance(
+                    source_fused,
+                    target_fused,
+                    source_labels,
+                    target_labels,
+                )
+            ),
+            "same_domain_neighbor_ratio": _class_conditional_domain_neighbor_purity(
+                source_fused,
+                target_fused,
+                source_labels,
+                target_labels,
+            ),
+            **_class_separability_metrics(
+                source_fused,
+                target_fused,
+                source_labels,
+                target_labels,
+            ),
+        }
+        stage_metrics["tensor_prototype_score"] = _tensor_prototype_score(
+            snapshot, stage
+        )
+        metrics[stage] = stage_metrics
+    return metrics
+
+
+def _four_group_modality_domain_scatter(
+    axis,
+    snapshot,
+    stage: str,
+    source_indices: np.ndarray,
+    target_indices: np.ndarray,
+    title: str,
+):
+    groups = [
+        (
+            "源域光学",
+            _l2_normalize(
+                np.asarray(
+                    snapshot[f"source_optical_{stage}"], dtype=np.float32
+                )[source_indices]
+            ),
+            "#e6862a",
+            "o",
+            0.55,
+        ),
+        (
+            "源域 SAR",
+            _l2_normalize(
+                np.asarray(snapshot[f"source_sar_{stage}"], dtype=np.float32)[
+                    source_indices
+                ]
+            ),
+            "#2f6f9f",
+            "o",
+            0.55,
+        ),
+        (
+            "目标域光学",
+            _l2_normalize(
+                np.asarray(
+                    snapshot[f"target_optical_{stage}"], dtype=np.float32
+                )[target_indices]
+            ),
+            "#e6862a",
+            "x",
+            0.72,
+        ),
+        (
+            "目标域 SAR",
+            _l2_normalize(
+                np.asarray(snapshot[f"target_sar_{stage}"], dtype=np.float32)[
+                    target_indices
+                ]
+            ),
+            "#2f6f9f",
+            "x",
+            0.72,
+        ),
+    ]
+    counts = [len(values) for _, values, *_ in groups]
+    embedding = _tsne(np.concatenate([values for _, values, *_ in groups], axis=0))
+    start = 0
+    for (label, _values, color, marker, alpha), count in zip(groups, counts):
+        stop = start + count
+        axis.scatter(
+            embedding[start:stop, 0],
+            embedding[start:stop, 1],
+            s=12,
+            alpha=alpha,
+            c=color,
+            marker=marker,
+            label=label,
+        )
+        start = stop
+    axis.set_title(title)
+    axis.set_xticks([])
+    axis.set_yticks([])
+
+
+def _class_conditional_fused_scatter(
+    axis,
+    snapshot,
+    stage: str,
+    source_indices: np.ndarray,
+    target_indices: np.ndarray,
+    title: str,
+):
+    source = _l2_normalize(
+        _fused_alignment_features(snapshot, "source", stage)[source_indices]
+    )
+    target = _l2_normalize(
+        _fused_alignment_features(snapshot, "target", stage)[target_indices]
+    )
+    source_labels = np.asarray(snapshot["source_labels"])[source_indices]
+    target_labels = np.asarray(snapshot["target_labels"])[target_indices]
+    _domain_class_scatter(
+        axis,
+        source,
+        target,
+        source_labels,
+        target_labels,
+        title,
+    )
+
+
 def _domain_scatter(axis, source, target, title, diagnostics):
     values = np.concatenate([source, target], axis=0)
     embedding = _tsne(values)
@@ -455,6 +652,205 @@ def plot_tal_tsne(runs, output_dir: Path) -> None:
             ),
             "tensor_score": _tensor_prototype_score(snapshot, stage),
         }
+
+    tal_metrics = _tal_high_dimensional_metrics(snapshot)
+    source_indices = _balanced_plot_indices(source_labels)
+    target_indices = _balanced_plot_indices(target_labels)
+
+    # Requested four-group view: both modalities and both domains share one
+    # t-SNE fit within each stage. Colour encodes modality and marker encodes
+    # domain. Pre/post remain separate because TAL changes dimensionality.
+    modality_domain_figure, modality_domain_axes = plt.subplots(
+        1, 2, figsize=(14, 6)
+    )
+    for axis, stage, title in (
+        (
+            modality_domain_axes[0],
+            "pre_alignment",
+            "TAL 前：编码器输出的四组模态—领域特征",
+        ),
+        (
+            modality_domain_axes[1],
+            "post_alignment",
+            "TAL 后：张量投影后的四组模态—领域特征",
+        ),
+    ):
+        _four_group_modality_domain_scatter(
+            axis,
+            snapshot,
+            stage,
+            source_indices,
+            target_indices,
+            title,
+        )
+        sar_metrics = tal_metrics[stage]["modalities"]["sar"]
+        optical_metrics = tal_metrics[stage]["modalities"]["optical"]
+        axis.text(
+            0.02,
+            0.02,
+            (
+                "同类跨域质心距离（越小越对齐）\n"
+                f"SAR={sar_metrics['class_conditional_source_target_centroid_distance']:.4f}，"
+                f"光学={optical_metrics['class_conditional_source_target_centroid_distance']:.4f}"
+            ),
+            transform=axis.transAxes,
+            fontsize=9,
+            bbox={"facecolor": "white", "alpha": 0.84, "edgecolor": "0.8"},
+        )
+    handles, labels = modality_domain_axes[0].get_legend_handles_labels()
+    modality_domain_figure.legend(handles, labels, loc="lower center", ncol=4)
+    modality_domain_figure.suptitle(
+        "TAL 前后四组模态—领域特征分布（各面板独立 t-SNE）",
+        fontsize=16,
+    )
+    modality_domain_figure.subplots_adjust(bottom=0.13)
+    _save(
+        modality_domain_figure,
+        output_dir / "TAL前后四组模态领域TSNE.png",
+    )
+
+    # Requested class-conditioned view: colour encodes semantic class and the
+    # marker encodes domain. Same-class Source/Target mixing and inter-class
+    # separation can therefore be inspected simultaneously.
+    class_figure, class_axes = plt.subplots(1, 2, figsize=(14, 6))
+    for axis, stage, title in (
+        (
+            class_axes[0],
+            "pre_alignment",
+            "TAL 前：编码器融合类别特征",
+        ),
+        (
+            class_axes[1],
+            "post_alignment",
+            "TAL 后：张量投影融合类别特征",
+        ),
+    ):
+        _class_conditional_fused_scatter(
+            axis,
+            snapshot,
+            stage,
+            source_indices,
+            target_indices,
+            title,
+        )
+        fused_metrics = tal_metrics[stage]["fused"]
+        axis.text(
+            0.02,
+            0.02,
+            (
+                f"同类跨域质心距离={fused_metrics['class_conditional_source_target_centroid_distance']:.4f}\n"
+                f"类别可分间隔={fused_metrics['class_separation_gap']:.4f}"
+            ),
+            transform=axis.transAxes,
+            fontsize=9,
+            bbox={"facecolor": "white", "alpha": 0.84, "edgecolor": "0.8"},
+        )
+    handles, labels = class_axes[0].get_legend_handles_labels()
+    class_figure.legend(handles, labels, loc="lower center", ncol=6, fontsize=8)
+    class_figure.suptitle(
+        "TAL 前后的类别条件跨域融合特征（颜色=类别，点形=领域）",
+        fontsize=16,
+    )
+    class_figure.subplots_adjust(bottom=0.17)
+    _save(
+        class_figure,
+        output_dir / "TAL前后类别条件跨域TSNE.png",
+    )
+
+    # High-dimensional metrics are reported independently of t-SNE so the
+    # visual conclusion cannot be manufactured by a 2-D projection.
+    metric_figure, metric_axes = plt.subplots(2, 2, figsize=(13, 9))
+    stages = ("pre_alignment", "post_alignment")
+    stage_names = ("TAL 前", "TAL 后")
+    group_names = ("SAR", "光学", "融合")
+    x = np.arange(len(group_names))
+    width = 0.36
+    for index, (stage, stage_name) in enumerate(zip(stages, stage_names)):
+        values = [
+            tal_metrics[stage]["modalities"]["sar"][
+                "class_conditional_source_target_centroid_distance"
+            ],
+            tal_metrics[stage]["modalities"]["optical"][
+                "class_conditional_source_target_centroid_distance"
+            ],
+            tal_metrics[stage]["fused"][
+                "class_conditional_source_target_centroid_distance"
+            ],
+        ]
+        metric_axes[0, 0].bar(
+            x + (index - 0.5) * width,
+            values,
+            width,
+            label=stage_name,
+        )
+        purity_values = [
+            tal_metrics[stage]["modalities"]["sar"][
+                "same_domain_neighbor_ratio"
+            ],
+            tal_metrics[stage]["modalities"]["optical"][
+                "same_domain_neighbor_ratio"
+            ],
+            tal_metrics[stage]["fused"]["same_domain_neighbor_ratio"],
+        ]
+        metric_axes[0, 1].bar(
+            x + (index - 0.5) * width,
+            purity_values,
+            width,
+            label=stage_name,
+        )
+    metric_axes[0, 0].set_xticks(x, group_names)
+    metric_axes[0, 0].set_ylabel("余弦距离")
+    metric_axes[0, 0].set_title("同类别 Source/Target 原型距离（越低越好）")
+    metric_axes[0, 0].legend()
+    metric_axes[0, 0].grid(axis="y", alpha=0.25)
+    metric_axes[0, 1].set_xticks(x, group_names)
+    metric_axes[0, 1].axhline(0.5, color="black", linestyle="--", linewidth=1)
+    metric_axes[0, 1].set_ylabel("同域近邻比例")
+    metric_axes[0, 1].set_title("类别条件领域可分性（越接近 0.5 越混合）")
+    metric_axes[0, 1].legend()
+    metric_axes[0, 1].grid(axis="y", alpha=0.25)
+
+    class_metric_names = ("同类相似度", "异类相似度", "类别可分间隔")
+    class_keys = (
+        "intra_class_cosine_similarity",
+        "inter_class_cosine_similarity",
+        "class_separation_gap",
+    )
+    for index, (stage, stage_name) in enumerate(zip(stages, stage_names)):
+        metric_axes[1, 0].bar(
+            x + (index - 0.5) * width,
+            [tal_metrics[stage]["fused"][key] for key in class_keys],
+            width,
+            label=stage_name,
+        )
+    metric_axes[1, 0].set_xticks(x, class_metric_names)
+    metric_axes[1, 0].set_ylabel("余弦相似度")
+    metric_axes[1, 0].set_title("融合特征的类别结构")
+    metric_axes[1, 0].legend()
+    metric_axes[1, 0].grid(axis="y", alpha=0.25)
+
+    tensor_scores = [
+        tal_metrics[stage]["tensor_prototype_score"] for stage in stages
+    ]
+    metric_axes[1, 1].bar(stage_names, tensor_scores, color=["#7f7f7f", "#4c72b0"])
+    metric_axes[1, 1].set_ylabel("相关分数")
+    metric_axes[1, 1].set_title("张量类别原型相关（越高越好）")
+    metric_axes[1, 1].grid(axis="y", alpha=0.25)
+    metric_figure.suptitle("TAL 前后原始高维特征指标", fontsize=16)
+    _save(metric_figure, output_dir / "TAL高维指标对比.png")
+
+    metrics_payload = {
+        "metric_notes": {
+            "class_conditional_source_target_centroid_distance": "越低表示同类别跨域原型越接近",
+            "same_domain_neighbor_ratio": "类别平衡条件下越接近0.5表示领域越混合",
+            "class_separation_gap": "同类余弦相似度减异类余弦相似度，越高表示类别越可分",
+            "tensor_prototype_score": "复现TAL类别原型张量相关分数，越高越好",
+        },
+        **tal_metrics,
+    }
+    with (output_dir / "TAL高维指标.json").open("w", encoding="utf-8") as stream:
+        json.dump(metrics_payload, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
 
     # TAL changes the dimensionality (512-D concatenated encoder features to
     # 256-D projected features), so each panel necessarily has its own t-SNE

@@ -5,7 +5,10 @@ import unittest
 import numpy as np
 
 from scripts.run_m4sar_ablation_suite import VARIANTS, build_parser
-from scripts.visualize_m4sar_ablation import _relation_statistics
+from scripts.visualize_m4sar_ablation import (
+    _class_separability_metrics,
+    _relation_statistics,
+)
 
 
 class M4SARAblationSuiteTests(unittest.TestCase):
@@ -63,6 +66,35 @@ class M4SARAblationSuiteTests(unittest.TestCase):
         self.assertAlmostEqual(
             float(np.mean(statistics["per_sample_signed_drift"])),
             statistics["signed_drift"],
+            places=7,
+        )
+
+    def test_tal_class_separation_metric_rewards_compact_classes(self) -> None:
+        source = np.asarray(
+            [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]],
+            dtype=np.float32,
+        )
+        target = np.asarray(
+            [[0.95, 0.05], [1.0, 0.1], [0.05, 0.95], [0.0, 1.0]],
+            dtype=np.float32,
+        )
+        labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+
+        metrics = _class_separability_metrics(
+            source,
+            target,
+            labels,
+            labels,
+        )
+
+        self.assertGreater(
+            metrics["intra_class_cosine_similarity"],
+            metrics["inter_class_cosine_similarity"],
+        )
+        self.assertAlmostEqual(
+            metrics["class_separation_gap"],
+            metrics["intra_class_cosine_similarity"]
+            - metrics["inter_class_cosine_similarity"],
             places=7,
         )
 
