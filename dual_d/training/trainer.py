@@ -22,7 +22,7 @@ import os
 from pathlib import Path
 import random
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 import warnings
 
 import numpy as np
@@ -1884,6 +1884,7 @@ def save_feature_embeddings(
     output_path: Path,
     max_samples: int = 512,
     translation_enabled: bool = True,
+    modality_names: Optional[Sequence[str]] = None,
 ) -> None:
     """Save source and target features for post-hoc alignment diagnostics.
 
@@ -2039,8 +2040,11 @@ def save_feature_embeddings(
         "raw": target_raw,
         "labels": target_labels,
     }
-    modality_names = ["sar", "optical"] + [
-        f"modality_{index}" for index in range(2, len(source_pre))
+    if modality_names is None:
+        modality_names = ["sar", "optical"]
+    modality_names = list(modality_names) + [
+        f"modality_{index}"
+        for index in range(len(modality_names), len(source_pre))
     ]
     for index, name in enumerate(modality_names[: len(source_pre)]):
         arrays[f"source_{name}_pre_alignment"] = source_pre[index]
@@ -2983,6 +2987,12 @@ def run_training(args) -> Dict[str, object]:
                     max_samples=getattr(args, "feature_visualization_samples", 512),
                     translation_enabled=bool(
                         getattr(args, "translation_enabled", True)
+                    ),
+                    modality_names=(
+                        ("sar", "optical")
+                        if getattr(args, "dataset_type", "directory")
+                        in {"so2sat_lcz42", "m4sar_classification"}
+                        else ("vis", "ir")
                     ),
                 )
             logger.info(
