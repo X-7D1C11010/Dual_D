@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import inspect
 import json
 from pathlib import Path
 
@@ -28,6 +29,31 @@ elif "Microsoft YaHei" in _available_fonts:
 
 
 _CHINESE_GLYPH_PROBE = "张量对齐模态类别漂移约束特征可视化"
+_PLOT_FONT_SCALE = 1.0
+
+
+def _font_size(value: float) -> float:
+    return float(value) * _PLOT_FONT_SCALE
+
+
+def _configure_plot_font_scale(scale: float) -> None:
+    """Scale all text without changing cached metrics or feature arrays."""
+
+    global _PLOT_FONT_SCALE
+    if scale <= 0.0:
+        raise ValueError("--font-scale must be positive.")
+    _PLOT_FONT_SCALE = float(scale)
+    plt.rcParams.update(
+        {
+            "font.size": _font_size(10),
+            "axes.titlesize": _font_size(12),
+            "axes.labelsize": _font_size(10),
+            "xtick.labelsize": _font_size(10),
+            "ytick.labelsize": _font_size(10),
+            "legend.fontsize": _font_size(10),
+            "figure.titlesize": _font_size(12),
+        }
+    )
 
 
 def _supports_chinese_glyphs(path: Path) -> bool:
@@ -545,6 +571,88 @@ def _class_conditional_fused_scatter(
     )
 
 
+def plot_tal_high_dimensional_metrics(tal_metrics, output_dir: Path) -> None:
+    """Redraw the TAL metric panel from cached JSON only."""
+
+    metric_figure, metric_axes = plt.subplots(2, 2, figsize=(13, 9))
+    stages = ("pre_alignment", "post_alignment")
+    stage_names = ("TAL 前", "TAL 后")
+    group_names = ("SAR", "光学", "融合")
+    x = np.arange(len(group_names))
+    width = 0.36
+    for index, (stage, stage_name) in enumerate(zip(stages, stage_names)):
+        values = [
+            tal_metrics[stage]["modalities"]["sar"][
+                "class_conditional_source_target_centroid_distance"
+            ],
+            tal_metrics[stage]["modalities"]["optical"][
+                "class_conditional_source_target_centroid_distance"
+            ],
+            tal_metrics[stage]["fused"][
+                "class_conditional_source_target_centroid_distance"
+            ],
+        ]
+        metric_axes[0, 0].bar(
+            x + (index - 0.5) * width,
+            values,
+            width,
+            label=stage_name,
+        )
+        purity_values = [
+            tal_metrics[stage]["modalities"]["sar"]["same_domain_neighbor_ratio"],
+            tal_metrics[stage]["modalities"]["optical"][
+                "same_domain_neighbor_ratio"
+            ],
+            tal_metrics[stage]["fused"]["same_domain_neighbor_ratio"],
+        ]
+        metric_axes[0, 1].bar(
+            x + (index - 0.5) * width,
+            purity_values,
+            width,
+            label=stage_name,
+        )
+    metric_axes[0, 0].set_xticks(x, group_names)
+    metric_axes[0, 0].set_ylabel("余弦距离")
+    metric_axes[0, 0].set_title("同类别 Source/Target 原型距离（越低越好）")
+    metric_axes[0, 0].legend()
+    metric_axes[0, 0].grid(axis="y", alpha=0.25)
+    metric_axes[0, 1].set_xticks(x, group_names)
+    metric_axes[0, 1].axhline(0.5, color="black", linestyle="--", linewidth=1)
+    metric_axes[0, 1].set_ylabel("同域近邻比例")
+    metric_axes[0, 1].set_title("类别条件领域可分性（越接近 0.5 越混合）")
+    metric_axes[0, 1].legend()
+    metric_axes[0, 1].grid(axis="y", alpha=0.25)
+
+    class_metric_names = ("同类相似度", "异类相似度", "类别可分间隔")
+    class_keys = (
+        "intra_class_cosine_similarity",
+        "inter_class_cosine_similarity",
+        "class_separation_gap",
+    )
+    for index, (stage, stage_name) in enumerate(zip(stages, stage_names)):
+        metric_axes[1, 0].bar(
+            x + (index - 0.5) * width,
+            [tal_metrics[stage]["fused"][key] for key in class_keys],
+            width,
+            label=stage_name,
+        )
+    metric_axes[1, 0].set_xticks(x, class_metric_names)
+    metric_axes[1, 0].set_ylabel("余弦相似度")
+    metric_axes[1, 0].set_title("融合特征的类别结构")
+    metric_axes[1, 0].legend()
+    metric_axes[1, 0].grid(axis="y", alpha=0.25)
+
+    tensor_scores = [tal_metrics[stage]["tensor_prototype_score"] for stage in stages]
+    metric_axes[1, 1].bar(stage_names, tensor_scores, color=["#7f7f7f", "#4c72b0"])
+    metric_axes[1, 1].set_ylabel("相关分数")
+    metric_axes[1, 1].set_title("张量类别原型相关（越高越好）")
+    metric_axes[1, 1].grid(axis="y", alpha=0.25)
+    metric_figure.suptitle(
+        "TAL 前后原始高维特征指标", fontsize=_font_size(16)
+    )
+    _save(metric_figure, output_dir / "TAL高维指标对比.png")
+
+
 def _domain_scatter(axis, source, target, title, diagnostics):
     values = np.concatenate([source, target], axis=0)
     embedding = _tsne(values)
@@ -760,85 +868,7 @@ def plot_tal_tsne(runs, output_dir: Path) -> None:
 
     # High-dimensional metrics are reported independently of t-SNE so the
     # visual conclusion cannot be manufactured by a 2-D projection.
-    metric_figure, metric_axes = plt.subplots(2, 2, figsize=(13, 9))
-    stages = ("pre_alignment", "post_alignment")
-    stage_names = ("TAL 前", "TAL 后")
-    group_names = ("SAR", "光学", "融合")
-    x = np.arange(len(group_names))
-    width = 0.36
-    for index, (stage, stage_name) in enumerate(zip(stages, stage_names)):
-        values = [
-            tal_metrics[stage]["modalities"]["sar"][
-                "class_conditional_source_target_centroid_distance"
-            ],
-            tal_metrics[stage]["modalities"]["optical"][
-                "class_conditional_source_target_centroid_distance"
-            ],
-            tal_metrics[stage]["fused"][
-                "class_conditional_source_target_centroid_distance"
-            ],
-        ]
-        metric_axes[0, 0].bar(
-            x + (index - 0.5) * width,
-            values,
-            width,
-            label=stage_name,
-        )
-        purity_values = [
-            tal_metrics[stage]["modalities"]["sar"][
-                "same_domain_neighbor_ratio"
-            ],
-            tal_metrics[stage]["modalities"]["optical"][
-                "same_domain_neighbor_ratio"
-            ],
-            tal_metrics[stage]["fused"]["same_domain_neighbor_ratio"],
-        ]
-        metric_axes[0, 1].bar(
-            x + (index - 0.5) * width,
-            purity_values,
-            width,
-            label=stage_name,
-        )
-    metric_axes[0, 0].set_xticks(x, group_names)
-    metric_axes[0, 0].set_ylabel("余弦距离")
-    metric_axes[0, 0].set_title("同类别 Source/Target 原型距离（越低越好）")
-    metric_axes[0, 0].legend()
-    metric_axes[0, 0].grid(axis="y", alpha=0.25)
-    metric_axes[0, 1].set_xticks(x, group_names)
-    metric_axes[0, 1].axhline(0.5, color="black", linestyle="--", linewidth=1)
-    metric_axes[0, 1].set_ylabel("同域近邻比例")
-    metric_axes[0, 1].set_title("类别条件领域可分性（越接近 0.5 越混合）")
-    metric_axes[0, 1].legend()
-    metric_axes[0, 1].grid(axis="y", alpha=0.25)
-
-    class_metric_names = ("同类相似度", "异类相似度", "类别可分间隔")
-    class_keys = (
-        "intra_class_cosine_similarity",
-        "inter_class_cosine_similarity",
-        "class_separation_gap",
-    )
-    for index, (stage, stage_name) in enumerate(zip(stages, stage_names)):
-        metric_axes[1, 0].bar(
-            x + (index - 0.5) * width,
-            [tal_metrics[stage]["fused"][key] for key in class_keys],
-            width,
-            label=stage_name,
-        )
-    metric_axes[1, 0].set_xticks(x, class_metric_names)
-    metric_axes[1, 0].set_ylabel("余弦相似度")
-    metric_axes[1, 0].set_title("融合特征的类别结构")
-    metric_axes[1, 0].legend()
-    metric_axes[1, 0].grid(axis="y", alpha=0.25)
-
-    tensor_scores = [
-        tal_metrics[stage]["tensor_prototype_score"] for stage in stages
-    ]
-    metric_axes[1, 1].bar(stage_names, tensor_scores, color=["#7f7f7f", "#4c72b0"])
-    metric_axes[1, 1].set_ylabel("相关分数")
-    metric_axes[1, 1].set_title("张量类别原型相关（越高越好）")
-    metric_axes[1, 1].grid(axis="y", alpha=0.25)
-    metric_figure.suptitle("TAL 前后原始高维特征指标", fontsize=16)
-    _save(metric_figure, output_dir / "TAL高维指标对比.png")
+    plot_tal_high_dimensional_metrics(tal_metrics, output_dir)
 
     metrics_payload = {
         "metric_notes": {
@@ -1009,13 +1039,22 @@ def _class_scatter(axis, embedding, labels, title):
     axis.set_yticks([])
 
 
-def plot_drift_comparison(runs, output_dir: Path) -> None:
+def plot_drift_comparison(
+    runs, output_dir: Path, comparison_only: bool = False
+) -> None:
     if "full" not in runs or "no_modality_drift" not in runs:
+        if comparison_only:
+            raise FileNotFoundError(
+                "Drift redraw requires both full_seed*/result_summary.json and "
+                "no_modality_drift_seed*/result_summary.json under --experiment-dir."
+            )
         return
     snapshots = {}
     for variant in ("full", "no_modality_drift"):
         path = runs[variant][0][1] / "feature_embeddings.npz"
         if not path.is_file():
+            if comparison_only:
+                raise FileNotFoundError(f"Missing saved feature snapshot: {path}")
             return
         snapshots[variant] = np.load(path)
     relation_statistics = {
@@ -1025,10 +1064,15 @@ def plot_drift_comparison(runs, output_dir: Path) -> None:
 
     figure, axes = plt.subplots(1, 2, figsize=(14, 5.8))
     values = [_relation_change(snapshots[name]) for name in snapshots]
+    boxplot_label_argument = (
+        "tick_labels"
+        if "tick_labels" in inspect.signature(axes[0].boxplot).parameters
+        else "labels"
+    )
     axes[0].boxplot(
         values,
-        labels=["完整模型", "无漂移约束"],
         showfliers=False,
+        **{boxplot_label_argument: ["完整模型", "无漂移约束"]},
     )
     axes[0].axhline(0.0, color="black", linewidth=1.0, alpha=0.7)
     axes[0].axhline(
@@ -1065,6 +1109,9 @@ def plot_drift_comparison(runs, output_dir: Path) -> None:
     axes[1].grid(axis="y", alpha=0.25)
     axes[1].legend()
     _save(figure, output_dir / "漂移约束对比.png")
+
+    if comparison_only:
+        return
 
     # Relation signatures use sample-to-sample similarities as coordinates,
     # matching the quantity protected by the loss. Before/after samples are
@@ -1270,22 +1317,58 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment-dir", default="")
     parser.add_argument("--font-path", default="")
+    parser.add_argument(
+        "--font-scale",
+        type=float,
+        default=1.0,
+        help="Scale titles, labels, ticks, legends, and annotations without training.",
+    )
+    parser.add_argument(
+        "--only",
+        choices=("all", "tal-metrics", "drift"),
+        default="all",
+        help=(
+            "Redraw the complete suite, only TAL高维指标对比.png from its JSON, "
+            "or only 漂移约束对比.png from saved feature snapshots."
+        ),
+    )
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
     selected_font = _configure_chinese_font(args.font_path)
+    _configure_plot_font_scale(args.font_scale)
     if args.check_only:
         from sklearn.manifold import TSNE  # noqa: F401
 
-        print(f"可视化依赖和中文字体检查通过：{selected_font}")
+        print(
+            f"可视化依赖和中文字体检查通过：{selected_font} | "
+            f"字号缩放={args.font_scale:g}"
+        )
         return
     if not args.experiment_dir:
         parser.error("--experiment-dir is required unless --check-only is used.")
     experiment_dir = Path(args.experiment_dir)
+    output_dir = experiment_dir / "visualizations"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.only == "tal-metrics":
+        metric_path = output_dir / "TAL高维指标.json"
+        if not metric_path.is_file():
+            raise SystemExit(
+                f"Cached TAL metrics do not exist: {metric_path}. "
+                "Run --only all once from existing feature_embeddings.npz."
+            )
+        plot_tal_high_dimensional_metrics(_load_json(metric_path), output_dir)
+        print(f"已从缓存重绘：{output_dir / 'TAL高维指标对比.png'}")
+        return
+
     runs = _discover_runs(experiment_dir)
     if not runs:
         raise SystemExit(f"No completed runs found in {experiment_dir}")
-    output_dir = experiment_dir / "visualizations"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.only == "drift":
+        plot_drift_comparison(runs, output_dir, comparison_only=True)
+        print(f"已从特征快照重绘：{output_dir / '漂移约束对比.png'}")
+        return
+
     plot_overall_metrics(runs, output_dir)
     plot_per_class_f1(runs, output_dir)
     plot_tal_tsne(runs, output_dir)
